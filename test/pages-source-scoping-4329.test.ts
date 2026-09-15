@@ -199,6 +199,70 @@ describe('#4329 — delete_page source_id', () => {
   });
 });
 
+describe('delete_page purge — immediate removal for the trusted local CLI only', () => {
+  test('contract: purge is a boolean param (so the generated CLI accepts `gbrain delete <slug> --purge`)', () => {
+    expect(delete_page.params.purge?.type).toBe('boolean');
+  });
+
+  test('trusted local purge: soft-delete then hard-delete of the targeted row only; status purged', async () => {
+    const res = await delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', source_id: 'beta', purge: true }) as Record<string, unknown>;
+    expect(res.status).toBe('purged');
+    expect(res.source_id).toBe('beta');
+    expect(res).not.toHaveProperty('recoverable_until');
+    const rows = await deletedAtBySource('shared/doc');
+    expect(rows.beta).toBeUndefined();          // row is GONE, not tombstoned
+    expect(rows.default).toBeNull();            // the other source's copy is untouched
+    expect(await engine.getPage('shared/doc', { sourceId: 'beta', includeDeleted: true })).toBeNull();
+    expect((await engine.getRawData('shared/doc', undefined, { sourceId: 'beta', includeDeleted: true })).length).toBe(0);
+  });
+
+  test('purge completes the removal of a row that was already soft-deleted (the remediation path)', async () => {
+    await engine.softDeletePage('shared/doc', { sourceId: 'default' });
+    const res = await delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', purge: true }) as Record<string, unknown>;
+    expect(res.status).toBe('purged');
+    expect((await deletedAtBySource('shared/doc')).default).toBeUndefined();
+    // Unknown slug is still a clean not-found, even with purge.
+    await expect(delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', purge: true }))
+      .rejects.toMatchObject({ code: 'page_not_found' });
+  });
+
+  test('remote callers (anything not strictly remote === false) get invalid_params and nothing is deleted', async () => {
+    await expect(delete_page.handler(ctxOf(), { slug: 'shared/doc', purge: true }))
+      .rejects.toMatchObject({ code: 'invalid_params' });
+    await expect(delete_page.handler(ctxOf({ remote: undefined as unknown as boolean }), { slug: 'shared/doc', purge: true }))
+      .rejects.toMatchObject({ code: 'invalid_params' });
+    const authed = ctxOf({ auth: authOf({ sourceId: 'default', allowedSources: ['default'], scopes: ['read', 'write', 'admin'] }) as any });
+    await expect(delete_page.handler(authed, { slug: 'shared/doc', purge: true }))
+      .rejects.toMatchObject({ code: 'invalid_params' });
+    const rows = await deletedAtBySource('shared/doc');
+    expect(rows.default).toBeNull();            // not even soft-deleted
+    expect(rows.beta).toBeNull();
+    // ...and the same remote caller can still soft-delete without purge.
+    const res = await delete_page.handler(ctxOf(), { slug: 'shared/doc' }) as Record<string, unknown>;
+    expect(res.status).toBe('soft_deleted');
+  });
+
+  test('a non-boolean purge value is rejected, never coerced', async () => {
+    await expect(delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', purge: 'yes' }))
+      .rejects.toMatchObject({ code: 'invalid_params' });
+    expect((await deletedAtBySource('shared/doc')).default).toBeNull();
+  });
+
+  test('purge: false behaves as a plain soft delete, and the hint names the purge path', async () => {
+    const res = await delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', purge: false }) as Record<string, unknown>;
+    expect(res.status).toBe('soft_deleted');
+    expect(String(res.recoverable_until)).toContain('gbrain delete <slug> --purge');
+    expect((await deletedAtBySource('shared/doc')).default).not.toBeNull();
+  });
+
+  test('dry-run purge previews the hard removal without touching the row', async () => {
+    const res = await delete_page.handler(ctxOf({ remote: false, dryRun: true }), { slug: 'shared/doc', purge: true }) as Record<string, unknown>;
+    expect(res.dry_run).toBe(true);
+    expect(res.action).toBe('purge_page');
+    expect((await deletedAtBySource('shared/doc')).default).toBeNull();
+  });
+});
+
 describe('#4329 — restore_page source_id', () => {
   beforeEach(async () => {
     await engine.softDeletePage('shared/doc', { sourceId: 'default' });

@@ -44,10 +44,10 @@ export function resolveWhoknowsFixturePath(
   env: NodeJS.ProcessEnv = process.env,
   moduleUrl: string = import.meta.url,
 ): string | null {
-  if (env.GBRAIN_WHOKNOWS_FIXTURE_PATH) {
-    return isAbsolute(env.GBRAIN_WHOKNOWS_FIXTURE_PATH)
-      ? env.GBRAIN_WHOKNOWS_FIXTURE_PATH
-      : resolvePath(process.cwd(), env.GBRAIN_WHOKNOWS_FIXTURE_PATH);
+  // cwd-dotenv-ok: doctor test-fixture path override; the check only READS that jsonl, never loads or executes it.
+  const override = env.GBRAIN_WHOKNOWS_FIXTURE_PATH;
+  if (override) {
+    return isAbsolute(override) ? override : resolvePath(process.cwd(), override);
   }
 
   try {

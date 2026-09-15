@@ -20,6 +20,24 @@ Existing sessions are preserved. Before upgrading an installation with queued
 work, follow the [authorization and worker upgrade guide](../guides/authorization-upgrade.md)
 for the coordinated cutover, consent recovery, and Bun requirements.
 
+**The owner-approval step.** `/authorize` never returns an authorization code
+on its own. It records a pending request and redirects the browser to the admin
+dashboard (`/admin/?oauth_request=…`), where the brain owner signs in (bootstrap
+token or magic link), reviews the client name, redirect URI and requested
+scopes, and approves or denies. Only an approval mints the code, which is then
+delivered to the client's registered redirect URI; a denial returns
+`error=access_denied`. This applies to every authorization-code client,
+including clients that self-registered via DCR — self-registration alone never
+yields a token. Pending requests expire after ten minutes, do not survive a
+server restart, and are bounded: at most ten awaiting-decision requests per
+client and a fixed server-wide ceiling, beyond which `/authorize` answers
+`429 too_many_requests` until earlier requests are decided or expire.
+
+**Say to your agent:** *"Start the brain server over HTTP with self-service
+registration, then approve my client in the admin dashboard — your agent runs
+`gbrain serve --http --enable-dcr` and you finish the connection by approving
+it at `/admin/`."*
+
 ## Three Paths
 
 ### Local stdio (zero setup)
@@ -210,6 +228,33 @@ await oauthProvider.registerClientManual(
 
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
+
+**Say to your agent:** *"Start my brain's MCP server with self-service client
+registration — your agent runs `gbrain serve --http --enable-dcr`, and you
+approve each new connection in the admin UI."*
+
+A self-registered client goes through three gates:
+
+1. **Scope ceiling at registration.** Dynamic registration may request at most
+   `read write`. A request naming `admin`, `sources_admin`, `users_admin`, or
+   `agent` is rejected with HTTP 400 `invalid_client_metadata` (never silently
+   narrowed), and the error text points at the operator path. Under
+   `--enable-dcr-insecure`, a `client_credentials` registration is capped at
+   `read` — a grant that skips owner approval never carries `write`.
+2. **Owner approval on `/authorize`.** Every authorization-code connection
+   redirects to the admin dashboard, where you see the client, its redirect
+   URI, and the requested scopes, and approve or deny. No code is minted
+   until you approve. Consent never widens the registered scope.
+3. **Per-request clamp.** Issued codes and tokens are re-intersected with the
+   client's current registered scope, so a later `rescope-client` takes effect
+   on the next request.
+
+To give a self-registered client more than `read write`, widen it yourself
+after the fact — `gbrain auth rescope-client <client_id> --scopes read,write,sources_admin`
+(or the admin dashboard's Agents page) — or pre-register it with
+`gbrain auth register-client` / the admin API, which accept every scope.
+`gbrain doctor` warns about active clients that hold a privileged scope but
+look self-registered.
 
 Native MCP clients register cleanly: `redirect_uris` may use an app custom
 scheme (RFC 8252, e.g. `myapp://callback`) or `http://` loopback alongside

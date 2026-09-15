@@ -33,6 +33,10 @@
  *
  * @module guardrails
  */
+import { homedir } from 'node:os';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { cwdDotenvAssignsKey } from './env-trust.ts';
 
 /**
  * The boundary at which a guardrail is being consulted. Stable string union so
@@ -141,8 +145,8 @@ export interface GuardrailEnvLoadResult {
 
 /**
  * #3688 — the operator wiring path. Loads guardrail providers from the module
- * named by `GBRAIN_GUARDRAILS_MODULE` (an absolute/relative file path or a
- * bare package specifier). Accepted module shapes, all additive:
+ * named by `GBRAIN_GUARDRAILS_MODULE`: an ABSOLUTE file path, a `~/` path, or
+ * a bare package specifier. Accepted module shapes, all additive:
  *
  *   - `export default provider` (a single {@link GuardrailProvider})
  *   - `export default [providerA, providerB]`
@@ -152,20 +156,45 @@ export interface GuardrailEnvLoadResult {
  * Unset env var → no-op (the OSS distribution stays inert). Set-but-broken —
  * import failure, or a module that registers zero providers — throws
  * {@link GuardrailLoadError} (fail-closed; see class doc).
+ *
+ * Origin checks (both throw {@link GuardrailLoadError} BEFORE any import):
+ *   - cwd-relative specs (`./x`, `../x`, bare `.`) are refused — they would
+ *     resolve against whatever directory the process happens to run in.
+ *   - when `env` is `process.env` (or `opts.cwd` is given), a spec that a cwd
+ *     `.env` file assigns is refused whatever its value: Bun auto-loads those
+ *     files and expands `${VAR}` inside them, so a cloned repository could
+ *     otherwise pick the module. The CLI already quarantines the variable at
+ *     startup (`cli-preflight.ts` → `env-trust.ts`); this is belt-and-braces
+ *     for `gbrain/core/guardrails` library callers. Bare package specifiers
+ *     still resolve through Bun's module walk-up, so the quarantine — not the
+ *     spec shape — is the real control.
  */
 export async function loadGuardrailProvidersFromEnv(
   env: Record<string, string | undefined> = process.env,
+  opts: { cwd?: string } = {},
 ): Promise<GuardrailEnvLoadResult> {
   const spec = env.GBRAIN_GUARDRAILS_MODULE?.trim();
   if (!spec) return { loaded: 0, modulePath: null };
 
-  // File paths import via file:// URL so relative specs resolve against the
-  // operator's cwd, not against this module's location.
+  if (spec.startsWith('.')) {
+    throw new GuardrailLoadError(
+      `GBRAIN_GUARDRAILS_MODULE=${spec} is a cwd-relative path and is not loaded; ` +
+      `use an absolute path, a ~/ path, or a package name.`,
+    );
+  }
+  if ((env === process.env || opts.cwd !== undefined) &&
+      cwdDotenvAssignsKey('GBRAIN_GUARDRAILS_MODULE', opts.cwd)) {
+    throw new GuardrailLoadError(
+      'GBRAIN_GUARDRAILS_MODULE is assigned by a .env file in the current directory and is ' +
+      'not loaded — cwd .env files are untrusted for security settings. Export it from your ' +
+      'shell or set it in ~/.gbrain/.env.',
+    );
+  }
+
+  // File paths import via file:// URL so the spec is taken literally rather
+  // than resolved against this module's location.
   let target = spec;
-  if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('~')) {
-    const { resolve } = await import('node:path');
-    const { pathToFileURL } = await import('node:url');
-    const { homedir } = await import('node:os');
+  if (spec.startsWith('/') || spec.startsWith('~')) {
     const expanded = spec.startsWith('~') ? spec.replace(/^~/, homedir()) : spec;
     target = pathToFileURL(resolve(expanded)).href;
   }

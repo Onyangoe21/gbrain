@@ -381,6 +381,8 @@ export interface PageReadScope {
   excludePrivate?: boolean;
   /** Untrusted chunk reads require a verified protected-body index, even with visibility opt-outs. */
   requireSafeChunks?: boolean;
+  /** Include soft-deleted pages (getRawData follows the page's deleted_at; export/migration/ingest-healing opt in). Default false. */
+  includeDeleted?: boolean;
 }
 
 export interface PageReadPolicy extends PageReadScope {

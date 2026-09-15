@@ -2519,3 +2519,57 @@ describeBoth('Engine parity — getCalleesOf bare-name fallback (#4670)', () => 
     }
   });
 });
+
+// getRawData soft-delete filter. Companion to the #4587 soft-delete blocks
+// above, but NOT behind describeBoth: the PGLite arm always runs (so the
+// filter is exercised in every sandbox) and the Postgres arm joins when
+// DATABASE_URL is configured (CI docker Postgres).
+describe('getRawData soft-delete filter — parity (PGLite always; Postgres when DATABASE_URL is set)', () => {
+  let pglite: PGLiteEngine;
+  const arms: Array<{ name: string; eng: BrainEngine }> = [];
+
+  beforeAll(async () => {
+    pglite = new PGLiteEngine();
+    await pglite.connect({});
+    await pglite.initSchema();
+    arms.push({ name: 'pglite', eng: pglite });
+    if (!SKIP_PG) arms.push({ name: 'postgres', eng: await setupDB() });
+  }, 90_000);
+
+  afterAll(async () => {
+    await pglite.disconnect();
+    if (!SKIP_PG) await teardownDB();
+  }, 30_000);
+
+  test('putRawData → softDeletePage hides raw_data on every read shape; includeDeleted:true still returns it; restorePage makes it visible again', async () => {
+    expect(arms.length).toBeGreaterThan(0);
+    for (const { name, eng } of arms) {
+      const slug = 'wiki/raw-soft-delete';
+      await eng.putPage(slug, { type: 'note', title: 'raw', compiled_truth: 'body', timeline: '' }, { sourceId: 'default' });
+      await eng.putRawData(slug, 'transcript:test', { k: 'v' }, { sourceId: 'default' });
+      expect((await eng.getRawData(slug, undefined, { sourceId: 'default' })).length).toBe(1);
+
+      expect(await eng.softDeletePage(slug, { sourceId: 'default' })).not.toBeNull();
+      // Every WHERE shape (unscoped, scalar source, federated sourceIds,
+      // with/without a raw source filter) hides the soft-deleted page.
+      const hidden = [
+        await eng.getRawData(slug),
+        await eng.getRawData(slug, 'transcript:test'),
+        await eng.getRawData(slug, undefined, { sourceId: 'default' }),
+        await eng.getRawData(slug, 'transcript:test', { sourceId: 'default' }),
+        await eng.getRawData(slug, undefined, { sourceIds: ['default'] }),
+        await eng.getRawData(slug, 'transcript:test', { sourceIds: ['default'] }),
+      ];
+      for (const rows of hidden) expect({ arm: name, rows }).toEqual({ arm: name, rows: [] });
+
+      // Explicit opt-in (export / engine migration / ingest healing) still sees it.
+      expect((await eng.getRawData(slug, undefined, { sourceId: 'default', includeDeleted: true })).length).toBe(1);
+      expect((await eng.getRawData(slug, 'transcript:test', { sourceIds: ['default'], includeDeleted: true })).length).toBe(1);
+      expect((await eng.getRawData(slug, undefined, { includeDeleted: true })).length).toBe(1);
+
+      expect(await eng.restorePage(slug, { sourceId: 'default' })).toBe(true);
+      expect((await eng.getRawData(slug, undefined, { sourceId: 'default' })).length).toBe(1);
+      await eng.deletePage(slug, { sourceId: 'default' });
+    }
+  });
+});

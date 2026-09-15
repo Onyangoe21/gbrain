@@ -47,6 +47,48 @@ export const ALLOWED_SCOPES_LIST: ReadonlyArray<Scope> = Object.freeze([
 ]);
 
 /**
+ * Ceiling for anonymous Dynamic Client Registration (RFC 7591). A network
+ * caller that self-registers may hold at most `read write`; every privileged
+ * scope needs an operator-created grant (`gbrain auth register-client`, the
+ * admin API) or a later `gbrain auth rescope-client`. The owner-approval
+ * step on /authorize shows the requested scopes but never narrows them, so
+ * the ceiling is what keeps "approve" from meaning "grant admin".
+ */
+export const DCR_REGISTRABLE_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['read', 'write']);
+
+/**
+ * A `client_credentials` DCR client (only reachable under
+ * `--enable-dcr-insecure`) mints tokens with NO owner approval at all, so its
+ * ceiling is tighter still: read-only.
+ */
+const DCR_MACHINE_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['read']);
+
+/**
+ * null when the requested DCR scopes fit under the ceiling; otherwise the
+ * `invalid_client_metadata` message naming the offending scopes + remedy.
+ * Unknown scope strings are ignored here (filterAllowedScopes drops them);
+ * `agent` keeps its own wording because it also needs delegation bindings.
+ */
+export function dcrScopeViolation(requested: readonly string[], grantTypes: readonly string[]): string | null {
+  if (requested.includes('agent')) {
+    return 'agent scope requires an operator-approved grant with explicit delegation bindings; dynamic registration cannot grant it';
+  }
+  const machine = grantTypes.includes('client_credentials');
+  const ceiling = machine ? DCR_MACHINE_SCOPES : DCR_REGISTRABLE_SCOPES;
+  const over = [...new Set(requested.filter((s) => isScope(s) && !ceiling.has(s)))];
+  if (over.length === 0) return null;
+  const limit = [...ceiling].join(' ');
+  return (
+    `Scope "${over.join(' ')}" cannot be granted through dynamic client registration; ` +
+    (machine
+      ? `a client_credentials registration is limited to \`${limit}\` because it is issued without owner approval. `
+      : `self-registered clients are limited to \`${limit}\`. `) +
+    'Register the client with `gbrain auth register-client` / the admin API instead, ' +
+    'or register with a narrower scope and widen it later with `gbrain auth rescope-client <client_id> --scopes ...`.'
+  );
+}
+
+/**
  * Hierarchy table: which required scopes are implied by which granted scope.
  * `admin` implies all (escape hatch for legacy + super-admin tokens).
  * `write` implies `read`. The two `*_admin` siblings only imply themselves.

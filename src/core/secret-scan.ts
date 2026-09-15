@@ -69,6 +69,15 @@ export const SCAN_ALLOW_FILENAME = '.gbrain-scan-allow';
 // "task-…") never fire. Order matters: 'anthropic' precedes 'openai' and the
 // per-line claimed-span set prevents a `sk-ant-…` key from double-reporting
 // as a generic `sk-` match.
+//
+// FORMAT-BASED, not prefix-only. Credentials without a vendor prefix (a JWT,
+// an account SID, a connection string carrying its password) are matched on
+// their WIRE SHAPE. Fixed-length shapes carry a trailing negative lookahead so
+// a longer alphanumeric run (a digest, an identifier) is not cut into a
+// false "key". The two CATCH-ALLS (`bearer`, `db_url_credentials`) are
+// appended LAST on purpose: the per-line claimed-span dedupe is first-wins,
+// so `Bearer <vendor key>` keeps its vendor attribution and a JWT used as a
+// URL password attributes once.
 
 interface CompiledPattern {
   name: string;
@@ -77,7 +86,19 @@ interface CompiledPattern {
   entropyGated?: boolean;
 }
 
-const CORE_PATTERNS: ReadonlyArray<{ name: string; source: string }> = [
+interface CorePattern {
+  name: string;
+  source: string;
+  /**
+   * When true, `source` already carries the two-group layout (group 1 =
+   * boundary/anchor, group 2 = value) and is compiled as-is instead of being
+   * wrapped in the default left-boundary group. Used when the anchor is a
+   * literal keyword (e.g. `Bearer `) that must NOT be part of the value.
+   */
+  prebuilt?: boolean;
+}
+
+const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   { name: 'anthropic', source: 'sk-ant-[A-Za-z0-9_-]{16,}' },
   // Prefixed OpenAI forms (sk-proj-/sk-svcacct-/sk-None-) allow `_`/`-` in the
   // body, which the bare sk- pattern below deliberately does not. Ordered
@@ -88,8 +109,27 @@ const CORE_PATTERNS: ReadonlyArray<{ name: string; source: string }> = [
   { name: 'voyage', source: 'pa-[A-Za-z0-9_-]{20,}' },
   { name: 'github_pat', source: 'github_pat_[A-Za-z0-9_]{22,}' },
   { name: 'github_token', source: 'gh[pousr]_[A-Za-z0-9]{36,}' },
+  { name: 'gitlab_pat', source: 'glpat-[A-Za-z0-9_-]{20,}' },
   { name: 'slack', source: 'xox[baprs]-[A-Za-z0-9-]{10,}' },
-  { name: 'aws_access_key', source: 'AKIA[0-9A-Z]{16}' },
+  // Long-lived (AKIA) and temporary/STS (ASIA) access-key ids: fixed 16 after
+  // the prefix, hard right edge.
+  { name: 'aws_access_key', source: '(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Za-z])' },
+  { name: 'google_api_key', source: 'AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])' },
+  // Stripe secret/restricted keys + webhook signing secrets.
+  { name: 'stripe', source: '[sr]k_(?:live|test)_[0-9a-zA-Z]{20,}' },
+  { name: 'stripe', source: 'whsec_[A-Za-z0-9]{24,}' },
+  { name: 'sendgrid', source: 'SG\\.[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{16,}' },
+  // Twilio account SID (AC) / API signing key SID (SK): 32 hex, hard right
+  // edge so a longer hex digest that happens to start with AC never matches.
+  { name: 'twilio', source: '(?:AC|SK)[0-9a-fA-F]{32}(?![0-9A-Za-z])' },
+  // Supabase secret (sb_secret_) and management/personal access (sbp_) keys.
+  // Deliberately NOT here: `sb_publishable_` (public by design) and the
+  // project ref (hostname label or `project_ref=` assignment) — identifiers,
+  // not credentials.
+  { name: 'supabase_key', source: 'sb_secret_[A-Za-z0-9_-]{20,}' },
+  { name: 'supabase_key', source: 'sbp_[a-f0-9]{40}(?![0-9A-Za-z])' },
+  { name: 'npm_token', source: 'npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])' },
+  { name: 'huggingface', source: 'hf_[A-Za-z0-9]{30,}' },
   // gbrain's own tokens: generateToken (core/utils.ts) mints 'gbrain_' plus an
   // optional OAuth infix (at_ access / rt_ refresh / cs_ client secret /
   // code_ auth code) plus 32 random bytes hex. Without this entry the scanner
@@ -98,6 +138,30 @@ const CORE_PATTERNS: ReadonlyArray<{ name: string; source: string }> = [
   // transcript ingest carries it into pages. gbrain_cl_ client ids are public
   // identifiers, deliberately not listed here.
   { name: 'gbrain_token', source: 'gbrain_(?:at_|rt_|cs_|code_)?[0-9a-f]{64}' },
+  // JWT: three base64url segments (header.payload.signature). No vendor
+  // prefix — this is the wire format of many service-role / session
+  // credentials, so it is matched on shape. Same source as the PII family in
+  // eval-capture-scrub.ts; secret-scan is the owner for redaction lanes.
+  { name: 'jwt', source: 'eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}' },
+  // ── Catch-alls: LAST, so vendor/JWT attribution above claims the span first.
+  // Bearer: prebuilt two-group layout — the `Bearer ` keyword is the anchor
+  // (group 1), only the token is the value (group 2), so the redacted text
+  // reads `Bearer <REDACTED:bearer>` and the fingerprint is the token's.
+  {
+    name: 'bearer',
+    source: '((?:^|[^A-Za-z0-9_])[Bb]earer\\s+)([A-Za-z0-9._~+/=-]{20,})',
+    prebuilt: true,
+  },
+  // Connection strings with inline credentials: the value is exactly the
+  // scheme://user:pass@ span (an empty user is allowed — a redis URL whose
+  // userinfo is just a colon and the password still fires),
+  // so the host/db survive redaction for context. Database schemes only;
+  // `https://user@host` never fires. Literal example spellings are avoided
+  // in this comment on purpose (scripts/check-pg-url-redaction.sh).
+  {
+    name: 'db_url_credentials',
+    source: '(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis|rediss|amqp|mssql):\\/\\/[^\\s:/@]*:[^\\s@]+@',
+  },
   // NOTE: private_key_pem is NOT here — a PEM key spans multiple lines and the
   // per-line scanner below cannot see the base64 body. It is matched over the
   // WHOLE text by PEM_BLOCK_RE (see scanPemBlocks) so redaction covers the
@@ -137,12 +201,21 @@ export const PEM_BLOCK_RE =
 // matched — the value length was doing gating the entropy check is there to
 // do. Real passwords are frequently 12-16 characters; secrets that long with
 // 3.5 bits/char of entropy are not prose.
+//
+// The value must ALSO contain at least one digit. Identifier-shaped values
+// (`DefaultAzureCredential`, `/usr/local/bin/aws-vault`, an env-var NAME
+// assigned to an `apiKeyEnvVar`) clear the entropy gate on mixed case and
+// separators alone and were being redacted out of ordinary code. Real
+// machine-minted secrets essentially always carry digits; a digitless
+// passphrase is the accepted miss. A 40-hex git sha assigned to a `token:`
+// key still redacts (digits + entropy) — documented, acceptable.
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 3.5;
+const HIGH_ENTROPY_REQUIRES_DIGIT_RE = /[0-9]/;
 
 function compilePatterns(opts: ScanOpts): CompiledPattern[] {
   const out: CompiledPattern[] = CORE_PATTERNS.map((p) => ({
     name: p.name,
-    re: new RegExp(`(^|[^A-Za-z0-9_])(${p.source})`, 'g'),
+    re: new RegExp(p.prebuilt ? p.source : `(^|[^A-Za-z0-9_])(${p.source})`, 'g'),
   }));
   if (opts.highEntropy) {
     // Group layout matches the core shape: group 1 = boundary (empty here,
@@ -335,6 +408,7 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
         // Zero-width safety: never loop forever on a pathological pattern.
         if (m[0].length === 0) p.re.lastIndex++;
         if (claimed.some(([s, e]) => start < e && end > s)) continue;
+        if (p.entropyGated && !HIGH_ENTROPY_REQUIRES_DIGIT_RE.test(value)) continue;
         if (p.entropyGated && shannonEntropy(value) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
         claimed.push([start, end]);
         hits.push({ pattern: p.name, line: i + 1, value, lineText: line });

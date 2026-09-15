@@ -551,8 +551,9 @@ export async function copyPageToTarget(
     }, sourceOpts);
   }
 
-  // Copy raw data
-  const rawData = await source.getRawData(page.slug, undefined, sourceOpts);
+  // Copy raw data (includeDeleted: a migration copies whatever the page row
+  // carries — the page list already decided which rows travel).
+  const rawData = await source.getRawData(page.slug, undefined, { ...sourceOpts, includeDeleted: true });
   for (const rd of rawData) {
     await target.putRawData(page.slug, rd.source, rd.data, sourceOpts);
   }

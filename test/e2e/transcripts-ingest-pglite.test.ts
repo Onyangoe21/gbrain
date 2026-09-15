@@ -646,3 +646,104 @@ describe('putRawData zero-row parity (PGLite)', () => {
     ).rejects.toThrow(/not found/);
   });
 });
+
+// ── Format-based redaction lands in the STORED page ─────────────────────────
+//
+// Synthetic, runtime-joined values (>= 2 fragments each) so no committed line
+// carries a credential-shaped literal. Read back through the engine (never
+// grep the PGLite data dir — its paged format hides plaintext from grep).
+const SEEDED_JWT = [
+  'eyJhbGciOiJIUzI1NiJ9',
+  'eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaWF0IjoxNzAwMDAwMDAwfQ',
+  'c2lnbmF0dXJlLXBsYWNlaG9sZGVyLTAwMDA',
+].join('.');
+const SEEDED_SID = ['AC', '0123456789abcdef', '0123456789abcdef'].join('');
+const SEEDED_GOOGLE = ['AIza', 'SyD1-Fake_Example0123456789abcdefGH'].join('');
+const SEEDED_STRIPE = ['sk_live_', '4eC39HqLyjWDarjtT1zdp7dc'].join('');
+const SEEDED_DB_URL = ['postgres://', 'dbuser', ':', 'p4ssw0rd', '@db.internal:5432/app'].join('');
+const SEEDED_ENTROPIC = ['aB3xK9mQ', '2pR7sT1vW4yZ8bC5'].join('');
+
+function claudeCodeLine(type: 'user' | 'assistant', uuid: string, ts: string, content: string): string {
+  return JSON.stringify({
+    type,
+    message: { role: type, content },
+    uuid,
+    timestamp: ts,
+    cwd: '/tmp/poc',
+    sessionId: 'poc-0001',
+    version: '2.1.0',
+    gitBranch: 'main',
+  });
+}
+
+describe('format-based redaction before write (unprefixed credential shapes)', () => {
+  test('claude-code session: JWT / account SID / connection string / cloud keys land as placeholders only', async () => {
+    const p = join(tmp, 'poc-session.jsonl');
+    writeFileSync(
+      p,
+      [
+        claudeCodeLine('user', 'seed-0000', '2026-08-25T23:00:00.000Z', `deploy is failing. service role key ${SEEDED_JWT} and project ref zfakerefzfakeref0000`),
+        claudeCodeLine('assistant', 'seed-0001', '2026-08-25T23:00:01.000Z', `twilio sid ${SEEDED_SID} and maps key ${SEEDED_GOOGLE} need rotating`),
+        claudeCodeLine('user', 'seed-0002', '2026-08-25T23:00:02.000Z', `stripe ${SEEDED_STRIPE} plus DATABASE_URL=${SEEDED_DB_URL} and SMTP_TOKEN=${SEEDED_ENTROPIC}`),
+      ].join('\n') + '\n',
+    );
+    const r = await runTranscriptsIngest(engine, baseOpts([p]));
+    expect(r.sessionsImported).toBe(1);
+    expect(r.pages.imported).toBe(1);
+    expect(r.redactions).toBeGreaterThanOrEqual(6);
+
+    const slug = r.slugsTouched[0];
+    const page = await engine.getPage(slug, { sourceId: 'default' });
+    expect(page).not.toBeNull();
+    const body = page!.compiled_truth;
+    // Positive control: harmless prose from the same page is present.
+    expect(body).toContain('deploy is failing');
+    for (const v of [SEEDED_JWT, SEEDED_SID, SEEDED_GOOGLE, SEEDED_STRIPE, SEEDED_ENTROPIC, 'p4ssw0rd']) {
+      expect(body).not.toContain(v);
+    }
+    for (const tag of [
+      '<REDACTED:jwt>', '<REDACTED:twilio>', '<REDACTED:google_api_key>', '<REDACTED:stripe>',
+      '<REDACTED:db_url_credentials>', '<REDACTED:high_entropy_assignment>',
+    ]) {
+      expect(body).toContain(tag);
+    }
+    // A project ref is an identifier, not a credential — deliberately kept.
+    expect(body).toContain('zfakerefzfakeref0000');
+    // Whatever session metadata rode along carries no seeded value either.
+    const raw = await engine.getRawData(slug, undefined, { sourceId: 'default' });
+    const stored = JSON.stringify(raw);
+    for (const v of [SEEDED_JWT, SEEDED_SID, SEEDED_GOOGLE, SEEDED_STRIPE, 'p4ssw0rd']) {
+      expect(stored).not.toContain(v);
+    }
+  });
+});
+
+describe('raw_data follows the page soft-delete', () => {
+  test('after softDeletePage the session metadata is invisible; includeDeleted:true still reads it; restore brings it back', async () => {
+    const p = join(tmp, 'plain-session.jsonl');
+    writeFileSync(
+      p,
+      [
+        JSON.stringify({ type: 'session', version: 3, id: 'plain-01', timestamp: '2026-08-09T10:00:00.000Z', cwd: '/tmp/plain' }),
+        JSON.stringify({
+          type: 'message',
+          id: 'm-1',
+          timestamp: '2026-08-09T10:00:01.000Z',
+          message: { role: 'user', timestamp: '2026-08-09T10:00:01.000Z', content: [{ type: 'text', text: 'plain question' }] },
+        }),
+      ].join('\n') + '\n',
+    );
+    const r = await runTranscriptsIngest(engine, baseOpts([p]));
+    expect(r.sessionsImported).toBe(1);
+    const slug = r.slugsTouched[0];
+    expect((await engine.getRawData(slug, undefined, { sourceId: 'default' })).length).toBeGreaterThan(0);
+
+    expect(await engine.softDeletePage(slug, { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.getRawData(slug, undefined, { sourceId: 'default' })).toEqual([]);
+    expect(await engine.getRawData(slug)).toEqual([]);
+    expect((await engine.getRawData(slug, undefined, { sourceId: 'default', includeDeleted: true })).length).toBeGreaterThan(0);
+
+    expect(await engine.restorePage(slug, { sourceId: 'default' })).toBe(true);
+    expect((await engine.getRawData(slug, undefined, { sourceId: 'default' })).length).toBeGreaterThan(0);
+  });
+});

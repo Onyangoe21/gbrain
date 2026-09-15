@@ -342,8 +342,13 @@ export async function runTranscriptsIngest(
                 // write so healthy re-runs stay write-free.
                 let needsRaw = true;
                 if (allSkipped) {
+                  // includeDeleted: this is a compare-before-write probe on
+                  // the page's own row, so it must see the row regardless of
+                  // its soft-delete state — otherwise a tombstoned row reads
+                  // as "no raw yet" and gets a fresh write.
                   const existing = await engine.getRawData(resolvedBaseSlug, rawSource, {
                     sourceId: opts.sourceId,
+                    includeDeleted: true,
                   });
                   needsRaw =
                     existing.length === 0 ||

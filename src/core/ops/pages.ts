@@ -1104,10 +1104,11 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential).',
   params: {
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },
     source_id: { type: 'string', description: "#4329: source holding the row to soft-delete (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId. Remote callers may only target their write source — federated read grants do not confer delete access." },
+    purge: { type: 'boolean', description: 'Hard-delete immediately after the soft-delete (no 72h recovery; status purged). Honored only for the trusted local CLI; remote/MCP callers get invalid_params and keep the soft-delete path.' },
   },
   mutating: true,
   scope: 'write',
@@ -1118,7 +1119,18 @@ const delete_page: Operation = {
     // the delete landed on ctx.sourceId's row — the wrong-source soft-delete).
     const requestedSource = parseSourceIdParam(p.source_id, 'delete_page');
     if (requestedSource !== undefined) assertSourceInWriteGrant(ctx, requestedSource);
-    if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
+    // purge: strict boolean, trusted-local only (fail-closed: anything not
+    // strictly remote === false is a remote caller). The hard-delete
+    // primitive is the point of no return, so it never rides an agent-facing
+    // transport — the operator types it.
+    if (p.purge !== undefined && typeof p.purge !== 'boolean') {
+      throw new OperationError('invalid_params', 'purge must be a boolean.', 'Pass purge: true (CLI: gbrain delete <slug> --purge).');
+    }
+    const purge = p.purge === true;
+    if (purge && ctx.remote !== false) {
+      throw new OperationError('invalid_params', 'purge is only available to the local CLI.', 'Remote callers soft-delete only; run `gbrain delete <slug> --purge` on the host to remove a page immediately.');
+    }
+    if (ctx.dryRun) return { dry_run: true, action: purge ? 'purge_page' : 'soft_delete_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
     const sourceOpts = requestedSource
@@ -1148,6 +1160,11 @@ const delete_page: Operation = {
       if (!existing) {
         throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug (and source_id on a multi-source brain).');
       }
+      if (purge) {
+        // Remediation path: the tombstone already exists; finish the removal.
+        await ctx.engine.deletePage(slug, sourceOpts);
+        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}) };
+      }
       return { status: 'already_soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), deleted_at: existing.deleted_at };
     }
     // #4022: remove the on-disk artifact too. Pre-fix this was DB-only, so the
@@ -1159,9 +1176,15 @@ const delete_page: Operation = {
     const writeThrough = isSandboxSubagent
       ? { removed: false, skipped: 'subagent_sandbox' as const }
       : await deletePageThrough(ctx.engine, slug, { sourceId: wtSourceId, logger: ctx.logger, target });
+    if (purge) {
+      // Soft-delete first (artifact removal + the same audit shape), then the
+      // hard primitive: cascades through chunks/links/raw_data via FKs.
+      await ctx.engine.deletePage(slug, sourceOpts);
+      return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough };
+    }
     // Echo the targeted source so a multi-source caller can verify WHICH row
     // the delete landed on (#4329's false-confidence failure mode).
-    return { status: 'soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), recoverable_until: 'now + 72h via restore_page', write_through: writeThrough };
+    return { status: 'soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), recoverable_until: 'now + 72h via restore_page (remove immediately instead: gbrain delete <slug> --purge, local CLI only)', write_through: writeThrough };
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };

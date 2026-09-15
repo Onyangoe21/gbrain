@@ -180,7 +180,8 @@ const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
  * niceness also inherits to the worker's own children automatically.
  */
 export function buildWorkerArgs(
-  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested' | 'jobIsolation'>,
+  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested' | 'jobIsolation'> &
+    Partial<Pick<SupervisorOpts, 'allowShellJobs'>>,
 ): string[] {
   const args = [
     'jobs', 'work',
@@ -197,6 +198,14 @@ export function buildWorkerArgs(
   // argv is byte-identical (pinned by supervisor-build-worker-args.test.ts).
   if (opts.jobIsolation === 'process') {
     args.push('--job-isolation', 'process');
+  }
+  // Conditional push: the shell opt-in travels as a flag as well as env. The
+  // worker's startup cwd-.env quarantine (core/env-trust.ts) drops
+  // GBRAIN_ALLOW_SHELL_JOBS whenever a .env in the worker's cwd assigns it,
+  // so an env-only handoff could silently disable shell jobs; `jobs work`
+  // re-asserts the env from this flag after its preflight.
+  if (opts.allowShellJobs) {
+    args.push('--allow-shell-jobs');
   }
   return args;
 }

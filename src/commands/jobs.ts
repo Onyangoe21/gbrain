@@ -456,10 +456,13 @@ const JOBS_SUBCOMMAND_HELP: Record<string, string> = {
 USAGE
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
                    [--health-interval MS] [--nice N]
-                   [--job-isolation inline|process]
+                   [--job-isolation inline|process] [--allow-shell-jobs]
 
 OPTIONS
   --queue Q            Queue to claim from (default: default)
+  --allow-shell-jobs   Enable the shell handler on this worker. Equivalent to
+                       exporting GBRAIN_ALLOW_SHELL_JOBS=1 from your shell; a
+                       .env in the working directory cannot set it.
   --job-isolation M    inline (default): handlers run in the worker process.
                        process: each claimed job runs in its own child
                        process — a stuck handler is group-SIGKILLed instead
@@ -816,13 +819,14 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       // so the warning remains useful any time the job might sit in 'waiting'.
       if (!follow && name === 'shell') {
         process.stderr.write(
-          `\n⚠  Shell jobs require GBRAIN_ALLOW_SHELL_JOBS=1 on the worker process.\n` +
+          `\n⚠  Shell jobs require the shell handler enabled on the worker process\n` +
+          `   (--allow-shell-jobs, or GBRAIN_ALLOW_SHELL_JOBS=1 exported from your shell).\n` +
           `   Your job was queued (id=${job.id}) but will sit in 'waiting' until a\n` +
-          `   worker with the env flag starts. To run now:\n\n` +
+          `   worker with shell jobs enabled starts. To run now:\n\n` +
           `     GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs submit shell \\\n` +
           `       --params '...' --follow\n\n` +
           `   Or start a persistent worker (Postgres only — PGLite uses --follow):\n\n` +
-          `     GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs work\n\n`,
+          `     gbrain jobs work --allow-shell-jobs\n\n`,
         );
       }
 
@@ -1537,6 +1541,12 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         console.error('Use --follow for inline execution: gbrain jobs submit <name> --follow');
         process.exit(1);
       }
+
+      // --allow-shell-jobs (supervisor pass-through, see buildWorkerArgs): the
+      // startup cwd-.env quarantine drops GBRAIN_ALLOW_SHELL_JOBS when a .env
+      // in this worker's cwd assigns it, so the flag re-asserts the operator's
+      // opt-in AFTER preflight. Read sites keep checking the env var.
+      if (hasFlag(args, '--allow-shell-jobs')) process.env.GBRAIN_ALLOW_SHELL_JOBS = '1';
 
       const queueName = parseFlag(args, '--queue') ?? 'default';
       const concurrency = resolveWorkerConcurrency(args);

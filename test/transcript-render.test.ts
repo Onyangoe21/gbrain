@@ -298,3 +298,84 @@ describe('part splitting [embed-skip is the binding limit]', () => {
     expect(matches).toHaveLength(2);
   });
 });
+
+// ── Format-based redaction on every persisted surface ───────────────────────
+//
+// Synthetic, runtime-joined values (>= 2 fragments each, never one literal in
+// committed bytes). Constant names keep scanner keywords away from the `=`.
+const SEEDED_JWT = [
+  'eyJhbGciOiJIUzI1NiJ9',
+  'eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaWF0IjoxNzAwMDAwMDAwfQ',
+  'c2lnbmF0dXJlLXBsYWNlaG9sZGVyLTAwMDA',
+].join('.');
+const SEEDED_SID = ['AC', '0123456789abcdef', '0123456789abcdef'].join('');
+const SEEDED_STRIPE = ['sk_live_', '4eC39HqLyjWDarjtT1zdp7dc'].join('');
+const SEEDED_GOOGLE = ['AIza', 'SyD1-Fake_Example0123456789abcdefGH'].join('');
+const SEEDED_SENDGRID = ['SG', '.abcDEF123_ghiJKL456', '.mnoPQR789-stuVWX012'].join('');
+const SEEDED_GITLAB = ['glpat-', 'Ab12Cd34Ef56Gh78Ij90Kl'].join('');
+const SEEDED_NPM = ['npm_', 'Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78'].join('');
+const SEEDED_OPAQUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
+const SEEDED_DB_URL = ['postgres://', 'dbuser', ':', 'p4ssw0rd', '@db.internal:5432/app'].join('');
+const SEEDED_ENTROPIC = ['aB3xK9mQ', '2pR7sT1vW4yZ8bC5'].join('');
+
+describe('redactSession — format-based classes reach text, speaker, title and raw meta', () => {
+  test('a claude-code session seeded with unprefixed credential shapes persists placeholders only', () => {
+    const dirty = session(
+      [
+        { role: 'user', timestamp: '2026-08-25T23:00:00.000Z', text: `deploy is failing. service role key ${SEEDED_JWT} and sid ${SEEDED_SID}` },
+        {
+          role: 'assistant',
+          timestamp: '2026-08-25T23:00:01.000Z',
+          speaker: `helper ${SEEDED_GOOGLE}`,
+          text: `stripe ${SEEDED_STRIPE}, db ${SEEDED_DB_URL}, header Bearer ${SEEDED_OPAQUE}`,
+        },
+        { role: 'user', timestamp: '2026-08-25T23:00:02.000Z', text: `env has SMTP_TOKEN=${SEEDED_ENTROPIC} set` },
+      ],
+      {
+        harness: 'claude-code',
+        sessionId: 'poc-0001',
+        title: `deploy notes ${SEEDED_SENDGRID}`,
+        raw: { cwd: `/tmp/${SEEDED_GITLAB}`, note: SEEDED_NPM, version: '2.1.0', count: 1 },
+      },
+    );
+    const red = redactSession(dirty, { userPatternsPath: '/nonexistent' });
+
+    const blob = JSON.stringify(red.session);
+    for (const v of [
+      SEEDED_JWT, SEEDED_SID, SEEDED_STRIPE, SEEDED_GOOGLE, SEEDED_SENDGRID,
+      SEEDED_GITLAB, SEEDED_NPM, SEEDED_OPAQUE, SEEDED_ENTROPIC, 'p4ssw0rd',
+    ]) {
+      expect(blob).not.toContain(v);
+    }
+
+    const [m0, m1, m2] = red.session.messages;
+    expect(m0.text).toBe('deploy is failing. service role key <REDACTED:jwt> and sid <REDACTED:twilio>');
+    expect(m1.text).toContain('<REDACTED:stripe>');
+    expect(m1.text).toContain('<REDACTED:db_url_credentials>db.internal:5432/app');
+    expect(m1.text).toContain('Bearer <REDACTED:bearer>');
+    expect(m1.speaker).toBe('helper <REDACTED:google_api_key>');
+    // The transcripts lane opts into the high-entropy assignment rule.
+    expect(m2.text).toBe('env has SMTP_TOKEN=<REDACTED:high_entropy_assignment> set');
+    expect(red.session.meta.title).toBe('deploy notes <REDACTED:sendgrid>');
+    expect(red.session.meta.raw!.cwd).toBe('/tmp/<REDACTED:gitlab_pat>');
+    expect(red.session.meta.raw!.note).toBe('<REDACTED:npm_token>');
+    expect(red.session.meta.raw!.version).toBe('2.1.0'); // benign strings untouched
+    expect(red.session.meta.raw!.count).toBe(1);
+    expect(red.redactionCount).toBeGreaterThanOrEqual(10);
+
+    // The rendered page carries the same guarantee.
+    const content = renderSessionParts(red).parts[0].content;
+    for (const v of [SEEDED_JWT, SEEDED_SID, SEEDED_STRIPE, SEEDED_GOOGLE, SEEDED_OPAQUE, 'p4ssw0rd']) {
+      expect(content).not.toContain(v);
+    }
+    expect(content).toContain('<REDACTED:jwt>');
+  });
+
+  test('a code-shaped assignment without digits is NOT redacted by the entropy rule (false-positive guard)', () => {
+    const clean = session([
+      { role: 'user', timestamp: '2026-08-25T23:00:00.000Z', text: 'credentials = DefaultAzureCredential()' },
+    ]);
+    const red = redactSession(clean, { userPatternsPath: '/nonexistent' });
+    expect(red.session.messages[0].text).toBe('credentials = DefaultAzureCredential()');
+  });
+});

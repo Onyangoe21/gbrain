@@ -59,6 +59,66 @@ enforced structurally by actionlint on every workflow change.
   trust-on-first-use on this path. For the strongest guarantee, install the
   attested release binary and run `gh attestation verify` as above.
 
+## Environment variables and cwd `.env` files
+
+gbrain is usually a globally installed CLI (or a compiled binary) that runs
+with an arbitrary working directory — the repo you happen to be in, the
+workspace an agent hook fires from. Bun auto-loads `.env`, `.env.local` and
+the `.env.<NODE_ENV>[.local]` variants from that working directory into the
+process environment before any gbrain code runs, for `bun run` and for
+compiled binaries alike, and it expands `${VAR}` references inside those
+files. A `.env` committed into a cloned repository is therefore **untrusted
+input** — it was written by whoever authored the repo, not by you.
+
+**The trust boundary.** Security-relevant `GBRAIN_*` variables are honored
+from your shell environment, from a service `EnvironmentFile`, and from
+`~/.gbrain/.env` (the operator-owned secrets file). They are **never** honored
+from a `.env` file in the current directory. At startup every gbrain process
+checks the working directory's `.env` family and, for each protected variable
+that one of those files *assigns* (whatever the value — an expanded
+`${PWD}/…` looks like an ordinary absolute path by the time it reaches the
+process), drops the variable and prints one line to stderr:
+
+```
+[env] Ignoring GBRAIN_GUARDRAILS_MODULE because a .env file in the current directory assigns it — cwd .env files are untrusted for security settings. Export it from your shell or set it in ~/.gbrain/.env.
+```
+
+**Protected variables** (`CWD_DOTENV_PROTECTED_KEYS` in
+`src/core/env-trust.ts`): code-loading `GBRAIN_GUARDRAILS_MODULE`,
+`GBRAIN_PLUGIN_PATH`; exec-target `GBRAIN_CLAUDE_CLI_BIN`,
+`GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG`, `GBRAIN_JOB_CHILD_CLI`,
+`GBRAIN_BIN_OVERRIDE`; root/registry redirect `GBRAIN_HOME`,
+`GBRAIN_MOUNTS_PATH`; posture-widening `GBRAIN_ALLOW_SHELL_JOBS`,
+`GBRAIN_ALLOW_PRIVATE_REMOTES`, `GBRAIN_ALLOW_UNVERIFIED_REMOTE`,
+`GBRAIN_GIT_ALLOW_FILE_TRANSPORT`, `GBRAIN_ALLOW_MASS_RECONCILE`,
+`GBRAIN_ALLOW_DEFAULT_WRITE`, `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`.
+`GBRAIN_GUARDRAILS_MODULE` additionally refuses cwd-relative specs (`./x`,
+`../x`); use an absolute path, a `~/` path, or a package name.
+
+**Semantics worth knowing.**
+
+- *Per process.* Every gbrain process re-applies the check at startup; the
+  supervisor passes the shell-job opt-in to workers as the `--allow-shell-jobs`
+  flag so the quarantine cannot silently disable it.
+- *Key presence, not value.* If a cwd `.env` assigns a protected key, a value
+  you exported from the shell is dropped too while you stay in that directory —
+  the warning tells you so. Move the setting to `~/.gbrain/.env` or run from
+  another directory.
+- *Other variables are unchanged.* Non-protected `GBRAIN_*` variables
+  (source/brain routing, tuning knobs) still load from a cwd `.env` as before.
+  `DATABASE_URL` keeps its own, value-matching guard (see `docs/ENGINES.md`);
+  `GBRAIN_DATABASE_URL` is always honored.
+- *Server deployments.* `GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, `GBRAIN_HTTP_CORS_ORIGIN`
+  and `GBRAIN_HTTP_TRUST_PROXY` are deliberately not on the list so documented
+  container deployments that co-locate them keep working — launch
+  `gbrain serve --http` from a directory you control.
+- *Compiled binaries included.* The check runs identically in
+  `bun run src/cli.ts` and in the compiled `gbrain` binary.
+
+If you kept one of the protected variables in a project's `.env` on purpose,
+move it to `~/.gbrain/.env` (loaded before anything else, never overriding a
+shell export) or export it from your shell profile.
+
 ## Remote MCP Security
 
 ### Keep dynamic client registration disabled unless explicitly needed
@@ -67,12 +127,25 @@ GBrain disables Dynamic Client Registration (DCR) by default. Keep that
 default for internet-reachable deployments and pre-register trusted clients
 with operator-approved scopes and source access. Enabling DCR lets network
 callers create OAuth client records, so use it only when the deployment's
-trust model requires self-service registration and browser approval remains
-part of the authorization flow.
+trust model requires self-service registration. Self-registered clients still
+need the owner's approval in the admin dashboard for every authorization-code
+connection; DCR by itself never yields a token.
+
+When DCR is on, a self-registered client passes three gates. At registration
+it may request at most `read write`; a request for any privileged scope is
+rejected with HTTP 400 `invalid_client_metadata` (never silently narrowed) and
+the error text points at the operator path (`gbrain auth register-client`, the
+admin API, or a later `gbrain auth rescope-client <client_id> --scopes ...`).
+Every authorization-code connection then stops at the admin dashboard for the
+owner's approval before a code is minted — approval never widens the
+registered scope. Finally, codes and tokens are re-intersected with the
+client's current registered scope on every request, so a rescope takes effect
+immediately.
 
 Do not enable `--enable-dcr-insecure` on an untrusted network. That option is
 reserved for deployments that intentionally allow self-registered
-machine-to-machine clients without browser approval.
+machine-to-machine (`client_credentials`) clients, which are issued tokens
+without owner approval; such clients are capped at **read-only** scope.
 
 ### Recommended: `gbrain serve --http`
 
@@ -139,17 +212,46 @@ unknown authentication methods are rejected consistently. Browser-based
 clients can be configured entirely through the supported CLI flags; operators
 do not need to edit OAuth database rows by hand.
 
-### DCR consent default (v0.42.55+)
+### DCR consent default and scope ceiling
 
 The "disable `client_credentials`, only allow `authorization_code`" guidance
-above is now the built-in default for the DCR path, not just advice for custom
+above is the built-in default for the DCR path, not just advice for custom
 wrappers. With `--enable-dcr` on, a self-registered client defaults to the
-`authorization_code` (browser-approval) grant, and an explicit
+`authorization_code` (owner-approval) grant, and an explicit
 `client_credentials` request is rejected with `invalid_client_metadata`.
 Operators who genuinely need the machine-to-machine grant on the registration
-endpoint opt in with `--enable-dcr-insecure` (which implies `--enable-dcr`); a
-startup WARNING prints whenever DCR is enabled, and a second when the insecure
-grant is allowed. Pre-registering clients via the CLI / admin API is unchanged.
+endpoint opt in with `--enable-dcr-insecure` (which implies `--enable-dcr`);
+those anonymous machine clients are limited to `read`. A startup WARNING
+prints whenever DCR is enabled, and a second when the insecure grant is
+allowed. Pre-registering clients via the CLI / admin API is unchanged and
+accepts every scope.
+
+`gbrain doctor` (`oauth_client_scope_health`) warns about active clients that
+hold a scope beyond the self-registration ceiling but carry no operator grant
+record, with the exact `rescope-client` / `revoke-client` remedy. Remote
+`sources_remove` callers are confined to the sources their grant names (an
+out-of-scope id answers `not_found`), matching `sources_list` / `sources_status`.
+
+### Owner approval for authorization-code connections
+
+`/authorize` never issues an authorization code on its own. It records a
+pending request and sends the browser to the admin dashboard, where the brain
+owner signs in (bootstrap token or magic link), reviews the client name,
+redirect URI and requested scopes, and approves or denies. Only an approval
+mints a code; the code is bound to the client, redirect URI and S256 PKCE
+challenge of the pending request and is delivered to the client's registered
+redirect URI. A denial returns `error=access_denied`. This applies equally to
+clients that self-registered through Dynamic Client Registration — with
+`--enable-dcr`, self-registration lets a network caller create a client record
+and a pending request, never a token. Revoked clients are refused at
+`/authorize` before a pending request is created.
+
+Pending requests expire after ten minutes and do not survive a server restart.
+They are bounded twice: a server-wide ceiling on the in-memory store and a
+per-client ceiling of ten requests awaiting a decision, beyond which
+`/authorize` answers `429 too_many_requests` until earlier requests are
+decided or expire. The MCP SDK's built-in per-IP limits on `/authorize`,
+`/register` and `/token` remain in force.
 
 ### Token Management
 
@@ -340,3 +442,38 @@ admin SSE feed at `/admin/events`. Operators on a personal laptop who want
 raw payloads back can pass `gbrain serve --http --log-full-params` (loud
 stderr warning at startup). Multi-tenant deployments should leave it
 on the redacted default.
+
+## If a secret reached the brain
+
+Transcript ingest, captures and syncs redact credential-shaped strings before
+anything is written: vendor key prefixes, JWTs, cloud/API key shapes, `Bearer`
+headers, connection strings carrying inline passwords, PEM private keys, and
+high-entropy `KEY=`/`TOKEN=`/`PASSWORD=` assignments. No pattern set is
+complete. If you find a live credential in a page:
+
+1. **Rotate the credential first.** Anything readable by a connected agent
+   should be treated as exposed.
+2. **Remove the page immediately**, from the host machine:
+
+   ```bash
+   gbrain delete <slug> --purge
+   ```
+
+   `--purge` is honored only by the local CLI; remote/MCP callers keep the
+   72-hour soft delete. It removes the row and its chunks, links and raw session
+   metadata with no recovery window. Verify with `gbrain get <slug>` (expects
+   not found).
+3. **Check the other copies.** The brain-repo git history, a synced working
+   tree, an export directory or a compiled context file may still hold the
+   value; rewrite/re-push or regenerate those as needed.
+4. Add a value's fingerprint (printed with every `gbrain sources push` finding)
+   to `<workspace>/.gbrain-scan-allow` ONLY for values you have confirmed are
+   not credentials.
+
+**Say to your agent:** *"a secret leaked into a brain page — rotate it and
+purge the page"* (your agent rotates the credential, then runs
+`gbrain delete <slug> --purge` on the host).
+
+Behavior note: connection strings with inline passwords now block
+`gbrain sources push` / bootstrap verify and are dropped from compiled-context
+entries. The escape hatch is the same `.gbrain-scan-allow` fingerprint line.

@@ -193,7 +193,10 @@ const sources_remove: Operation = {
     'Hard-remove a source (cascades pages/chunks/embeddings). Refuses to ' +
     'delete the auto-managed clone dir unless its resolved path is confined ' +
     'under $GBRAIN_HOME/clones/ (realpath+lstat — symlink-safe). For most ' +
-    'workflows prefer sources_archive for the soft-delete path.',
+    'workflows prefer sources_archive for the soft-delete path. Confined to ' +
+    "the caller's resolved source scope (#4433): an out-of-scope id answers " +
+    'not_found, indistinguishable from a nonexistent source. Only the trusted ' +
+    'local CLI (`gbrain sources remove`) can remove any source.',
   params: {
     id: { type: 'string', required: true, description: "Source id to remove, as listed by sources_list (e.g. 'wiki'). A source id, not a page slug." },
     confirm_destructive: {
@@ -210,6 +213,19 @@ const sources_remove: Operation = {
   mutating: true,
   scope: 'sources_admin',
   handler: async (ctx, p) => {
+    // Source isolation on the DESTRUCTIVE path, mirroring sources_status's
+    // #4433 wave-L confinement exactly: EVERY untrusted caller (anything not
+    // strictly remote === false) may only remove an id inside its resolved
+    // source scope — federated grant > scalar bound source. A `sources_admin`
+    // token pinned to one source must not be able to hard-delete another
+    // source's pages. Out-of-scope ids answer not_found, indistinguishable
+    // from a nonexistent source (anti-enumeration). Trusted local CLI keeps
+    // the full operator view.
+    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
+    if (allowed && !allowed.includes(p.id as string)) {
+      throw new OperationError('not_found', `Unknown source: ${p.id}`);
+    }
     const { removeSource } = await import('../sources-ops.ts');
     return removeSource(ctx.engine, {
       id: p.id as string,

@@ -375,6 +375,21 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
   // sources_remove: cascade + clone cleanup
   // -------------------------------------------------------------------------
 
+  /**
+   * sources_remove is confined to the caller's resolved source scope (same
+   * #4433 posture as sources_status / sources_list): a sources_admin token
+   * can only hard-delete a source its federated read grant names. A freshly
+   * added source is outside the grant until the operator rescopes the client
+   * — mirror that operator step here.
+   */
+  async function widenGrantTo(...sourceIds: string[]): Promise<void> {
+    const { execFileSync } = await import('child_process');
+    execFileSync('bun', ['run', 'src/cli.ts', 'auth', 'rescope-client', clientId!,
+      '--federated-read', sourceIds.join(',')], {
+      cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, GBRAIN_HOME },
+    });
+  }
+
   test('sources_remove deletes row + cleans up the clone (managed path)', async () => {
     // Recreate the clone first (the previous test rmd it for the missing
     // assertion). We do this via sources_add since that path is exercised.
@@ -386,6 +401,16 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
     });
     const clonePath = join(GBRAIN_HOME, '.gbrain', 'clones', 'e2e-removable');
     expect(existsSync(clonePath)).toBe(true);
+    // Out of the token's grant → not_found, and nothing is removed.
+    const fenced = await callMcp(token!, 'sources_remove', {
+      id: 'e2e-removable',
+      confirm_destructive: true,
+    });
+    expect(fenced.__isError).toBe(true);
+    expect(JSON.stringify(fenced.parsed)).toMatch(/not_found/);
+    expect(existsSync(clonePath)).toBe(true);
+    // Operator widens the grant; the live token sees it on the next request.
+    await widenGrantTo('default', 'e2e-yc-artifacts', 'e2e-removable');
     const result = await callMcp(token!, 'sources_remove', {
       id: 'e2e-removable',
       confirm_destructive: true,
@@ -398,6 +423,7 @@ describeE2E('sources-remote-mcp E2E (gstack /setup-gbrain Path 4)', () => {
     // Add a fresh source with no pages — should still need confirm_destructive
     // semantically because remove is hard-delete (vs archive).
     await callMcp(token!, 'sources_add', { id: 'e2e-confirm-test', url: TEST_URL });
+    await widenGrantTo('default', 'e2e-yc-artifacts', 'e2e-confirm-test');
     const result = await callMcp(token!, 'sources_remove', {
       id: 'e2e-confirm-test',
       // omit confirm_destructive

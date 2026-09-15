@@ -36,6 +36,7 @@ import type { Operation, OperationContext } from './core/operations.ts';
 import { shouldForceExitAfterMain, finishCliTeardown, flushThenExit, currentExitCode, setCliExitVerdict, writeStdoutFinal, installStdoutPipeDelivery } from './core/cli-force-exit.ts';
 import { serializeMarkdown } from './core/markdown.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
+import { runCliPreflight } from './core/cli-preflight.ts';
 import { conceptNudge } from './core/search/query-intent.ts';
 import type { CliOptions } from './core/cli-options.ts';
 import { callRemoteTool, RemoteMcpError, unpackToolResult, extractResponseMeta } from './core/mcp-client.ts';
@@ -449,26 +450,15 @@ function maybeEmitUpdateMarker(command: string): void {
 }
 
 async function main() {
+  // cwd-.env quarantine → ~/.gbrain/.env → #3688 guardrails loader (fail-closed).
+  await runCliPreflight();
+
   // Parse global flags (--quiet / --progress-json / --progress-interval)
   // BEFORE command dispatch, so `gbrain --progress-json doctor` works.
   // The stripped argv is what the command sees.
   const rawArgs = process.argv.slice(2);
   const { cliOpts, rest: args } = parseGlobalFlags(rawArgs);
   setCliOptions(cliOpts);
-
-  // #3688: operator-configured guardrail providers load before ANY command
-  // dispatch. Fail-closed by design: when GBRAIN_GUARDRAILS_MODULE is set but
-  // broken, abort rather than silently run without the operator's firewall.
-  // (Unset → zero cost, the OSS distribution stays inert.)
-  if (process.env.GBRAIN_GUARDRAILS_MODULE) {
-    try {
-      const { loadGuardrailProvidersFromEnv } = await import('./core/guardrails.ts');
-      await loadGuardrailProvidersFromEnv();
-    } catch (err) {
-      console.error(`guardrails: ${(err as Error)?.message ?? String(err)}`);
-      process.exit(1);
-    }
-  }
 
   let command = args[0];
 

@@ -258,10 +258,61 @@ describe('sources_* handlers — happy path', () => {
         url: 'https://github.com/example/repo',
       })) as any;
       const removeOp = findOp('sources_remove');
-      const result = (await removeOp.handler(ctxRemote(['sources_admin']), {
+      // The remover's grant must cover the id (same confinement as
+      // sources_status); a freshly added source is outside the scalar
+      // 'default' grant until the operator rescopes the client.
+      const result = (await removeOp.handler(ctxRemote(['sources_admin'], ['default', 'mcp-remove-test']), {
         id: 'mcp-remove-test',
         confirm_destructive: true,
       })) as any;
+      expect(result.clone_removed).toBe(true);
+      expect(existsSync(row.local_path)).toBe(false);
+    });
+  });
+
+  test('sources_remove: untrusted caller is confined to its source scope; out-of-scope → not_found, nothing removed', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      const row = (await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-remove-fenced',
+        url: 'https://github.com/example/repo',
+      })) as any;
+      const removeOp = findOp('sources_remove');
+      const errFor = async (ctx: OperationContext, id: string): Promise<OperationError> => {
+        try {
+          await removeOp.handler(ctx, { id, confirm_destructive: true });
+        } catch (e) {
+          expect(e).toBeInstanceOf(OperationError);
+          return e as OperationError;
+        }
+        throw new Error(`expected sources_remove(${id}) to throw for the confined caller`);
+      };
+      // Scalar-bound remote caller (sourceId 'default', no federated grant):
+      // an existing out-of-scope source answers not_found and survives.
+      const scalar = await errFor(ctxRemote(['sources_admin']), 'mcp-remove-fenced');
+      expect(scalar.code).toBe('not_found');
+      // Federated grant that does not name the id: same answer.
+      const fed = await errFor(ctxRemote(['sources_admin'], ['other-src']), 'mcp-remove-fenced');
+      expect(fed.code).toBe('not_found');
+      // Anti-enumeration: a genuinely missing id yields the IDENTICAL message
+      // after id substitution, so the error cannot be used as an existence oracle.
+      const missing = await errFor(ctxRemote(['sources_admin']), 'no-such-source');
+      expect(missing.code).toBe('not_found');
+      expect(fed.message.replaceAll('mcp-remove-fenced', '<id>'))
+        .toBe(missing.message.replaceAll('no-such-source', '<id>'));
+      // `remote: undefined` is untrusted too (fail-closed), same fence.
+      const undef = await errFor({ ...ctxRemote(['sources_admin']), remote: undefined as any }, 'mcp-remove-fenced');
+      expect(undef.code).toBe('not_found');
+      // The source and its clone are untouched.
+      expect(existsSync(row.local_path)).toBe(true);
+      const local: OperationContext = { ...ctxRemote(['read']), remote: false };
+      const status = (await findOp('sources_status').handler(local, { id: 'mcp-remove-fenced' })) as any;
+      expect(status.id).toBe('mcp-remove-fenced');
+      // Trusted local CLI keeps the full operator view and can remove it.
+      const result = (await removeOp.handler(
+        { ...ctxRemote(['sources_admin']), remote: false },
+        { id: 'mcp-remove-fenced', confirm_destructive: true },
+      )) as any;
       expect(result.clone_removed).toBe(true);
       expect(existsSync(row.local_path)).toBe(false);
     });

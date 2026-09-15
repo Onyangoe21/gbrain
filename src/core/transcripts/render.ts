@@ -113,6 +113,18 @@ export function loadImportRedactionPatterns(userPatternsPath?: string): ImportRe
  * persisted (message text, SPEAKER labels, title, raw-meta string fields).
  * Throws on scanner or pattern failure — page writes are FAIL-CLOSED (unlike
  * the hook corpus lane, these pages are searchable and synced).
+ *
+ * Detector classes (all from `secret-scan.ts`, format-based — not just vendor
+ * prefixes): vendor key shapes (anthropic/openai/voyage/github/gitlab/slack/
+ * aws/google/stripe/sendgrid/twilio/supabase/npm/huggingface/gbrain), JWTs,
+ * whole-block PEM private keys, `Bearer <token>` headers, connection strings
+ * carrying inline credentials, and — opted in for THIS lane — the
+ * high-entropy `KEY=`/`TOKEN=`/`PASSWORD=` assignment heuristic (value must
+ * carry a digit and clear the entropy gate). Transcripts are the corpus where
+ * a pasted `.env` line is most likely, so recall wins over the false-positive
+ * cost here; the push gate and compiled-context scan keep the heuristic off.
+ * Every match becomes `<REDACTED:pattern>`; user patterns become
+ * `<REDACTED:user-pattern>`.
  */
 export function redactSession(
   session: ParsedSession,
@@ -127,7 +139,9 @@ export function redactSession(
     // output that legitimately carries U+0000, which Postgres text/jsonb
     // reject at the write boundary (#4392).
     let out = sanitizeForJsonb(text);
-    const r = redactFindings(out);
+    // highEntropy: transcripts opt into the assignment heuristic (see doc
+    // comment above) — the shared scanner keeps it off by default.
+    const r = redactFindings(out, { highEntropy: true });
     redactionCount += r.redactions.length;
     out = r.text;
     for (const { regex } of patterns) {

@@ -12,7 +12,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -22,6 +22,7 @@ import {
   runGuardrails,
   GuardrailLoadError,
 } from '../src/core/guardrails.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 // One fresh mkdtemp per fixture: bun caches a directory's listing after the
 // first dynamic import from it, so a second module written into the SAME dir
@@ -143,5 +144,56 @@ describe('#3688 residual — top-level side-effect registration counts', () => {
     const out = await loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: p });
     expect(out.loaded).toBe(1);
     expect(hasGuardrails()).toBe(true);
+  });
+});
+
+describe('cwd-relative specs and cwd-.env-assigned specs are refused', () => {
+  /** Fixture whose TOP LEVEL drops a marker — proves the module was never imported. */
+  function markerFixture(): { path: string; marker: string; dir: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-guardrails-relspec-'));
+    dirs.push(dir);
+    const marker = join(dir, 'PROBE_RAN');
+    const path = join(dir, 'probe.mjs');
+    writeFileSync(path, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\nexport default undefined;\n`);
+    return { path, marker, dir };
+  }
+
+  test('a cwd-relative spec (./, ../, bare .) throws GuardrailLoadError WITHOUT importing', async () => {
+    const { marker } = markerFixture();
+    for (const spec of ['./probe.mjs', '../probe.mjs', '.']) {
+      const err = await loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: spec }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(GuardrailLoadError);
+      expect((err as Error).message).toContain('absolute');
+    }
+    expect(existsSync(marker)).toBe(false);
+    expect(hasGuardrails()).toBe(false);
+  });
+
+  test('an absolute spec that a cwd .env file assigns is refused (opts.cwd)', async () => {
+    const { path, marker, dir } = markerFixture();
+    writeFileSync(join(dir, '.env'), 'GBRAIN_GUARDRAILS_MODULE=${PWD}/probe.mjs\n');
+    await expect(
+      loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: path }, { cwd: dir }),
+    ).rejects.toBeInstanceOf(GuardrailLoadError);
+    expect(existsSync(marker)).toBe(false);
+    // Same spec, a cwd WITHOUT a .env assigning the key → loads normally.
+    const clean = mkdtempSync(join(tmpdir(), 'gbrain-guardrails-clean-cwd-'));
+    dirs.push(clean);
+    await expect(
+      loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: path }, { cwd: clean }),
+    ).rejects.toBeInstanceOf(GuardrailLoadError); // imported (marker) but registers nothing
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  test('process.env path: the cwd check applies when env is process.env', async () => {
+    const { path, marker, dir } = markerFixture();
+    writeFileSync(join(dir, '.env'), 'GBRAIN_GUARDRAILS_MODULE=./probe.mjs\n');
+    await withEnv({ GBRAIN_GUARDRAILS_MODULE: path }, async () => {
+      await expect(loadGuardrailProvidersFromEnv(process.env, { cwd: dir })).rejects.toBeInstanceOf(GuardrailLoadError);
+    });
+    expect(existsSync(marker)).toBe(false);
   });
 });

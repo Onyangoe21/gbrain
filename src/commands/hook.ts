@@ -813,7 +813,9 @@ function spawnDetachedPush(root: string): void {
   // Compiled binary: execPath IS gbrain. Dev (bun src/cli.ts): re-exec the
   // entrypoint — the jobs.ts --detach precedent.
   const argv = /[/\\]gbrain(\.exe)?$/.test(exec) ? pushArgs : [process.argv[1], ...pushArgs];
-  const child = spawn(exec, argv, { detached: true, stdio: 'ignore' });
+  // Explicit env: a child spawned without one does not see the parent's
+  // cwd-.env quarantine deletions (core/env-trust.ts).
+  const child = spawn(exec, argv, { detached: true, stdio: 'ignore', env: process.env });
   child.unref();
 }
 

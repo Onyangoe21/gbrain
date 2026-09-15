@@ -993,15 +993,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // logs, not buried in the neutral "DCR: enabled" banner line.
   if (enableDcr) {
     console.error(
-      'SECURITY WARNING: Dynamic Client Registration (--enable-dcr) is ON. ' +
-      'Any network caller can self-register an OAuth client. DCR clients default ' +
-      'to the authorization_code (consent-bearing) grant. See SECURITY.md.',
+      'SECURITY WARNING: Dynamic Client Registration (--enable-dcr) is ON. Any network caller ' +
+      'can self-register an OAuth client, limited to read/write (read-only for client_credentials ' +
+      'under --enable-dcr-insecure); every authorization_code connection needs owner approval in the admin UI. See SECURITY.md.',
     );
     if (enableDcrInsecure) {
       console.error(
-        'SECURITY WARNING: --enable-dcr-insecure is ON — self-registered DCR ' +
-        'clients may request the client_credentials grant, which BYPASSES the ' +
-        '/authorize consent screen. Only use this on a trusted network.',
+        'SECURITY WARNING: --enable-dcr-insecure is ON — self-registered DCR clients may ' +
+        'request the client_credentials grant, which BYPASSES owner approval (they are capped ' +
+        'at read-only scope). Only use this on a trusted network.',
       );
     }
   }
@@ -3321,7 +3321,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 ║  Engine:    ${(config.engine || 'pglite').padEnd(40)}║
 ║  Issuer:    ${issuerUrl.origin.padEnd(40)}║
 ║  Clients:   ${String((clientCount[0] as any).count).padEnd(40)}║
-║  DCR:       ${(enableDcr ? (enableDcrInsecure ? 'enabled (INSECURE: client_credentials)' : 'enabled') : 'disabled').padEnd(40)}║
+║  DCR:       ${(enableDcr ? (enableDcrInsecure ? 'enabled (INSECURE: read-only M2M)' : 'enabled (consent; DCR max read write)') : 'disabled').padEnd(40)}║
 ║  Skills:    ${skillStatus.bannerValue.padEnd(40)}║
 ║  Token TTL: ${(tokenTtl + 's').padEnd(40)}║
 ╠══════════════════════════════════════════════════════╣

@@ -119,4 +119,91 @@ describe('checkOauthClientScopeHealth', () => {
     const r = await checkOauthClientScopeHealth(engine);
     expect(r.status).toBe('ok');
   });
+
+  // (c) Privileged self-registered clients. A row created through the
+  // anonymous DCR path carries grant_revision = 0 and no oauth_grant_audit
+  // 'register' row (operator paths write one). Rows that hold a scope beyond
+  // the DCR ceiling with that signature predate the ceiling (or predate the
+  // grant audit log) and deserve an operator look — advisory WARN with the
+  // rescope / revoke remedy.
+  describe('privileged self-registered (DCR-signature) clients', () => {
+    async function seedClient(id: string, scope: string, opts: { audited?: boolean; revision?: number; deleted?: boolean } = {}): Promise<void> {
+      await engine.executeRaw(
+        `INSERT INTO oauth_clients (client_id, client_name, scope, source_id, federated_read, grant_revision, deleted_at)
+         VALUES ($1, $2, $3, 'default', $4, $5, ${opts.deleted ? 'now()' : 'NULL'})`,
+        [id, `${id}-name`, scope, ['default'], opts.revision ?? 0],
+      );
+      if (opts.audited) {
+        await engine.executeRaw(
+          `INSERT INTO oauth_grant_audit (client_id, actor, action, revision, before_grant, after_grant)
+           VALUES ($1, 'operator', 'register', 0, NULL, '{}'::jsonb)`,
+          [id],
+        );
+      }
+    }
+
+    beforeEach(async () => {
+      await (engine as any).db.exec('DELETE FROM oauth_grant_audit');
+    });
+
+    test('admin-scoped DCR-signature row → warn naming the client + rescope/revoke remedy', async () => {
+      await seedClient('c-dcr-admin', 'read admin');
+      const r = await checkOauthClientScopeHealth(engine);
+      expect(r.status).toBe('warn');
+      expect(r.message).toMatch(/c-dcr-admin/);
+      expect(r.message).toMatch(/admin/);
+      expect(r.message).toMatch(/rescope-client <client_id> --scopes read,write|rescope-client .*--scopes/);
+      expect(r.message).toMatch(/revoke-client/);
+    });
+
+    test('sources_admin and users_admin also trip the arm; the client name is shown', async () => {
+      await seedClient('c-dcr-sources', 'sources_admin');
+      await seedClient('c-dcr-users', 'read users_admin');
+      const r = await checkOauthClientScopeHealth(engine);
+      expect(r.status).toBe('warn');
+      expect(r.message).toMatch(/c-dcr-sources-name/);
+      expect(r.message).toMatch(/c-dcr-users-name/);
+    });
+
+    test('read/write DCR-signature rows are within the ceiling → NOT flagged', async () => {
+      await seedClient('c-dcr-rw', 'read write');
+      await seedClient('c-dcr-empty', '');
+      const r = await checkOauthClientScopeHealth(engine);
+      expect(r.status).toBe('ok');
+    });
+
+    test('operator-registered admin client (audit register row) → NOT flagged', async () => {
+      await seedClient('c-op-admin', 'admin', { audited: true });
+      const r = await checkOauthClientScopeHealth(engine);
+      expect(r.status).toBe('ok');
+    });
+
+    test('rescoped admin client (grant_revision > 0) → NOT flagged', async () => {
+      await seedClient('c-rescoped-admin', 'admin', { revision: 2 });
+      const r = await checkOauthClientScopeHealth(engine);
+      expect(r.status).toBe('ok');
+    });
+
+    test('revoked (deleted_at) DCR-signature admin row → NOT flagged', async () => {
+      await seedClient('c-dcr-revoked', 'admin', { deleted: true });
+      const r = await checkOauthClientScopeHealth(engine);
+      expect(r.status).toBe('ok');
+    });
+
+    test('grant audit table missing → arm skipped with an explicit note, other arms intact', async () => {
+      await seedClient('c-dcr-admin-noaudit', 'admin');
+      await (engine as any).db.exec('DROP TABLE oauth_grant_audit');
+      try {
+        const r = await checkOauthClientScopeHealth(engine);
+        // Fail-open: cannot tell operator rows from self-registered ones
+        // without the audit log, so the arm reports unknown instead of
+        // guessing — and says so.
+        expect(r.status).toBe('ok');
+        expect(r.message).toMatch(/self-registered.*(skipped|unknown)|(skipped|unknown).*self-registered/i);
+      } finally {
+        const { GRANT_AUDIT_SCHEMA_SQL } = await import('../src/core/grants/schema.ts');
+        await (engine as any).db.exec(GRANT_AUDIT_SCHEMA_SQL);
+      }
+    });
+  });
 });

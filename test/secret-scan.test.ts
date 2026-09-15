@@ -364,3 +364,186 @@ describe('high-entropy assignment reaches compound credential keys', () => {
     }
   });
 });
+
+// ── Format-based detectors (unprefixed credential shapes) ───────────────────
+//
+// Every seeded value below is SYNTHETIC and assembled at runtime from >= 2
+// fragments so no committed line carries a credential-shaped literal (the
+// wave security scan runs gitleaks with the allowlist stripped). Constant
+// names keep scanner keywords away from the `=`.
+const JWT_SEGMENTS = [
+  'eyJhbGciOiJIUzI1NiJ9',
+  'eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaWF0IjoxNzAwMDAwMDAwfQ',
+  'c2lnbmF0dXJlLXBsYWNlaG9sZGVyLTAwMDA',
+];
+const JWT = JWT_SEGMENTS.join('.');
+const ASIA_ID = ['ASIA', 'Q3EXAMPLE7ABCDEF'].join(''); // 16 after the prefix
+const GOOGLE_SHAPE = ['AIza', 'SyD1-Fake_Example0123456789abcdefGH'].join('');
+const STRIPE_LIVE = ['sk_live_', '4eC39HqLyjWDarjtT1zdp7dc'].join('');
+const STRIPE_RESTRICTED = ['rk_test_', 'Ab12Cd34Ef56Gh78Ij90Kl'].join('');
+const STRIPE_WEBHOOK = ['whsec_', 'Ab12Cd34Ef56Gh78Ij90Kl12Mn34'].join('');
+const SENDGRID_SHAPE = ['SG', '.abcDEF123_ghiJKL456', '.mnoPQR789-stuVWX012'].join('');
+const TWILIO_SID = ['AC', '0123456789abcdef', '0123456789abcdef'].join('');
+const TWILIO_SIGNING = ['SK', 'fedcba9876543210', 'fedcba9876543210'].join('');
+const SUPABASE_SB = ['sb_secret_', 'exampleplaceholdervalue00'].join(''); // low-entropy value: matches sb_secret_[A-Za-z0-9_-]{20,} but stays under gitleaks' generic-api-key entropy gate
+const SUPABASE_SBP = ['sbp_', '0123456789abcdef0123456789abcdef01234567'].join('');
+const GITLAB_SHAPE = ['glpat-', 'Ab12Cd34Ef56Gh78Ij90Kl'].join('');
+const NPM_SHAPE = ['npm_', 'Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78'].join('');
+const HF_SHAPE = ['hf_', 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'].join('');
+const OPAQUE_BEARER_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
+const DB_URL_CREDS = ['postgres://', 'dbuser', ':', 'p4ssw0rd', '@'].join('');
+const DB_URL = DB_URL_CREDS + 'db.internal:5432/app';
+const MONGO_SRV_URL = ['mongodb+srv://', 'app', ':', 'p4ss', '@cluster0.internal/db'].join('');
+const REDIS_NOUSER_URL = ['redis://', ':', 'r3dis', '@cache.internal:6379'].join('');
+
+describe('format-based detectors — attribution per pattern (unprefixed credential shapes)', () => {
+  const cases: Array<[string, string, string]> = [
+    ['jwt', 'service role', JWT],
+    ['aws_access_key', 'temporary aws id', ASIA_ID],
+    ['google_api_key', 'maps', GOOGLE_SHAPE],
+    ['stripe', 'live', STRIPE_LIVE],
+    ['stripe', 'restricted', STRIPE_RESTRICTED],
+    ['stripe', 'webhook signing', STRIPE_WEBHOOK],
+    ['sendgrid', 'mail', SENDGRID_SHAPE],
+    ['twilio', 'account sid', TWILIO_SID],
+    ['twilio', 'signing key', TWILIO_SIGNING],
+    ['supabase_key', 'sb_secret form', SUPABASE_SB],
+    ['supabase_key', 'sbp management token', SUPABASE_SBP],
+    ['gitlab_pat', 'gitlab', GITLAB_SHAPE],
+    ['npm_token', 'npm', NPM_SHAPE],
+    ['huggingface', 'hf', HF_SHAPE],
+    ['db_url_credentials', 'postgres url', DB_URL],
+    ['db_url_credentials', 'mongodb+srv url', MONGO_SRV_URL],
+    ['db_url_credentials', 'redis url with empty user', REDIS_NOUSER_URL],
+  ];
+  for (const [pattern, label, value] of cases) {
+    test(`${pattern} (${label}) fires exactly once and never leaks the value`, () => {
+      const findings = scanText(`note: ${value} end`);
+      expect(findings.map((f) => f.pattern)).toEqual([pattern]);
+      expect(JSON.stringify(findings).includes(value)).toBe(false);
+      expect(findings[0]!.redactedPreview).toContain(`<REDACTED:${pattern}>`);
+      const { text } = redactFindings(`x ${value} y`);
+      expect(text.includes(value)).toBe(false);
+      expect(text).toContain(`<REDACTED:${pattern}>`);
+    });
+  }
+
+  test('connection-string redaction keeps the host/db, drops only the credential span', () => {
+    const { text } = redactFindings(`DATABASE_URL=${DB_URL}`);
+    expect(text).toBe('DATABASE_URL=<REDACTED:db_url_credentials>db.internal:5432/app');
+    expect(text.includes('p4ssw0rd')).toBe(false);
+  });
+
+  test('the advisory-shaped session line: JWT + account SID both redacted, prose intact', () => {
+    const line = `deploy is failing. service role key ${JWT} and twilio sid ${TWILIO_SID}`;
+    const { text, redactions } = redactFindings(line);
+    expect(redactions.map((r) => r.pattern).sort()).toEqual(['jwt', 'twilio']);
+    expect(text).toBe('deploy is failing. service role key <REDACTED:jwt> and twilio sid <REDACTED:twilio>');
+  });
+});
+
+describe('format-based detectors — ordering + catch-all attribution', () => {
+  test('Bearer <jwt> attributes to jwt (specific wins over the bearer catch-all)', () => {
+    const findings = scanText(`Authorization: Bearer ${JWT}`);
+    expect(findings.map((f) => f.pattern)).toEqual(['jwt']);
+  });
+
+  test('Bearer <opaque token> attributes to bearer; the header word survives redaction', () => {
+    const findings = scanText(`Authorization: Bearer ${OPAQUE_BEARER_VALUE}`);
+    expect(findings.map((f) => f.pattern)).toEqual(['bearer']);
+    const { text } = redactFindings(`Authorization: Bearer ${OPAQUE_BEARER_VALUE}`);
+    expect(text).toBe('Authorization: Bearer <REDACTED:bearer>');
+    // lowercase header word too
+    expect(scanText(`authorization: bearer ${OPAQUE_BEARER_VALUE}`).map((f) => f.pattern)).toEqual(['bearer']);
+  });
+
+  test('Bearer <vendor key> keeps the vendor attribution (existing contract, pinned against the catch-all)', () => {
+    expect(scanText(`Bearer ${ANTHROPIC}`).map((f) => f.pattern)).toEqual(['anthropic']);
+    expect(scanText(`Bearer gbrain_at_${GBRAIN_HEX}`).map((f) => f.pattern)).toEqual(['gbrain_token']);
+    expect(scanText(`Bearer ${GHP}`).map((f) => f.pattern)).toEqual(['github_token']);
+  });
+
+  test('a JWT used as a connection-string password attributes once (no double report)', () => {
+    const url = ['postgres://', 'svc', ':', JWT, '@db.internal/app'].join('');
+    const findings = scanText(url);
+    expect(findings.length).toBe(1);
+    const { text } = redactFindings(url);
+    expect(text.includes(JWT)).toBe(false);
+  });
+});
+
+describe('format-based detectors — negatives (identifiers and public shapes stay put)', () => {
+  test('uppercase 64-hex digest starting with AC is not a Twilio SID', () => {
+    const digest = 'AC' + 'DEADBEEF'.repeat(7) + 'DEADBE';
+    expect(digest.length).toBe(64);
+    expect(scanText(`sha256: ${digest}`)).toEqual([]);
+  });
+
+  test('URLs with userinfo but no password, or non-database schemes, do not fire', () => {
+    for (const s of [
+      'https://user@host.example/path',
+      'https://user:pw@host.example/path',   // not a database scheme — by design
+      'postgres://db.internal:5432/app',     // no credentials
+      'git@github.com:org/repo.git',
+    ]) {
+      expect(scanText(s)).toEqual([]);
+    }
+  });
+
+  test('fixed-length shapes require a hard right edge (longer runs are identifiers)', () => {
+    for (const s of [
+      `${ASIA_ID}XYZ`,               // 19 after ASIA — not a 16-char key id
+      `${TWILIO_SID}ff`,              // 34 hex after AC
+      `${GOOGLE_SHAPE}zz`,            // 37 after AIza
+      `${NPM_SHAPE}Q`,                // 37 after npm_
+      `${SUPABASE_SBP}9`,             // 41 hex after sbp_
+    ]) {
+      expect(scanText(s)).toEqual([]);
+    }
+  });
+
+  test('Supabase publishable keys and project refs are identifiers, not credentials', () => {
+    // sb_publishable_ is public by design; a bare 20-char project ref is an
+    // identifier (deliberately NOT a pattern).
+    expect(scanText(`anon: sb_publishable_${'Ab12Cd34Ef56Gh78Ij90Kl12'}`)).toEqual([]);
+    expect(scanText('project ref zfakerefzfakeref0000 at zfakerefzfakeref0000.supabase.co')).toEqual([]);
+  });
+
+  test('the JWT prefix alone, or two segments, does not fire', () => {
+    expect(scanText(`header ${JWT_SEGMENTS[0]} only`)).toEqual([]);
+    expect(scanText(`two ${JWT_SEGMENTS[0]}.${JWT_SEGMENTS[1]} segments`)).toEqual([]);
+  });
+
+  test('embedded inside an identifier, vendor prefixes still do not fire', () => {
+    expect(scanText(`x_${STRIPE_LIVE}`)).toEqual([]);
+    expect(scanText(`my${GITLAB_SHAPE}`)).toEqual([]);
+  });
+});
+
+describe('high-entropy assignment requires a digit in the value', () => {
+  test('code-shaped assignments without a digit do not fire (probe lines)', () => {
+    for (const s of [
+      'credentials = DefaultAzureCredential()',
+      'credential_process = /usr/local/bin/aws-vault',
+      'apiKeyEnvVar = "OPENAI_API_KEY_PRODUCTION"',
+      'secret_name = my-app/prod/database-credentials',
+      'api_key_header: X-Api-Key-Authorization-Header',
+    ]) {
+      expect(scanText(s, { highEntropy: true })).toEqual([]);
+    }
+  });
+
+  test('a TOKEN= assignment with a digit-bearing entropic value still fires', () => {
+    const v = ['aB3xK9mQ', '2pR7sT1vW4yZ8bC5'].join('');
+    expect(scanText(`SMTP_TOKEN=${v}`, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
+  });
+
+  /** Known, accepted limitation: a 40-hex git sha assigned to a `token:` key
+   * has digits AND passes the entropy gate, so it redacts. Pinned so the
+   * trade-off stays visible. */
+  test('a 40-hex sha after token: still redacts (documented trade-off)', () => {
+    const sha = '3e365f5f1a2b4c8d9e0f1a2b3c4d5e6f70819293';
+    expect(shannonEntropy(sha)).toBeGreaterThanOrEqual(3.5);
+    expect(scanText(`token: ${sha}`, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
+  });
+});
