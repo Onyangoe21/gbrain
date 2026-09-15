@@ -84,6 +84,8 @@ interface CompiledPattern {
   re: RegExp; // 'g' flags; group 1 = boundary, group 2 = the secret value
   /** When true, a match must also pass the Shannon-entropy gate. */
   entropyGated?: boolean;
+  /** See CorePattern.precheck. */
+  precheck?: (line: string) => boolean;
 }
 
 interface CorePattern {
@@ -96,6 +98,13 @@ interface CorePattern {
    * literal keyword (e.g. `Bearer `) that must NOT be part of the value.
    */
   prebuilt?: boolean;
+  /**
+   * Cheap substring gate run BEFORE the regex on every line: when it returns
+   * false the line cannot contain a match and the regex is skipped. Used by
+   * the catch-alls, whose alternation + negated classes are the costliest
+   * shapes here and whose anchor (`earer`, `@`) is a one-call `includes`.
+   */
+  precheck?: (line: string) => boolean;
 }
 
 const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
@@ -151,6 +160,7 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
     name: 'bearer',
     source: '((?:^|[^A-Za-z0-9_])[Bb]earer\\s+)([A-Za-z0-9._~+/=-]{20,})',
     prebuilt: true,
+    precheck: (line) => line.includes('earer'),
   },
   // Connection strings with inline credentials: the value is exactly the
   // scheme://user:pass@ span (an empty user is allowed — a redis URL whose
@@ -158,9 +168,28 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // so the host/db survive redaction for context. Database schemes only;
   // `https://user@host` never fires. Literal example spellings are avoided
   // in this comment on purpose (scripts/check-pg-url-redaction.sh).
+  //
+  // Both userinfo segments are BOUNDED (user 0-128, password 1-256) and both
+  // classes stop at `/` and at the characters RFC 3986 forbids raw in
+  // userinfo (`"` `<` `>` `\` `^` backtick `{` `|` `}`) plus `'` — every
+  // sub-delim (`!$&()*+,;=`), `:` in the password and `%XX` escapes still
+  // match. The old unbounded `[^\s@]+` ran to the end of the line and
+  // backtracked once per scheme occurrence: quadratic on long @-free lines
+  // (a 250 KB minified JSON line of credential-less redis URLs took ~4 s,
+  // 160 KB of repeated `redis://:` ~5.6 s, 1 MB minutes). It ALSO turned a
+  // credential-less URL followed within 256 chars by any `@` (an email in
+  // the same minified JSON object) into a bogus finding, because the string
+  // delimiters between them were legal password characters — the class
+  // exclusions are what end that run at the URL's closing quote. With the
+  // bounds the work per scheme occurrence is a constant; the precheck skips
+  // the regex on lines with no `@` at all. A password over 256 chars is the
+  // accepted miss (a JWT that long is still claimed by `jwt` above).
   {
     name: 'db_url_credentials',
-    source: '(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis|rediss|amqp|mssql):\\/\\/[^\\s:/@]*:[^\\s@]+@',
+    source:
+      '(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis|rediss|amqp|mssql):\\/\\/' +
+      '[^\\s:/@"\'<>\\\\^`{|}]{0,128}:[^\\s@/"\'<>\\\\^`{|}]{1,256}@',
+    precheck: (line) => line.includes('@'),
   },
   // NOTE: private_key_pem is NOT here — a PEM key spans multiple lines and the
   // per-line scanner below cannot see the base64 body. It is matched over the
@@ -216,6 +245,7 @@ function compilePatterns(opts: ScanOpts): CompiledPattern[] {
   const out: CompiledPattern[] = CORE_PATTERNS.map((p) => ({
     name: p.name,
     re: new RegExp(p.prebuilt ? p.source : `(^|[^A-Za-z0-9_])(${p.source})`, 'g'),
+    ...(p.precheck ? { precheck: p.precheck } : {}),
   }));
   if (opts.highEntropy) {
     // Group layout matches the core shape: group 1 = boundary (empty here,
@@ -356,11 +386,30 @@ export function pathAllowlisted(relPath: string, allowlist: string[]): boolean {
 
 // ── Scanning ────────────────────────────────────────────────────────────────
 
-interface RawHit {
+/** One claimed span on a line: where `value` starts within the line text. */
+interface LineSpan {
   pattern: string;
-  line: number; // 1-based
   value: string;
+  start: number;
+}
+
+/**
+ * The claimed spans of one scanned line, shared BY REFERENCE between that
+ * line's hits (appended to while the line is still being scanned), so
+ * buildPreview can redact a hit's neighbours and snap its window to whole
+ * spans.
+ */
+interface LineSpans {
+  /** Discovery order (pattern-major). */
+  all: LineSpan[];
+  /** Lazily built by buildPreview: `all` sorted by `start`. */
+  byStart?: LineSpan[];
+}
+
+interface RawHit extends LineSpan {
+  line: number; // 1-based
   lineText: string;
+  spans: LineSpans;
 }
 
 /**
@@ -382,7 +431,8 @@ function scanPemBlocks(text: string): RawHit[] {
     }
     // 1-based line of the header start.
     const line = text.slice(0, m.index).split('\n').length;
-    hits.push({ pattern: 'private_key_pem', line, value, lineText: value });
+    const span: LineSpan = { pattern: 'private_key_pem', value, start: 0 };
+    hits.push({ ...span, line, lineText: value, spans: { all: [span] } });
   }
   return hits;
 }
@@ -394,11 +444,26 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
   // named patterns, so order is a belt-and-suspenders guarantee).
   const hits: RawHit[] = scanPemBlocks(text);
   const lines = text.split('\n');
+  // No per-line length cap, deliberately: a secret on a 1 MB minified line
+  // must still be found and redacted, so long lines are scanned in full.
+  // What keeps that bounded is (a) every pattern doing constant work per
+  // candidate occurrence — the one shape that could backtrack to end-of-line
+  // (db_url_credentials) carries bounded quantifiers — and (b) each
+  // catch-all's `precheck`, a substring test that skips its regex on lines
+  // without the anchor. The first-wins overlap check and the preview window
+  // are both O(log hits) per hit (claimed-char bitmap; sorted spans), so a
+  // line with tens of thousands of hits costs O(hits), not O(hits²) — and
+  // preview rendering is windowed (buildPreview), not O(hits × line).
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line || line.length < 8) continue;
-    const claimed: Array<[number, number]> = [];
+    const spans: LineSpans = { all: [] };
+    // Claimed-character bitmap behind the first-wins dedupe: allocated on the
+    // line's FIRST hit only (most lines have none), then O(value) to test and
+    // to mark. Same answer as scanning every prior span for an intersection.
+    let taken: Uint8Array | null = null;
     for (const p of patterns) {
+      if (p.precheck && !p.precheck(line)) continue;
       p.re.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = p.re.exec(line)) !== null) {
@@ -407,35 +472,102 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
         const end = start + value.length;
         // Zero-width safety: never loop forever on a pathological pattern.
         if (m[0].length === 0) p.re.lastIndex++;
-        if (claimed.some(([s, e]) => start < e && end > s)) continue;
+        if (taken && anyTaken(taken, start, end)) continue;
         if (p.entropyGated && !HIGH_ENTROPY_REQUIRES_DIGIT_RE.test(value)) continue;
         if (p.entropyGated && shannonEntropy(value) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
-        claimed.push([start, end]);
-        hits.push({ pattern: p.name, line: i + 1, value, lineText: line });
+        (taken ??= new Uint8Array(line.length)).fill(1, start, end);
+        spans.all.push({ pattern: p.name, value, start });
+        hits.push({ pattern: p.name, value, start, line: i + 1, lineText: line, spans });
       }
     }
   }
   return hits;
 }
 
-const PREVIEW_MAX_CHARS = 160;
-
-function buildPreview(lineText: string, value: string, patternName: string): string {
-  // ENG-9: render through redactSecretsInText for the canonical
-  // `<REDACTED:name>` token — the value never survives into the preview.
-  const redacted = redactSecretsInText(lineText, new Map([[patternName, value]])).trim();
-  if (redacted.length <= PREVIEW_MAX_CHARS) return redacted;
-  const at = redacted.indexOf(`<REDACTED:${patternName}>`);
-  const start = Math.max(0, at - 40);
-  return (start > 0 ? '…' : '') + redacted.slice(start, start + PREVIEW_MAX_CHARS) + '…';
+/** True when any character in [start, end) is already claimed. */
+function anyTaken(taken: Uint8Array, start: number, end: number): boolean {
+  for (let k = start; k < end; k++) if (taken[k]) return true;
+  return false;
 }
 
-function toFinding(hit: RawHit, file?: string): SecretFinding {
-  const fullHex = createHash('sha256').update(hit.value).digest('hex');
+const PREVIEW_MAX_CHARS = 160;
+/** Raw context kept before / after the hit when the line is longer than the preview. */
+const PREVIEW_CONTEXT_BEFORE = 40;
+const PREVIEW_CONTEXT_AFTER = 80;
+
+/**
+ * Render the finding preview. ENG-9: rendered through redactSecretsInText
+ * for the canonical `<REDACTED:name>` token — a value never survives into a
+ * preview.
+ *
+ * Only a WINDOW around the hit is rendered, never the whole line: a
+ * minified/bundled line can run to hundreds of KB, and redacting the full
+ * line once per hit was O(hits × line) (5000 tokens on one 190 KB line took
+ * ~2.6 s; 41 ms one-per-line). Lines that fit the preview are rendered whole,
+ * so the short-line output is unchanged.
+ *
+ * Two leak guards on the window: (1) EVERY claimed span on the line that
+ * falls inside it is redacted, longest value first, so a preview never
+ * carries a sibling secret from the same line; (2) the window's edges snap
+ * OUTWARD to the boundary of any span they would cut through, so a
+ * neighbouring occurrence is redacted whole instead of leaving a fragment
+ * at the edge. Ellipses mark whichever edges were cut.
+ */
+function buildPreview(hit: RawHit): string {
+  const { lineText, value, start, pattern } = hit;
+  const end = start + value.length;
+  let winStart = 0;
+  let winEnd = lineText.length;
+  if (lineText.length > PREVIEW_MAX_CHARS) {
+    winStart = Math.max(0, start - PREVIEW_CONTEXT_BEFORE);
+    winEnd = Math.min(lineText.length, end + PREVIEW_CONTEXT_AFTER);
+  }
+  // Spans never overlap each other (claimed-span dedupe), so sorted by start
+  // they are sorted by end too: binary-search the first span ending after
+  // winStart, walk while spans begin before winEnd. Snapping an edge to a
+  // span boundary cannot pull a further span into the window — one pass.
+  const byStart = (hit.spans.byStart ??= [...hit.spans.all].sort((a, b) => a.start - b.start));
+  let lo = 0;
+  let hi = byStart.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const sp = byStart[mid]!;
+    if (sp.start + sp.value.length <= winStart) lo = mid + 1;
+    else hi = mid;
+  }
+  const inWindow: Array<readonly [string, string]> = [];
+  for (let i = lo; i < byStart.length; i++) {
+    const span = byStart[i]!;
+    if (span.start >= winEnd) break;
+    const e = span.start + span.value.length;
+    if (span.start < winStart) winStart = span.start;
+    if (e > winEnd) winEnd = e;
+    inWindow.push([span.pattern, span.value]);
+  }
+  inWindow.sort((a, b) => b[1].length - a[1].length);
+  let redacted = redactSecretsInText(lineText.slice(winStart, winEnd), inWindow).trim();
+  let cutLeft = winStart > 0;
+  let cutRight = winEnd < lineText.length;
+  if (redacted.length > PREVIEW_MAX_CHARS) {
+    const at = Math.max(0, redacted.indexOf(`<REDACTED:${pattern}>`));
+    const from = Math.max(0, at - PREVIEW_CONTEXT_BEFORE);
+    const to = Math.min(redacted.length, from + PREVIEW_MAX_CHARS);
+    cutLeft ||= from > 0;
+    cutRight ||= to < redacted.length;
+    redacted = redacted.slice(from, to);
+  }
+  return `${cutLeft ? '…' : ''}${redacted}${cutRight ? '…' : ''}`;
+}
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function toFinding(hit: RawHit, fullHex: string, file?: string): SecretFinding {
   return {
     pattern: hit.pattern,
     line: hit.line,
-    redactedPreview: buildPreview(hit.lineText, hit.value, hit.pattern),
+    redactedPreview: buildPreview(hit),
     fingerprint: `sha256:${fullHex.slice(0, 16)}`,
     ...(file !== undefined ? { file } : {}),
   };
@@ -450,9 +582,9 @@ export function scanText(text: string, opts: ScanOpts = {}): SecretFinding[] {
   const allowlist = opts.allowlist ?? [];
   const out: SecretFinding[] = [];
   for (const hit of scanInternal(text, opts)) {
-    const fullHex = createHash('sha256').update(hit.value).digest('hex');
+    const fullHex = sha256Hex(hit.value);
     if (valueAllowlisted(fullHex, allowlist)) continue;
-    out.push(toFinding(hit));
+    out.push(toFinding(hit, fullHex));
   }
   return out;
 }
@@ -518,6 +650,14 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
  * `<REDACTED:pattern>` (via redactSecretsInText) and report what was
  * redacted. Allowlisted values are left intact — the user declared them
  * safe. Returns the redacted text plus one finding per original occurrence.
+ *
+ * The unique (pattern, value) pairs are collected first and replaced in ONE
+ * redactSecretsInText call, LONGEST value first. Order matters when one
+ * value is a substring of another — a bearer token that is also the password
+ * inside a connection string: replacing the short value first (discovery
+ * order) corrupted the longer span, so it was never replaced and its
+ * username survived. The same value under two pattern names keeps the
+ * first-discovered name (stable sort).
  */
 export function redactFindings(
   text: string,
@@ -525,16 +665,15 @@ export function redactFindings(
 ): { text: string; redactions: SecretFinding[] } {
   const allowlist = opts.allowlist ?? [];
   const redactions: SecretFinding[] = [];
-  const seen = new Set<string>(); // pattern\0value pairs already replaced
-  let out = text;
+  const pairs = new Map<string, readonly [string, string]>(); // pattern\0value → [pattern, value]
   for (const hit of scanInternal(text, opts)) {
-    const fullHex = createHash('sha256').update(hit.value).digest('hex');
+    const fullHex = sha256Hex(hit.value);
     if (valueAllowlisted(fullHex, allowlist)) continue;
-    redactions.push(toFinding(hit));
+    redactions.push(toFinding(hit, fullHex));
     const key = `${hit.pattern}\0${hit.value}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out = redactSecretsInText(out, new Map([[hit.pattern, hit.value]]));
+    if (!pairs.has(key)) pairs.set(key, [hit.pattern, hit.value]);
   }
-  return { text: out, redactions };
+  if (pairs.size === 0) return { text, redactions };
+  const ordered = [...pairs.values()].sort((a, b) => b[1].length - a[1].length);
+  return { text: redactSecretsInText(text, ordered), redactions };
 }

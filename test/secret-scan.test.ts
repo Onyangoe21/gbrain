@@ -547,3 +547,77 @@ describe('high-entropy assignment requires a digit in the value', () => {
     expect(scanText(`token: ${sha}`, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
   });
 });
+
+// ── Preview windowing + corpus redaction ordering ────────────────────────────
+//
+// buildPreview renders a WINDOW around the hit (not the whole line) and
+// redacts every claimed span inside it; redactFindings replaces the unique
+// (pattern, value) pairs longest-first in one pass. Values below are
+// synthetic and runtime-joined from >= 2 fragments.
+describe('redactFindings — replacement order and preview window', () => {
+  const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
+  /** PREVIEW_MAX_CHARS (160) plus a leading and a trailing ellipsis. */
+  const PREVIEW_CEILING = 162;
+
+  test('a value that is a substring of another value: both redact whole, longest first', () => {
+    // The bearer token is discovered first (line 1) and is ALSO the password
+    // inside the line-2 connection string. Replacing the short value first
+    // used to corrupt the longer span, leaving the username and a bare
+    // `<REDACTED:bearer>` where the connection string should have been.
+    const url = ['postgres://', 'svc', ':', OPAQUE_VALUE, '@db.internal/app'].join('');
+    const { text, redactions } = redactFindings(`Authorization: Bearer ${OPAQUE_VALUE}\nDATABASE_URL=${url}\n`);
+    expect(text).toBe('Authorization: Bearer <REDACTED:bearer>\nDATABASE_URL=<REDACTED:db_url_credentials>db.internal/app\n');
+    expect(redactions.map((r) => r.pattern)).toEqual(['bearer', 'db_url_credentials']);
+  });
+
+  test('one redaction record per occurrence even when the same value repeats', () => {
+    const { text, redactions } = redactFindings(`a ${OPENAI}\nb ${OPENAI}\nc ${OPENAI}\n`);
+    expect(redactions.length).toBe(3);
+    expect(text).toBe('a <REDACTED:openai>\nb <REDACTED:openai>\nc <REDACTED:openai>\n');
+  });
+
+  test('a preview never carries a SIBLING secret from the same line', () => {
+    const findings = scanText(`a=${OPENAI} b=${SLACK}`);
+    expect(findings.map((f) => f.pattern).sort()).toEqual(['openai', 'slack']);
+    for (const f of findings) {
+      expect(f.redactedPreview.includes(OPENAI)).toBe(false);
+      expect(f.redactedPreview.includes(SLACK)).toBe(false);
+      expect(f.redactedPreview).toContain(`<REDACTED:${f.pattern}>`);
+    }
+    // The line is short, so the preview is the whole line with both spans redacted.
+    expect(findings[0]!.redactedPreview).toBe('a=<REDACTED:openai> b=<REDACTED:slack>');
+  });
+
+  test('a preview on a long line is a window around the hit, marked with ellipses', () => {
+    const pad = 'x'.repeat(300);
+    const [f] = scanText(`${pad} k=${OPENAI} ${pad}`);
+    expect(f!.redactedPreview).toContain('<REDACTED:openai>');
+    expect(f!.redactedPreview.startsWith('…')).toBe(true);
+    expect(f!.redactedPreview.endsWith('…')).toBe(true);
+    expect(f!.redactedPreview.length).toBeLessThanOrEqual(PREVIEW_CEILING);
+    expect(f!.redactedPreview.includes(OPENAI)).toBe(false);
+    // Hit at the very start: no leading ellipsis, trailing one only.
+    const [g] = scanText(`k=${OPENAI} ${pad}`);
+    expect(g!.redactedPreview.startsWith('k=<REDACTED:openai> ')).toBe(true);
+    expect(g!.redactedPreview.startsWith('…')).toBe(false);
+    expect(g!.redactedPreview.endsWith('…')).toBe(true);
+    // Short line: whole line, no ellipses (unchanged contract).
+    expect(scanText(`k=${OPENAI}`)[0]!.redactedPreview).toBe('k=<REDACTED:openai>');
+  });
+
+  test('repeated occurrences of one value on a long line never leave a FRAGMENT in any preview', () => {
+    // 40-char tokens spaced so a naive fixed window (hit-40 … hit+80) would
+    // cut straight through the third occurrence. The window must snap to
+    // span boundaries instead.
+    const long = [OPAQUE_VALUE, '0123456789'].join('');
+    expect(long.length).toBe(40);
+    const line = Array.from({ length: 12 }, () => `Bearer ${long}`).join(' ');
+    const findings = scanText(line);
+    expect(findings.length).toBe(12);
+    for (const f of findings) {
+      expect(f.redactedPreview.includes(long.slice(0, 12))).toBe(false);
+      expect(f.redactedPreview.includes(long.slice(-12))).toBe(false);
+      expect(f.redactedPreview).toContain('<REDACTED:bearer>');
+    }
+  });
+});

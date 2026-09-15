@@ -8,7 +8,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError } from './contract.ts';
-import { sourceScopeOpts } from './context.ts';
+import { assertSourceInCallerScope, sourceScopeOpts } from './context.ts';
 import { resolveAuthCapabilities } from '../harness/capabilities.ts';
 
 // --- v0.28: whoami + sources management ---
@@ -213,19 +213,11 @@ const sources_remove: Operation = {
   mutating: true,
   scope: 'sources_admin',
   handler: async (ctx, p) => {
-    // Source isolation on the DESTRUCTIVE path, mirroring sources_status's
-    // #4433 wave-L confinement exactly: EVERY untrusted caller (anything not
-    // strictly remote === false) may only remove an id inside its resolved
-    // source scope — federated grant > scalar bound source. A `sources_admin`
-    // token pinned to one source must not be able to hard-delete another
-    // source's pages. Out-of-scope ids answer not_found, indistinguishable
-    // from a nonexistent source (anti-enumeration). Trusted local CLI keeps
-    // the full operator view.
-    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
-    const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
-    if (allowed && !allowed.includes(p.id as string)) {
-      throw new OperationError('not_found', `Unknown source: ${p.id}`);
-    }
+    // Source isolation on the DESTRUCTIVE path (#4433 wave-L, shared helper
+    // with sources_status): a `sources_admin` token pinned to one source must
+    // not be able to hard-delete another source's pages; out-of-scope ids
+    // answer not_found (anti-enumeration), trusted local CLI passes.
+    assertSourceInCallerScope(ctx, p.id as string);
     const { removeSource } = await import('../sources-ops.ts');
     return removeSource(ctx.engine, {
       id: p.id as string,
@@ -251,19 +243,11 @@ const sources_status: Operation = {
   },
   scope: 'read',
   handler: async (ctx, p) => {
-    // Source isolation, mirroring sources_list's #4433 wave-L posture
-    // exactly (the maintainer decision that superseded the wave-g "scalar
-    // callers keep the full listing" carve-out): EVERY untrusted caller
-    // (anything not strictly remote === false) is confined through the
-    // canonical sourceScopeOpts ladder — federated grant > scalar bound
-    // source. Trusted local CLI keeps the full operator view. Out-of-scope
-    // ids answer not_found, indistinguishable from a nonexistent source
-    // (anti-enumeration), matching get_agent_job's shape.
-    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
-    const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
-    if (allowed && !allowed.includes(p.id as string)) {
-      throw new OperationError('not_found', `Unknown source: ${p.id}`);
-    }
+    // Source isolation (#4433 wave-L posture, the maintainer decision that
+    // superseded the wave-g "scalar callers keep the full listing"
+    // carve-out), via the helper shared with sources_remove: out-of-scope ids
+    // answer not_found (matching get_agent_job's shape), trusted local passes.
+    assertSourceInCallerScope(ctx, p.id as string);
     const { getSourceStatus } = await import('../sources-ops.ts');
     return getSourceStatus(ctx.engine, p.id as string);
   },

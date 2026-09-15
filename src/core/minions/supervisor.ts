@@ -82,7 +82,9 @@ export interface SupervisorOpts {
   healthInterval: number;
   /** Path to the gbrain CLI executable (MUST be a compiled binary; .ts sources cannot be spawned). */
   cliPath: string;
-  /** Allow shell jobs on child worker. Default: false. When true, sets GBRAIN_ALLOW_SHELL_JOBS=1 on child env. */
+  /** Allow shell jobs on child worker. Default: false. When true, sets GBRAIN_ALLOW_SHELL_JOBS=1 on the
+   *  child env AND passes `--allow-shell-jobs` (buildWorkerArgs) so the worker's cwd-.env quarantine
+   *  cannot silently drop the opt-in. */
   allowShellJobs: boolean;
   /** JSON mode: emit JSONL events on stderr, reserve stdout for data payloads. Default: false. */
   json: boolean;

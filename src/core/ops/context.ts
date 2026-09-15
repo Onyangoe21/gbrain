@@ -473,6 +473,24 @@ export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sou
   return {};
 }
 
+/**
+ * Confine an explicitly named source id to the caller's resolved source scope
+ * (#4433 wave-L posture, shared by sources_remove + sources_status): EVERY
+ * untrusted caller (anything not strictly `remote === false`) may only name a
+ * source inside the canonical `sourceScopeOpts` ladder — federated grant >
+ * scalar bound source. An out-of-scope id answers `not_found`, exactly like a
+ * nonexistent source (anti-enumeration). The trusted local CLI passes
+ * unconditionally (full operator view). Returns void; throws otherwise.
+ */
+export function assertSourceInCallerScope(ctx: OperationContext, id: string): void {
+  if (ctx.remote === false) return;
+  const scope = sourceScopeOpts(ctx);
+  const allowed = scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : null);
+  if (allowed && !allowed.includes(id)) {
+    throw new OperationError('not_found', `Unknown source: ${id}`);
+  }
+}
+
 /** Holder permissions are independent of the operator's page-visibility opt-out. */
 export function readHolders(ctx: OperationContext): string[] | undefined {
   return ctx.remote === false ? ctx.takesHoldersAllowList : ctx.takesHoldersAllowList ?? ['world'];

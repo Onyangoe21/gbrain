@@ -1,7 +1,7 @@
 /**
  * Structural guard: the cwd-.env quarantine list cannot silently rot.
  *
- * Every `process.env.GBRAIN_*` / `env.GBRAIN_*` read in src/ whose NAME looks
+ * Every `process.env.GBRAIN_*` / `Bun.env.GBRAIN_*` / `env.GBRAIN_*` read in src/ whose NAME looks
  * like a code-loading, exec-target, root-redirect or posture-widening knob
  * (`_BIN`, `_CLI`, `_MODULE`, `_PATH`, `_HOME` suffix or `GBRAIN_ALLOW_`
  * prefix) must either be in CWD_DOTENV_PROTECTED_KEYS or carry a
@@ -15,7 +15,7 @@ import { CWD_DOTENV_PROTECTED_KEYS } from '../src/core/env-trust.ts';
 
 const SRC_ROOT = join(import.meta.dir, '..', 'src');
 const SUSPICIOUS_NAME = /_BIN$|_CLI$|_MODULE$|_PATH$|^GBRAIN_ALLOW_|_HOME$/;
-const READ_SITE = /(?:process\.env|\benv)(?:\.(GBRAIN_[A-Z0-9_]+)|\[['"](GBRAIN_[A-Z0-9_]+)['"]\])/g;
+const READ_SITE = /(?:process\.env|Bun\.env|\benv)(?:\.(GBRAIN_[A-Z0-9_]+)|\[['"](GBRAIN_[A-Z0-9_]+)['"]\])/g;
 const OK_MARKER = 'cwd-dotenv-ok:';
 
 function* walk(dir: string): Generator<string> {
@@ -27,6 +27,14 @@ function* walk(dir: string): Generator<string> {
 }
 
 describe('CWD_DOTENV_PROTECTED_KEYS covers every suspicious GBRAIN_* env read in src/', () => {
+  test('scanner self-test: a Bun.env read of a suspicious name is flagged', () => {
+    const hits = [...'const b = Bun.env.GBRAIN_FAKE_BIN; const p = process.env["GBRAIN_FAKE_MODULE"];'.matchAll(READ_SITE)]
+      .map((m) => m[1] ?? m[2]!);
+    expect(hits).toEqual(['GBRAIN_FAKE_BIN', 'GBRAIN_FAKE_MODULE']);
+    for (const h of hits) expect(SUSPICIOUS_NAME.test(h)).toBe(true);
+    expect(SUSPICIOUS_NAME.test('GBRAIN_SOURCE')).toBe(false);
+  });
+
   test('list is non-empty and de-duplicated', () => {
     expect(CWD_DOTENV_PROTECTED_KEYS.length).toBeGreaterThan(10);
     expect(new Set(CWD_DOTENV_PROTECTED_KEYS).size).toBe(CWD_DOTENV_PROTECTED_KEYS.length);

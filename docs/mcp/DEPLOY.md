@@ -30,8 +30,10 @@ delivered to the client's registered redirect URI; a denial returns
 including clients that self-registered via DCR — self-registration alone never
 yields a token. Pending requests expire after ten minutes, do not survive a
 server restart, and are bounded: at most ten awaiting-decision requests per
-client and a fixed server-wide ceiling, beyond which `/authorize` answers
-`429 too_many_requests` until earlier requests are decided or expire.
+client and a fixed server-wide ceiling. Beyond either, `/authorize` sends the
+client back to its registered redirect URI with `error=too_many_requests`
+(and no code) until earlier requests are decided or expire; a `429` status on
+`/authorize` comes only from the MCP SDK's per-IP rate limit.
 
 **Say to your agent:** *"Start the brain server over HTTP with self-service
 registration, then approve my client in the admin dashboard — your agent runs

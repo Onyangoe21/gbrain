@@ -18,6 +18,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operations, OperationError } from '../src/core/operations.ts';
 import type { OperationContext, AuthInfo, Operation } from '../src/core/operations.ts';
 import { hasScope } from '../src/core/scope.ts';
+import { assertSourceInCallerScope } from '../src/core/ops/context.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -383,6 +384,50 @@ describe('sources_* scope enforcement (simulates serve-http gate)', () => {
 // (those are local-CLI-only — remote sources_admin is for managing federated
 // remote URLs, not arbitrary host-path writes).
 // ---------------------------------------------------------------------------
+
+// The scope→allowed→not_found ladder sources_remove and sources_status share
+// (#4433 wave-L), as a unit: the four caller shapes that decide it.
+describe('assertSourceInCallerScope (shared confinement helper)', () => {
+  const base = (): OperationContext => ({
+    engine: engine as any,
+    config: { engine: 'pglite' } as any,
+    logger: { info() {}, warn() {}, error() {} },
+    dryRun: false,
+    remote: true,
+    sourceId: 'alpha',
+  });
+
+  test('scalar-bound remote caller: only its own source passes; anything else is not_found', () => {
+    const ctx = base();
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).not.toThrow();
+    let err: unknown;
+    try { assertSourceInCallerScope(ctx, 'beta'); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(OperationError);
+    expect((err as OperationError).code).toBe('not_found');
+    expect((err as OperationError).message).toBe('Unknown source: beta');
+  });
+
+  test('federated grant wins over the scalar bind: every granted id passes, the bound-but-ungranted one does not', () => {
+    const ctx: OperationContext = { ...base(), auth: { ...ctxRemote(['read'], ['beta', 'gamma']).auth! } };
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'gamma')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).toThrow('Unknown source: alpha');
+    expect(() => assertSourceInCallerScope(ctx, 'ghost')).toThrow('Unknown source: ghost');
+  });
+
+  test('remote: undefined is untrusted (fail-closed) — confined exactly like remote: true', () => {
+    const ctx = { ...base(), remote: undefined as unknown as boolean };
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).toThrow('Unknown source: beta');
+  });
+
+  test('trusted local (remote === false) passes unconditionally — even an id that exists nowhere', () => {
+    const ctx = { ...base(), remote: false };
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'does-not-exist')).not.toThrow();
+  });
+});
 
 describe('sources_add — remote callers ignore path/clone_dir overrides', () => {
   test('remote sources_admin: clone_dir override is silently ignored', async () => {

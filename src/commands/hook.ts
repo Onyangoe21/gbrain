@@ -719,10 +719,10 @@ async function statusFileNotice(): Promise<string | null> {
 const HOOK_GIT_TIMEOUT_MS = 1000;
 
 /**
- * Async execFile wrapper: the hook push paths must NEVER block the event
- * loop with execFileSync — a slow repo/network would keep withDeadline's
- * timer from ever firing and stall the harness for minutes. null on any
- * failure (missing binary, non-zero exit, timeout).
+ * Async execFile wrapper: hook push paths must NEVER block the event loop with
+ * execFileSync (a slow repo/network would stall withDeadline's timer for minutes).
+ * null on any failure (missing binary, non-zero exit, timeout). Explicit `env`:
+ * git must see the cwd-.env quarantine (env-trust.ts), not Bun's startup snapshot.
  */
 function tryExecAsync(bin: string, args: string[], timeoutMs = HOOK_GIT_TIMEOUT_MS): Promise<string | null> {
   return new Promise((resolve) => {
@@ -730,7 +730,7 @@ function tryExecAsync(bin: string, args: string[], timeoutMs = HOOK_GIT_TIMEOUT_
       execFile(
         bin,
         args,
-        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, env: process.env },
         (err, stdout) => resolve(err ? null : stdout.toString().trim()),
       );
     } catch {

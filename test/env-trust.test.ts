@@ -19,8 +19,12 @@ import { describe, expect, test } from 'bun:test';
 import {
   CWD_DOTENV_FILES,
   CWD_DOTENV_PROTECTED_KEYS,
+  CWD_DOTENV_PROTECTED_PREFIXES,
+  CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS,
+  CWD_DOTENV_REMEDIATION,
   cwdDotenvAssignsKey,
   dotenvValuesForKey,
+  isCwdDotenvProtectedKey,
   quarantineCwdDotenv,
 } from '../src/core/env-trust.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -171,5 +175,85 @@ describe('quarantineCwdDotenv', () => {
       const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
       expect(out).toBe('<unset>');
     });
+  });
+});
+
+// ── A1: line terminators / encoding must match Bun's loader ──────────────────
+//
+// Bun treats a bare `\r` as a .env line terminator (verified on 1.3.13:
+// `KEY=/e\rvil` loads as `/e`, and `A=x\rB=1` loads BOTH keys). A parser that
+// split on `\n` only saw one over-long line whose RHS the `(.*)$` anchor could
+// not match (`.` skips `\r` and U+2028/2029), so the assignment vanished and
+// the quarantine let the key through. Every case below must count as
+// "assigned" — erring toward file-origin is the safe side of this guard.
+describe('dotenv grammar: CR / CRLF / BOM / U+2028 (A1)', () => {
+  const cases: Array<[label: string, body: string]> = [
+    ['CR-only file', 'UNRELATED=1\rGBRAIN_GUARDRAILS_MODULE=${PWD}/evil.js\r'],
+    ['mid-line bare CR hiding a second assignment', 'UNRELATED=${PWD}/x\rGBRAIN_GUARDRAILS_MODULE=${PWD}/evil.js\nX=1\n'],
+    ['CRLF file', 'UNRELATED=1\r\nGBRAIN_GUARDRAILS_MODULE=${PWD}/evil.js\r\n'],
+    ['BOM-prefixed first line', '﻿GBRAIN_GUARDRAILS_MODULE=${PWD}/evil.js\n'],
+    ['U+2028 inside a value', 'GBRAIN_GUARDRAILS_MODULE=${PWD}/ev il.js\n'],
+  ];
+  for (const [label, body] of cases) {
+    test(`${label}: the key counts as assigned and is quarantined`, () => {
+      const dir = tmpProject({ '.env': body });
+      expect(cwdDotenvAssignsKey('GBRAIN_GUARDRAILS_MODULE', dir)).toBe(true);
+      const env: Record<string, string | undefined> = { GBRAIN_GUARDRAILS_MODULE: `${dir}/evil.js` };
+      const warnings: string[] = [];
+      expect(quarantineCwdDotenv(env, dir, { warn: (m) => warnings.push(m) })).toEqual(['GBRAIN_GUARDRAILS_MODULE']);
+      expect('GBRAIN_GUARDRAILS_MODULE' in env).toBe(false);
+      expect(warnings).toHaveLength(1);
+    });
+  }
+
+  test('a bare CR terminates the value for the #427 guard too, and the hidden key is an assignment', () => {
+    const dir = tmpProject({ '.env': 'DATABASE_URL=postgres://app.example.test/db\rOTHER=1\n' });
+    expect(dotenvValuesForKey('DATABASE_URL', dir).has('postgres://app.example.test/db')).toBe(true);
+    expect(cwdDotenvAssignsKey('OTHER', dir)).toBe(true);
+  });
+});
+
+// ── A2: loader / git / node / proxy / AI-CLI hijack families ─────────────────
+describe('non-GBRAIN hijack families (A2)', () => {
+  test('isCwdDotenvProtectedKey: exact GBRAIN_* keys, prefix families, exact toolchain keys', () => {
+    for (const k of [
+      'GBRAIN_HOME', 'GBRAIN_GUARDRAILS_MODULE',
+      'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES',
+      'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH',
+      'BUN_OPTIONS', 'BUN_INSTALL', 'NPM_CONFIG_REGISTRY', 'npm_config_registry',
+      'NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS', 'NODE_TLS_REJECT_UNAUTHORIZED',
+      'SSH_ASKPASS', 'SSH_ASKPASS_REQUIRE', 'PYTHONPATH', 'PYTHONSTARTUP', 'PERL5LIB', 'PERL5OPT', 'RUBYOPT', 'RUBYLIB',
+      'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+      'CLAUDE_CONFIG_DIR', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_BASE_URL',
+    ]) {
+      expect(isCwdDotenvProtectedKey(k)).toBe(true);
+    }
+    // Ordinary project variables keep loading from a cwd .env.
+    for (const k of ['GITHUB_TOKEN', 'GBRAIN_SOURCE', 'DATABASE_URL', 'PATH', 'HOME', 'LDFLAGS', 'NODE_ENV', 'OPENAI_API_KEY', 'GITLAB_CI', 'BUNDLE_PATH']) {
+      expect(isCwdDotenvProtectedKey(k)).toBe(false);
+    }
+    for (const p of ['LD_', 'DYLD_', 'GIT_', 'BUN_', 'NPM_CONFIG_', 'npm_config_']) expect(CWD_DOTENV_PROTECTED_PREFIXES).toContain(p);
+    expect(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).toContain('NODE_OPTIONS');
+    expect(new Set(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).size).toBe(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS.length);
+  });
+
+  test('a GIT_CONFIG_* injection planted by the cwd .env is dropped (prefix family), ONE warning naming the keys', () => {
+    const dir = tmpProject({
+      '.env': 'GIT_CONFIG_COUNT=1\nGIT_CONFIG_KEY_0=core.fsmonitor\nGIT_CONFIG_VALUE_0=./tooling/evil.sh\nGBRAIN_ALLOW_SHELL_JOBS=1\nGIT_UNSET_IN_ENV=1\nPROJECT_NAME=demo\n',
+    });
+    const env: Record<string, string | undefined> = {
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: `${dir}/tooling/evil.sh`,
+      GBRAIN_ALLOW_SHELL_JOBS: '1', PROJECT_NAME: 'demo', GIT_AUTHOR_NAME: 'from-the-shell', PATH: '/usr/bin',
+    };
+    const warnings: string[] = [];
+    const dropped = quarantineCwdDotenv(env, dir, { warn: (m) => warnings.push(m) });
+    expect(dropped).toEqual(['GBRAIN_ALLOW_SHELL_JOBS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0']);
+    for (const k of dropped) expect(k in env).toBe(false);
+    expect(env.PROJECT_NAME).toBe('demo');          // not protected
+    expect(env.GIT_AUTHOR_NAME).toBe('from-the-shell'); // protected family, but NOT assigned by the cwd .env
+    expect(env.PATH).toBe('/usr/bin');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^\[env\] Ignoring GBRAIN_ALLOW_SHELL_JOBS, GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0, GIT_CONFIG_VALUE_0 because a \.env file in the current directory assigns it — /);
+    expect(warnings[0]).toContain(CWD_DOTENV_REMEDIATION);
   });
 });

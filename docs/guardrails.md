@@ -92,20 +92,25 @@ The module may export any of: a default-exported provider, a default-exported
 provider array, a named `guardrailProviders` array, or a
 `register(registerGuardrailProvider)` function (sync or async).
 
-**Where the variable may come from.** The spec must be an **absolute path**,
-a **`~/` path**, or a **package name**. Cwd-relative specs (`./x`, `../x`) are
-refused: they would resolve against whatever directory gbrain happens to run
-in. The variable is honored from your shell environment, from a service
-`EnvironmentFile`, or from **`~/.gbrain/.env`** (the operator-owned secrets
-file, loaded before the guardrails loader runs). It is **never** honored from
-a `.env` file in the *current directory*: Bun auto-loads those files, and a
-cloned repository must not be able to choose what your gbrain executes. When
-a cwd `.env` assigns `GBRAIN_GUARDRAILS_MODULE`, gbrain drops the variable for
-that process and prints one stderr line (`[env] Ignoring
-GBRAIN_GUARDRAILS_MODULE because a .env file in the current directory assigns
-it …`). The same rule covers the other security-relevant `GBRAIN_*` variables
-— see the "Environment variables and cwd `.env` files" section of
-`SECURITY.md`.
+**Where the variable may come from.** The spec must be an **absolute path**
+or a **`~/` path**. Cwd-relative specs (`./x`, `../x`) are refused: they would
+resolve against whatever directory gbrain happens to run in. Bare package
+names (`some-guardrail`, `@scope/pkg`) are refused too: in the compiled binary
+a package name resolves from the *current directory's* `node_modules`, so a
+cloned repository could supply the module. The variable is honored from your
+shell environment, from a service `EnvironmentFile`, or from
+**`~/.gbrain/.env`** (the operator-owned secrets file, loaded before the
+guardrails loader runs). It is **never** honored from a `.env` file in the
+*current directory*: Bun auto-loads those files, and a cloned repository must
+not be able to choose what your gbrain executes. When a cwd `.env` assigns
+`GBRAIN_GUARDRAILS_MODULE`, gbrain drops the variable, prints one stderr line
+(`[env] Ignoring GBRAIN_GUARDRAILS_MODULE because a .env file in the current
+directory assigns it …`) and re-runs itself with the sanitized environment so
+nothing it spawns sees the value either. Running gbrain from *inside*
+`~/.gbrain` is the one exception: that `.env` is your own, and it is honored
+without a warning. The same rule covers the other security-relevant `GBRAIN_*`
+variables and the loader / git / node / proxy / AI-CLI hijack families — see
+the "Environment variables and cwd `.env` files" section of `SECURITY.md`.
 
 **Loading is fail-closed.** If `GBRAIN_GUARDRAILS_MODULE` is set but the module
 fails to import or registers zero providers, the CLI exits 1 instead of

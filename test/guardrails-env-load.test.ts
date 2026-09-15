@@ -11,10 +11,10 @@
  *   - fail-CLOSED: module that registers nothing throws GuardrailLoadError
  */
 
-import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
+import { describe, test, expect, beforeEach, afterAll, spyOn } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { join, relative } from 'path';
+import { homedir, tmpdir } from 'os';
 import {
   __resetGuardrailProvidersForTests,
   hasGuardrails,
@@ -195,5 +195,108 @@ describe('cwd-relative specs and cwd-.env-assigned specs are refused', () => {
       await expect(loadGuardrailProvidersFromEnv(process.env, { cwd: dir })).rejects.toBeInstanceOf(GuardrailLoadError);
     });
     expect(existsSync(marker)).toBe(false);
+  });
+});
+
+describe('bare package specifiers are refused (A3)', () => {
+  /**
+   * In the compiled binary a bare specifier resolves through Bun's module
+   * walk-up FROM THE CWD, so a hostile checkout's node_modules/<name>/ is what
+   * gets loaded. Only absolute and `~/` paths name a module the operator chose.
+   */
+  function cwdWithPackage(name: string): { dir: string; marker: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-guardrails-barespec-'));
+    dirs.push(dir);
+    const marker = join(dir, 'PROBE_RAN');
+    const pkgDir = join(dir, 'node_modules', ...name.split('/'));
+    mkdirSync(pkgDir, { recursive: true });
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, main: 'index.js' }));
+    writeFileSync(
+      join(pkgDir, 'index.js'),
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran');\nmodule.exports = { id: 'fixture-bare', classify() {} };\n`,
+    );
+    return { dir, marker };
+  }
+
+  test('a bare name, a scoped name and a subpath all throw GuardrailLoadError BEFORE any import', async () => {
+    for (const spec of ['gbrain-fixture-guardrail', '@fixture-scope/guardrail', 'gbrain-fixture-guardrail/register']) {
+      const { dir, marker } = cwdWithPackage(spec.startsWith('@') ? spec : spec.split('/')[0]!);
+      const err = await loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: spec }, { cwd: dir }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(GuardrailLoadError);
+      expect((err as Error).message).toContain('must be an absolute path or a ~/ path');
+      expect((err as Error).message).toContain("node_modules");
+      expect(existsSync(marker)).toBe(false);
+    }
+    expect(hasGuardrails()).toBe(false);
+  });
+
+  test('the relative-spec message no longer advertises package names', async () => {
+    const err = await loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: './x.mjs' }).then(() => null, (e: unknown) => e);
+    expect((err as Error).message).not.toContain('package name');
+  });
+});
+
+describe('zero-arg library call: env defaults to process.env, cwd to process.cwd() (A8)', () => {
+  test('loadGuardrailProvidersFromEnv() refuses a spec that the cwd .env assigns', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-guardrails-zeroarg-'));
+    dirs.push(dir);
+    const marker = join(dir, 'PROBE_RAN');
+    const path = join(dir, 'probe.mjs');
+    writeFileSync(path, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\nexport default undefined;\n`);
+    writeFileSync(join(dir, '.env'), 'GBRAIN_GUARDRAILS_MODULE=${PWD}/probe.mjs\n');
+    // Never process.chdir() in a shared test process — mock the cwd read instead.
+    const cwdSpy = spyOn(process, 'cwd').mockReturnValue(dir);
+    try {
+      await withEnv({ GBRAIN_GUARDRAILS_MODULE: path }, async () => {
+        const err = await loadGuardrailProvidersFromEnv().then(() => null, (e: unknown) => e);
+        expect(err).toBeInstanceOf(GuardrailLoadError);
+        expect((err as Error).message).toContain('assigned by a .env file in the current directory');
+      });
+    } finally {
+      cwdSpy.mockRestore();
+    }
+    expect(existsSync(marker)).toBe(false);
+    expect(hasGuardrails()).toBe(false);
+  });
+});
+
+// The `~/` branch now goes through STATIC node:path / node:url / node:os
+// imports (the runtime dynamic imports were removed alongside the origin
+// checks). Pin that a `~/` spec still expands against the home dir and is
+// imported. Bun caches os.homedir() at first call, so a HOME override cannot
+// drive this: the probe is written into a cleaned-up temp dir under the REAL
+// home (skipped when that home is not writable, e.g. a read-only CI HOME).
+// Computed ONCE at module scope so the skip decision is visible in the report
+// instead of a silent early return inside the test body.
+const canWriteHome = (() => {
+  try {
+    const probe = mkdtempSync(join(homedir(), '.gbrain-guardrails-tilde-probe-'));
+    rmSync(probe, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+describe('~/ specs expand against the home directory', () => {
+  test.skipIf(!canWriteHome)('a ~/ spec resolves under homedir() and is imported (then fail-closed on zero providers)', async () => {
+    const home = mkdtempSync(join(homedir(), '.gbrain-guardrails-tilde-'));
+    try {
+      const marker = join(home, 'PROBE_RAN');
+      writeFileSync(
+        join(home, 'probe.mjs'),
+        `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\nexport default undefined;\n`,
+      );
+      const spec = '~/' + relative(homedir(), join(home, 'probe.mjs'));
+      await expect(loadGuardrailProvidersFromEnv({ GBRAIN_GUARDRAILS_MODULE: spec }))
+        .rejects.toBeInstanceOf(GuardrailLoadError);
+      expect(existsSync(marker)).toBe(true); // expanded + imported; the rejection is the zero-provider rule
+      expect(hasGuardrails()).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

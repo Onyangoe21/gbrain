@@ -435,9 +435,9 @@ HANDLER TYPES (built in)
   extract           Extract links + timeline entries; '{"mode":"all"}'
   backlinks         Check or fix back-links; '{"action":"fix"}'
   autopilot-cycle   One autopilot pass (sync+extract+embed+backlinks)
-  shell             Run a command or argv. Requires GBRAIN_ALLOW_SHELL_JOBS=1
-                    on the worker. Params: {cmd?, argv?, cwd, env?}.
-                    See: docs/guides/minions-shell-jobs.md
+  shell             Run a command or argv. Requires --allow-shell-jobs (or
+                    GBRAIN_ALLOW_SHELL_JOBS=1) on the worker. Params: {cmd?,
+                    argv?, cwd, env?}. See: docs/guides/minions-shell-jobs.md
 
 Detailed help: gbrain jobs {work|supervisor|submit|watch|prune} --help
 Other subcommands are fully described above.
@@ -1487,6 +1487,9 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       // exit. Deliberately absent from user-facing help. The CLI layer owns
       // engine.disconnect() + process.exit() (engine-ownership invariant).
       {
+        // --allow-shell-jobs (buildChildArgs pass-through): same re-assert as
+        // `work` — this child's preflight re-ran the cwd-.env quarantine.
+        if (hasFlag(args, '--allow-shell-jobs')) process.env.GBRAIN_ALLOW_SHELL_JOBS = '1';
         const config = loadConfig();
         if (config?.engine === 'pglite') {
           console.error('[run-child] process isolation requires the Postgres engine.');

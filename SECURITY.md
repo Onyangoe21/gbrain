@@ -70,8 +70,8 @@ compiled binaries alike, and it expands `${VAR}` references inside those
 files. A `.env` committed into a cloned repository is therefore **untrusted
 input** — it was written by whoever authored the repo, not by you.
 
-**The trust boundary.** Security-relevant `GBRAIN_*` variables are honored
-from your shell environment, from a service `EnvironmentFile`, and from
+**The trust boundary.** Security-relevant variables are honored from your
+shell environment, from a service `EnvironmentFile`, and from
 `~/.gbrain/.env` (the operator-owned secrets file). They are **never** honored
 from a `.env` file in the current directory. At startup every gbrain process
 checks the working directory's `.env` family and, for each protected variable
@@ -83,37 +83,66 @@ process), drops the variable and prints one line to stderr:
 [env] Ignoring GBRAIN_GUARDRAILS_MODULE because a .env file in the current directory assigns it — cwd .env files are untrusted for security settings. Export it from your shell or set it in ~/.gbrain/.env.
 ```
 
-**Protected variables** (`CWD_DOTENV_PROTECTED_KEYS` in
-`src/core/env-trust.ts`): code-loading `GBRAIN_GUARDRAILS_MODULE`,
-`GBRAIN_PLUGIN_PATH`; exec-target `GBRAIN_CLAUDE_CLI_BIN`,
-`GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG`, `GBRAIN_JOB_CHILD_CLI`,
-`GBRAIN_BIN_OVERRIDE`; root/registry redirect `GBRAIN_HOME`,
-`GBRAIN_MOUNTS_PATH`; posture-widening `GBRAIN_ALLOW_SHELL_JOBS`,
-`GBRAIN_ALLOW_PRIVATE_REMOTES`, `GBRAIN_ALLOW_UNVERIFIED_REMOTE`,
-`GBRAIN_GIT_ALLOW_FILE_TRANSPORT`, `GBRAIN_ALLOW_MASS_RECONCILE`,
-`GBRAIN_ALLOW_DEFAULT_WRITE`, `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`.
-`GBRAIN_GUARDRAILS_MODULE` additionally refuses cwd-relative specs (`./x`,
-`../x`); use an absolute path, a `~/` path, or a package name.
+Because a variable removed from one process is still visible to the programs
+that process starts (git, the agent CLI, job workers inherit the environment
+gbrain started with), gbrain then re-runs itself once with the sanitized
+environment and exits with that run's status. Everything it spawns from then
+on sees the clean view. This costs nothing when the working directory has no
+`.env`, or when nothing protected is assigned there.
+
+**Protected variables.** Two groups, one predicate
+(`isCwdDotenvProtectedKey` in `src/core/env-trust.ts`):
+
+- The security-relevant `GBRAIN_*` keys (`CWD_DOTENV_PROTECTED_KEYS`):
+  code-loading `GBRAIN_GUARDRAILS_MODULE`, `GBRAIN_PLUGIN_PATH`; exec-target
+  `GBRAIN_CLAUDE_CLI_BIN`, `GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG`,
+  `GBRAIN_JOB_CHILD_CLI`, `GBRAIN_BIN_OVERRIDE`; root/registry redirect
+  `GBRAIN_HOME`, `GBRAIN_MOUNTS_PATH`; posture-widening
+  `GBRAIN_ALLOW_SHELL_JOBS`, `GBRAIN_ALLOW_PRIVATE_REMOTES`,
+  `GBRAIN_ALLOW_UNVERIFIED_REMOTE`, `GBRAIN_GIT_ALLOW_FILE_TRANSPORT`,
+  `GBRAIN_ALLOW_MASS_RECONCILE`, `GBRAIN_ALLOW_DEFAULT_WRITE`,
+  `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`.
+- The variable families through which a checkout could hijack the programs
+  gbrain spawns rather than gbrain itself (`CWD_DOTENV_PROTECTED_PREFIXES`,
+  `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`): dynamic-loader injection (`LD_*`,
+  `DYLD_*`), git configuration/hook/exec injection (`GIT_*`), Bun and npm
+  runtime configuration (`BUN_*`, `NPM_CONFIG_*`/`npm_config_*`), Node preload
+  and TLS knobs (`NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`,
+  `NODE_TLS_REJECT_UNAUTHORIZED`), interpreter preload for Python/Perl/Ruby
+  helpers, ssh askpass programs, HTTP(S)/ALL proxy variables in both
+  spellings, and AI-CLI/API redirection (`CLAUDE_CONFIG_DIR`,
+  `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_BASE_URL`).
+
+`GBRAIN_GUARDRAILS_MODULE` additionally accepts only an absolute path or a
+`~/` path: cwd-relative specs and bare package names are refused (a package
+name would resolve from the current directory's `node_modules`).
 
 **Semantics worth knowing.**
 
-- *Per process.* Every gbrain process re-applies the check at startup; the
-  supervisor passes the shell-job opt-in to workers as the `--allow-shell-jobs`
-  flag so the quarantine cannot silently disable it.
+- *Per process, then inherited.* Every gbrain process re-applies the check at
+  startup; the one-time sanitized re-run above is what makes the result reach
+  git, the agent CLI and workers. The supervisor passes the shell-job opt-in to
+  workers — and workers to per-job child processes — as the
+  `--allow-shell-jobs` flag so the quarantine cannot silently disable it.
 - *Key presence, not value.* If a cwd `.env` assigns a protected key, a value
   you exported from the shell is dropped too while you stay in that directory —
   the warning tells you so. Move the setting to `~/.gbrain/.env` or run from
-  another directory.
-- *Other variables are unchanged.* Non-protected `GBRAIN_*` variables
-  (source/brain routing, tuning knobs) still load from a cwd `.env` as before.
+  another directory. A family member you exported (say `GIT_AUTHOR_NAME`) is
+  untouched unless the cwd `.env` assigns that same name.
+- *Everything else still loads.* Routing and tuning `GBRAIN_*` variables and
+  every variable not listed above still load from a cwd `.env` as before.
   `DATABASE_URL` keeps its own, value-matching guard (see `docs/ENGINES.md`);
   `GBRAIN_DATABASE_URL` is always honored.
+- *Your own config directory.* Running gbrain from inside `~/.gbrain` (or
+  `$GBRAIN_HOME/.gbrain`) makes its `.env` the "cwd `.env`". That file is
+  yours, so it is honored without a warning — unless a cwd `.env` assigns
+  `GBRAIN_HOME` itself, which is never treated as your config directory.
 - *Server deployments.* `GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, `GBRAIN_HTTP_CORS_ORIGIN`
   and `GBRAIN_HTTP_TRUST_PROXY` are deliberately not on the list so documented
   container deployments that co-locate them keep working — launch
   `gbrain serve --http` from a directory you control.
-- *Compiled binaries included.* The check runs identically in
-  `bun run src/cli.ts` and in the compiled `gbrain` binary.
+- *Compiled binaries included.* The check and the sanitized re-run behave
+  identically in `bun run src/cli.ts` and in the compiled `gbrain` binary.
 
 If you kept one of the protected variables in a project's `.env` on purpose,
 move it to `~/.gbrain/.env` (loaded before anything else, never overriding a
@@ -248,10 +277,11 @@ and a pending request, never a token. Revoked clients are refused at
 
 Pending requests expire after ten minutes and do not survive a server restart.
 They are bounded twice: a server-wide ceiling on the in-memory store and a
-per-client ceiling of ten requests awaiting a decision, beyond which
-`/authorize` answers `429 too_many_requests` until earlier requests are
-decided or expire. The MCP SDK's built-in per-IP limits on `/authorize`,
-`/register` and `/token` remain in force.
+per-client ceiling of ten requests awaiting a decision. Beyond either,
+`/authorize` sends the client back to its registered redirect URI with
+`error=too_many_requests` and no code until earlier requests are decided or
+expire; a `429` status on `/authorize` comes only from the MCP SDK's built-in
+per-IP limits, which remain in force on `/authorize`, `/register` and `/token`.
 
 ### Token Management
 

@@ -366,15 +366,29 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
         validateRedirectUri(String(uri));
       }
 
+      // v0.42 (#1353): the DCR path is the unauthenticated network entry point.
+      // `client_credentials` skips /authorize owner approval entirely, so a
+      // self-registered DCR client must NOT get it unless the operator opted in
+      // via `--enable-dcr-insecure`. Gated BEFORE the scope ceiling: when the
+      // grant is not on offer at all the reply must say so, not "limited to
+      // read" (which implies it is available narrower). CLI/admin paths bypass this.
+      grantTypes = client.grant_types?.length ? client.grant_types : ['authorization_code'];
+      if (!this.allowClientCredentialsDcr && grantTypes.includes('client_credentials')) {
+        throw new InvalidClientMetadataError(
+          'client_credentials grant is not permitted via dynamic client registration; ' +
+          'restart the server with --enable-dcr-insecure to allow it, or register the ' +
+          'client via the gbrain CLI / admin API.',
+        );
+      }
+
       // Scope policy for DCR: (1) ceiling — anonymous registration may hold
-      // at most `read write` (`read` for client_credentials); privileged
-      // scopes are REJECTED as 400, never silently dropped (scope.ts). The
-      // grant default is computed first because the ceiling depends on it.
+      // at most `read write` (`read` for an allowed client_credentials
+      // registration); privileged scopes are REJECTED as 400, never silently
+      // dropped (scope.ts). The ceiling depends on the grant default above.
       // (2) filter unknowns (RFC 7591 value replacement) instead of
       // hard-rejecting: OIDC-flavored stacks append `offline_access` /
       // `openid`. Empty-after-filter with a non-empty request is a hard 400.
       const requestedScopes = parseScopeString(client.scope);
-      grantTypes = client.grant_types?.length ? client.grant_types : ['authorization_code'];
       const ceilingViolation = dcrScopeViolation(requestedScopes, grantTypes);
       if (ceilingViolation) throw new InvalidClientMetadataError(ceilingViolation);
       const { allowed, dropped } = filterAllowedScopes(requestedScopes);
@@ -398,20 +412,6 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
       // registration entry points share one allow-list.
       authMethod = validateTokenEndpointAuthMethod(client.token_endpoint_auth_method);
 
-      // v0.42 (#1353): the DCR path is the unauthenticated network entry point.
-      // `client_credentials` skips /authorize owner approval entirely, so a
-      // self-registered DCR client must NOT get it by default. `grantTypes`
-      // defaulted to `authorization_code` above; reject an explicit
-      // `client_credentials` request unless the operator opted in via
-      // `--enable-dcr-insecure` (and even then the ceiling above capped it at
-      // `read`). Manual CLI/admin registration bypasses this store method.
-      if (!this.allowClientCredentialsDcr && grantTypes.includes('client_credentials')) {
-        throw new InvalidClientMetadataError(
-          'client_credentials grant is not permitted via dynamic client registration; ' +
-          'restart the server with --enable-dcr-insecure to allow it, or register the ' +
-          'client via the gbrain CLI / admin API.',
-        );
-      }
     } catch (err) {
       asClientMetadataError(err);
     }

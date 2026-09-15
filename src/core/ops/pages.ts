@@ -1104,11 +1104,11 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential).',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential). Remote/MCP callers asking for purge get permission_denied (the soft-delete path stays available to them); status purged always carries write_through.',
   params: {
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },
     source_id: { type: 'string', description: "#4329: source holding the row to soft-delete (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId. Remote callers may only target their write source — federated read grants do not confer delete access." },
-    purge: { type: 'boolean', description: 'Hard-delete immediately after the soft-delete (no 72h recovery; status purged). Honored only for the trusted local CLI; remote/MCP callers get invalid_params and keep the soft-delete path.' },
+    purge: { type: 'boolean', description: 'Hard-delete immediately after the soft-delete (no 72h recovery; status purged). Honored only for the trusted local CLI; remote/MCP callers get permission_denied (a non-boolean value is invalid_params) and keep the soft-delete path.' },
   },
   mutating: true,
   scope: 'write',
@@ -1128,7 +1128,7 @@ const delete_page: Operation = {
     }
     const purge = p.purge === true;
     if (purge && ctx.remote !== false) {
-      throw new OperationError('invalid_params', 'purge is only available to the local CLI.', 'Remote callers soft-delete only; run `gbrain delete <slug> --purge` on the host to remove a page immediately.');
+      throw new OperationError('permission_denied', 'purge is only available to the local CLI.', 'Remote callers soft-delete only; run `gbrain delete <slug> --purge` on the host to remove a page immediately.');
     }
     if (ctx.dryRun) return { dry_run: true, action: purge ? 'purge_page' : 'soft_delete_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
@@ -1161,9 +1161,9 @@ const delete_page: Operation = {
         throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug (and source_id on a multi-source brain).');
       }
       if (purge) {
-        // Remediation path: the tombstone already exists; finish the removal.
+        // Remediation path: the tombstone already exists (its artifact went with the earlier soft-delete); finish the removal. Same response shape as the live-row purge.
         await ctx.engine.deletePage(slug, sourceOpts);
-        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}) };
+        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: { removed: false, skipped: 'already_soft_deleted' as const } };
       }
       return { status: 'already_soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), deleted_at: existing.deleted_at };
     }

@@ -10,7 +10,12 @@ import { TEST_PKCE_CHALLENGE, TEST_PKCE_VERIFIER } from '../helpers/oauth.ts';
 let child: ChildProcess;
 let home: string;
 let base: string;
-let adminCookie = ''; // set by the first test; the second reuses it (the shared admin auth limiter is 10/min/IP)
+// ONE admin login for the whole file (the shared admin auth limiter is
+// 10/min/IP and the consent routes draw from the same bucket), taken in
+// beforeAll so every test is order-independent. `adminSetCookie` keeps the
+// raw header for the attribute assertions.
+let adminCookie = '';
+let adminSetCookie = '';
 const BOOTSTRAP = 'synthetic-consent-admin-test-token';
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), 'gbrain-consent-test-'));
@@ -29,12 +34,17 @@ beforeAll(async () => {
   let output = '';
   child.stderr?.on('data', chunk => { output += chunk.toString(); });
   child.stdout?.on('data', chunk => { output += chunk.toString(); });
-  for (let attempt = 0; attempt < 150; attempt++) {
+  let up = false;
+  for (let attempt = 0; attempt < 150 && !up; attempt++) {
     if (child.exitCode !== null) throw new Error(`Consent server exited: ${output.slice(-2000)}`);
-    try { if ((await fetch(`${base}/health`)).ok) return; } catch { /* starting */ }
-    await Bun.sleep(100);
+    try { up = (await fetch(`${base}/health`)).ok; } catch { /* starting */ }
+    if (!up) await Bun.sleep(100);
   }
-  throw new Error(`Consent server did not start: ${output.slice(-2000)}`);
+  if (!up) throw new Error(`Consent server did not start: ${output.slice(-2000)}`);
+  const login = await fetch(`${base}/admin/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: BOOTSTRAP }) });
+  if (login.status !== 200) throw new Error(`admin login failed: ${login.status}`);
+  adminSetCookie = login.headers.get('set-cookie') ?? '';
+  adminCookie = adminSetCookie.split(';')[0];
 }, 30_000);
 afterAll(async () => {
   if (child && child.exitCode === null) {
@@ -60,10 +70,9 @@ test('login, magic-link recovery, consent authentication and single-use approval
   const id = pendingUrl.searchParams.get('oauth_request')!;
   expect((await fetch(pendingUrl)).status).toBe(200); // unauthenticated page shell
   expect((await fetch(`${base}/admin/api/oauth-requests/${id}`)).status).toBe(401);
-  const login = await fetch(`${base}/admin/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: BOOTSTRAP }) });
-  expect(login.status).toBe(200);
-  const oldCookie = login.headers.get('set-cookie')!.split(';')[0];
-  expect(login.headers.get('set-cookie')).toContain('SameSite=Strict');
+  expect(adminCookie).not.toBe('');
+  const oldCookie = adminCookie; // the beforeAll login session
+  expect(adminSetCookie).toContain('SameSite=Strict');
   const oldDetails = await (await fetch(`${base}/admin/api/oauth-requests/${id}`, { headers: { Cookie: oldCookie } })).json() as any;
   const magic = await fetch(`${base}/admin/api/issue-magic-link`, { method: 'POST', headers: { Authorization: `Bearer ${BOOTSTRAP}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ oauth_request: id, return_url: 'https://untrusted.example' }) });
   expect(magic.status).toBe(200);
@@ -73,7 +82,6 @@ test('login, magic-link recovery, consent authentication and single-use approval
   expect(redemption.headers.get('location')).toBe(`/admin/?oauth_request=${id}#oauth-consent`);
   const newCookie = redemption.headers.get('set-cookie')!.split(';')[0];
   expect(newCookie).not.toBe(oldCookie);
-  adminCookie = newCookie;
   const endpoint = `${base}/admin/api/oauth-requests/${id}`;
   const headers = { Cookie: newCookie, 'Content-Type': 'application/json' };
   expect((await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ decision: 'approve', csrf: oldDetails.csrf }) })).status).toBe(403);
@@ -125,7 +133,6 @@ test('a self-registered public client cannot obtain or redeem a code without own
   const unscoped = await register({ grant_types: ['authorization_code'] });
   expect(unscoped.scope ?? '').toBe('');
   const id = await expectPending(unscoped.client_id);
-  expect(adminCookie).not.toBe('');
   const details = await fetch(`${base}/admin/api/oauth-requests/${id}`, { headers: { Cookie: adminCookie } });
   expect(details.status).toBe(200);
   expect((await details.json() as any).scopes).toEqual([]);

@@ -204,6 +204,32 @@ describe('registerClient (DCR) under --enable-dcr-insecure: client_credentials i
   });
 });
 
+describe('registerClient (DCR) WITHOUT --enable-dcr-insecure: the grant gate answers before the ceiling', () => {
+  // A client_credentials request is not available at all here, so the reply
+  // must say so — not "limited to read because issued without owner
+  // approval", which implies the grant is on offer at a narrower scope.
+  test('client_credentials + "read write" → the not-permitted message, never the machine ceiling', async () => {
+    const provider = makeProvider();
+    const before = (await sql`SELECT client_id FROM oauth_clients WHERE client_name = 'dcr-ceiling-m2m'`).length;
+    const err = await expectRejected(
+      provider.clientsStore.registerClient!(machineMetadata('read write')),
+      /not permitted via dynamic client registration/,
+    );
+    expect(err.message).toMatch(/--enable-dcr-insecure/);
+    expect(err.message).not.toMatch(/limited to/);
+    const after = (await sql`SELECT client_id FROM oauth_clients WHERE client_name = 'dcr-ceiling-m2m'`).length;
+    expect(after).toBe(before); // nothing stored
+  });
+
+  test('client_credentials + "read" (inside the machine ceiling) is still refused for the same reason', async () => {
+    const provider = makeProvider();
+    await expectRejected(
+      provider.clientsStore.registerClient!(machineMetadata('read')),
+      /not permitted via dynamic client registration/,
+    );
+  });
+});
+
 describe('operator-trusted registration is unaffected', () => {
   test('registerClientManual still accepts admin', async () => {
     const provider = makeProvider();

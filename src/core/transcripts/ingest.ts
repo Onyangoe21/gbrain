@@ -29,6 +29,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { importFromContent } from '../import-file.ts';
+import { canonicalJson } from '../remediation-step.ts';
 import type { TranscriptAdapter, TranscriptFormat } from './types.ts';
 import { detectAdapter } from './detect.ts';
 import {
@@ -350,9 +351,14 @@ export async function runTranscriptsIngest(
                     sourceId: opts.sourceId,
                     includeDeleted: true,
                   });
+                  // Key-order-insensitive compare: JSONB hands keys back in
+                  // its own canonical order, so a plain JSON.stringify never
+                  // matched the freshly built object and every healthy re-run
+                  // rewrote the row.
                   needsRaw =
                     existing.length === 0 ||
-                    JSON.stringify(existing[0].data) !== JSON.stringify(redacted.session.meta.raw);
+                    canonicalJson(existing[0].data) !==
+                      canonicalJson(JSON.parse(JSON.stringify(redacted.session.meta.raw)));
                 }
                 if (needsRaw) {
                   await engine.putRawData(resolvedBaseSlug, rawSource, redacted.session.meta.raw, {

@@ -718,6 +718,89 @@ describe('format-based redaction before write (unprefixed credential shapes)', (
   });
 });
 
+/** Count calls to an engine method for one block; restores the original. */
+async function spyEngine<K extends 'getRawData' | 'putRawData'>(
+  method: K,
+  run: () => Promise<void>,
+): Promise<unknown[][]> {
+  const calls: unknown[][] = [];
+  const original = (engine as any)[method].bind(engine);
+  (engine as any)[method] = (...args: unknown[]) => { calls.push(args); return original(...args); };
+  try { await run(); } finally { delete (engine as any)[method]; }
+  return calls;
+}
+
+function writePlainSession(path: string): void {
+  writeFileSync(
+    path,
+    [
+      JSON.stringify({ type: 'session', version: 3, id: 'plain-02', timestamp: '2026-08-09T11:00:00.000Z', cwd: '/tmp/plain' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'm-1',
+        timestamp: '2026-08-09T11:00:01.000Z',
+        message: { role: 'user', timestamp: '2026-08-09T11:00:01.000Z', content: [{ type: 'text', text: 'plain question two' }] },
+      }),
+    ].join('\n') + '\n',
+  );
+}
+
+describe('re-ingest over a soft-deleted base page', () => {
+  test('resurrects the page (hash check reads ACTIVE rows only) — the compare probe never runs, raw is rewritten', async () => {
+    const p = join(tmp, 'plain-session-2.jsonl');
+    writePlainSession(p);
+    const r1 = await runTranscriptsIngest(engine, baseOpts([p]));
+    expect(r1.pages.imported).toBe(1);
+    const slug = r1.slugsTouched[0];
+    expect(await engine.softDeletePage(slug, { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.getPage(slug, { sourceId: 'default' })).toBeNull();
+
+    let r2: Awaited<ReturnType<typeof runTranscriptsIngest>> | undefined;
+    let putCalls: unknown[][] = [];
+    const probeCalls = await spyEngine('getRawData', async () => {
+      putCalls = await spyEngine('putRawData', async () => {
+        r2 = await runTranscriptsIngest(engine, baseOpts([p]));
+      });
+    });
+    // No abort; the tombstoned base page reads as missing to the import
+    // hash check, so it is IMPORTED again (not skipped) and comes back alive.
+    expect(r2!.sessionsImported).toBe(1);
+    expect(r2!.sessionsErrored).toBe(0);
+    expect(r2!.cleanScan).toBe(true);
+    expect(r2!.pages.imported).toBe(1);
+    expect(r2!.pages.skipped).toBe(0);
+    const alive = await engine.getPage(slug, { sourceId: 'default' });
+    expect(alive).not.toBeNull();
+    expect(alive!.deleted_at).toBeNull();
+    // Because the session was NOT all-skipped, the compare-before-write
+    // probe (the only getRawData with includeDeleted:true in ingest) is not
+    // reached; the raw row is written fresh over the resurrected page.
+    expect(probeCalls).toEqual([]);
+    expect(putCalls.length).toBe(1);
+    expect((await engine.getRawData(slug, undefined, { sourceId: 'default' })).length).toBe(1);
+  });
+
+  test('the compare probe fires only on an all-skipped (alive) re-run, and a content-equal row is not rewritten', async () => {
+    const p = join(tmp, 'plain-session-3.jsonl');
+    writePlainSession(p);
+    const r1 = await runTranscriptsIngest(engine, baseOpts([p]));
+    const slug = r1.slugsTouched[0];
+    let putCalls: unknown[][] = [];
+    const probeCalls = await spyEngine('getRawData', async () => {
+      putCalls = await spyEngine('putRawData', async () => {
+        const r2 = await runTranscriptsIngest(engine, baseOpts([p]));
+        expect(r2.pages.skipped).toBe(1);
+        expect(r2.pages.imported).toBe(0);
+      });
+    });
+    expect(probeCalls.length).toBe(1);
+    expect(probeCalls[0][0]).toBe(slug);
+    expect(probeCalls[0][1]).toBe('transcript:openclaw');
+    expect(probeCalls[0][2]).toMatchObject({ sourceId: 'default', includeDeleted: true });
+    expect(putCalls).toEqual([]);
+  });
+});
+
 describe('raw_data follows the page soft-delete', () => {
   test('after softDeletePage the session metadata is invisible; includeDeleted:true still reads it; restore brings it back', async () => {
     const p = join(tmp, 'plain-session.jsonl');

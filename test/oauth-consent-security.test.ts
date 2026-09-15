@@ -289,6 +289,24 @@ describe('dynamically registered public clients', () => {
     expect((await details(id)).scopes).toEqual([]);
   });
 
+  test('the eleventh pending request for one client is a redirect carrying error=too_many_requests, not a 429', async () => {
+    // Contract pin for the docs: the per-client cap trips inside
+    // provider.authorize(), which the MCP SDK's phase-2 catch turns into a
+    // 302 back to the registered redirect_uri with error parameters. A 429
+    // body on /authorize only ever comes from the SDK's per-IP limiter.
+    const client = await registerDcr();
+    for (let i = 0; i < 10; i++) await expectPending(client.client_id, 'read');
+    const response = await authorizeRaw(client.client_id, 'read');
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.origin + location.pathname).toBe(ATTACKER_REDIRECT);
+    expect(location.searchParams.get('error')).toBe('too_many_requests');
+    expect(location.searchParams.get('error_description')).toMatch(/pending requests for this client/);
+    expect(location.searchParams.get('state')).toBe('attacker-state');
+    expect(location.searchParams.has('code')).toBe(false);
+    expect(await sql`SELECT * FROM oauth_codes WHERE client_id = ${client.client_id}`).toHaveLength(0);
+  });
+
   test('a revoked self-registered client is rejected before any consent request is created', async () => {
     const client = await registerDcr();
     await provider.revokeClient(client.client_id);

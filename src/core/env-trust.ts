@@ -5,9 +5,9 @@
  * Bun merges `.env`, `.env.local` and the `.env.<NODE_ENV>[.local]` variants
  * from the process cwd into process.env before any user code runs — for
  * `bun run` AND for `bun build --compile` binaries alike (verified on Bun
- * 1.3.10). For a globally installed CLI the cwd is arbitrary: any cloned
- * repository can carry a `.env`, so those files are UNTRUSTED input. Bun
- * gives no way to ask which variables came from a file (the merge happens
+ * 1.3.10 and 1.3.13). For a globally installed CLI the cwd is arbitrary: any
+ * cloned repository can carry a `.env`, so those files are UNTRUSTED input.
+ * Bun gives no way to ask which variables came from a file (the merge happens
  * before module load), so this module re-parses the same files and reasons
  * about them. Two guards sit on top of that parse:
  *
@@ -20,6 +20,23 @@
  *     matching is unsound for a security list because Bun expands `${VAR}`
  *     inside .env values — `KEY=${PWD}/x` lands in process.env as an absolute
  *     path that never equals the file text.
+ *
+ * What the quarantine covers: the code-loading, exec-target, root-redirect and
+ * posture-widening GBRAIN_* keys (`CWD_DOTENV_PROTECTED_KEYS`) AND the loader /
+ * git / node / proxy / AI-CLI hijack families a cwd .env could plant for the
+ * programs gbrain spawns (`CWD_DOTENV_PROTECTED_PREFIXES`,
+ * `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`) — `isCwdDotenvProtectedKey` is the
+ * single predicate. Routing/tuning GBRAIN_* keys and everything not listed
+ * still load from a cwd .env.
+ *
+ * Grammar: this parser must accept AT LEAST every line shape Bun's loader
+ * accepts, or an assignment Bun honours becomes invisible to the guard. Bun
+ * treats `\n`, `\r\n` AND a bare `\r` as line terminators (`A=x\rB=1` sets
+ * BOTH keys), keeps U+2028/U+2029 as ordinary value bytes, and does not strip
+ * a leading BOM (we strip it anyway — counting one more assignment is the
+ * safe side). The right-hand side is therefore matched as "everything up to
+ * the line terminator", never as `.*$`: `.` skips `\r` and U+2028/2029, and
+ * the `$` anchor then fails, hiding the whole assignment.
  *
  * fs/path only — this runs before anything else in the CLI.
  */
@@ -37,9 +54,23 @@ export const CWD_DOTENV_FILES: readonly string[] = [
   '.env.test', '.env.test.local',
 ];
 
+// Bun's terminator set: CRLF first so it is consumed as one break.
+const LINE_TERMINATOR = /\r\n|\r|\n/;
+
+/**
+ * Split .env file content into lines the way Bun's loader does (see the
+ * grammar note above) and strip a leading BOM. Shared with the
+ * `~/.gbrain/.env` loader in gbrain-env-file.ts so both files speak the same
+ * grammar.
+ */
+export function splitDotenvLines(content: string): string[] {
+  const body = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+  return body.split(LINE_TERMINATOR);
+}
+
 // `export KEY=...` is accepted so a shell-styled .env still counts as an
-// assignment (the guard errs toward "file-origin").
-const ASSIGNMENT = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
+// assignment (the guard errs toward "file-origin"). RHS: see the grammar note.
+const ASSIGNMENT = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^\r\n]*)$/;
 
 /** Every `KEY=<raw rhs>` pair across the cwd .env files in `dir`, in file order. */
 function* dotenvAssignments(dir: string): Generator<[key: string, raw: string]> {
@@ -50,7 +81,7 @@ function* dotenvAssignments(dir: string): Generator<[key: string, raw: string]> 
     } catch {
       continue; // missing/unreadable file — nothing to guard against
     }
-    for (const rawLine of content.split('\n')) {
+    for (const rawLine of splitDotenvLines(content)) {
       const line = rawLine.trim();
       if (!line || line.startsWith('#')) continue;
       const m = line.match(ASSIGNMENT);
@@ -133,28 +164,98 @@ export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   'GBRAIN_REMOTE_PRIVATE_PAGES',     // exposes private pages to remote callers
 ];
 
+/**
+ * Non-GBRAIN hijack families a cwd `.env` could plant for the PROGRAMS gbrain
+ * spawns (git, the claude CLI, bun/node workers, shell jobs). These are
+ * normally absent from an operator's environment, which is exactly why a
+ * file-planted value lands (Bun never overrides a variable that already
+ * exists). Matched by PREFIX because each family is open-ended
+ * (`GIT_CONFIG_KEY_<n>`, `LD_*`, `BUN_CONFIG_*`); a family member the shell
+ * DID export is untouched unless a cwd .env assigns that same name.
+ */
+export const CWD_DOTENV_PROTECTED_PREFIXES: readonly string[] = [
+  'LD_',         // glibc loader injection (LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT) into every dynamically linked child
+  'DYLD_',       // the macOS loader's equivalents (DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH)
+  'GIT_',        // git config/hook/exec injection: GIT_CONFIG_COUNT/KEY_n/VALUE_n (core.fsmonitor, core.hooksPath), GIT_EXEC_PATH, GIT_SSH*, GIT_ASKPASS
+  'BUN_',        // bun runtime hijack for bun-based children: BUN_OPTIONS (--preload), BUN_INSTALL, BUN_CONFIG_*
+  'NPM_CONFIG_', // npm registry / script-shell / node-options redirection for npm-based children
+  'npm_config_', // the lowercase spelling npm actually reads
+];
+
+/**
+ * Exact non-GBRAIN keys with the same effect as the prefix families above but
+ * no shared prefix. Same rule: dropped only when a cwd .env assigns them.
+ */
+export const CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS: readonly string[] = [
+  // --- node preload / resolution / TLS --------------------------------------
+  'NODE_OPTIONS',                 // --require/--import a module into every node child (the claude CLI among them)
+  'NODE_PATH',                    // extra module-resolution roots → dependency shadowing
+  'NODE_EXTRA_CA_CERTS',          // trusts a planted CA → TLS interception of API traffic
+  'NODE_TLS_REJECT_UNAUTHORIZED', // =0 disables certificate verification outright
+  // --- ssh credential prompts -----------------------------------------------
+  'SSH_ASKPASS',                  // program ssh/git run to obtain a passphrase
+  'SSH_ASKPASS_REQUIRE',          // forces that program even when a tty is present
+  // --- interpreter preload for scripted children (git's own helpers included)
+  'PYTHONPATH',                   // python module shadowing
+  'PYTHONSTARTUP',                // python startup script
+  'PERL5LIB',                     // perl library path
+  'PERL5OPT',                     // implicit perl -M module load
+  'RUBYOPT',                      // implicit ruby -r preload
+  'RUBYLIB',                      // ruby library path
+  // --- proxy MITM of every HTTP client gbrain or its children run -----------
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+  'http_proxy', 'https_proxy', 'all_proxy',
+  // --- AI CLI / API endpoint redirection ------------------------------------
+  'CLAUDE_CONFIG_DIR',            // the claude CLI's config dir → its hooks and settings
+  'ANTHROPIC_BASE_URL',           // redirects Anthropic API traffic (and the key with it) to a planted host
+  'ANTHROPIC_AUTH_TOKEN',         // substitutes the bearer credential the SDK / claude CLI send
+  'OPENAI_BASE_URL',              // redirects OpenAI-compatible API traffic
+];
+
+const PROTECTED_EXACT: ReadonlySet<string> = new Set([
+  ...CWD_DOTENV_PROTECTED_KEYS,
+  ...CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS,
+]);
+
+/** The one predicate: is `key` something a cwd .env must never be allowed to set? */
+export function isCwdDotenvProtectedKey(key: string): boolean {
+  if (PROTECTED_EXACT.has(key)) return true;
+  for (const prefix of CWD_DOTENV_PROTECTED_PREFIXES) {
+    if (key.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
 export interface QuarantineOpts {
   /** Warning sink; default writes one line to stderr. Injectable for tests. */
   warn?: (line: string) => void;
 }
 
+/** The remediation every cwd-.env refusal ends with (also used by guardrails.ts). */
+export const CWD_DOTENV_REMEDIATION =
+  'cwd .env files are untrusted for security settings. Export it from your shell or set it ' +
+  'in ~/.gbrain/.env.';
+
 export function formatQuarantineWarning(keys: readonly string[]): string {
   return (
     `[env] Ignoring ${keys.join(', ')} because a .env file in the current directory assigns it — ` +
-    'cwd .env files are untrusted for security settings. Export it from your shell or set it ' +
-    'in ~/.gbrain/.env.'
+    CWD_DOTENV_REMEDIATION
   );
 }
 
 /**
  * Drop every protected key present in `env` that a cwd .env file in `dir`
- * assigns, and print ONE stderr warning naming them. Returns the dropped keys.
+ * assigns, and print ONE stderr warning naming them (sorted). Returns the
+ * dropped keys, sorted. Iterates the keys the .env files ASSIGN (not a fixed
+ * list) so the prefix families are covered.
  *
  * Semantics worth knowing:
- *   - Per-process. Every gbrain process re-applies this at startup (via
- *     `cli-preflight.ts`). `delete process.env.X` is NOT seen by children
- *     spawned without an explicit `env` option (verified on Bun 1.3.10) — a
- *     child that must inherit the quarantined view passes `env: process.env`.
+ *   - Per-process, in-process. `delete process.env.X` is NOT seen by children
+ *     spawned without an explicit `env` option (Bun hands them the environ
+ *     snapshot it took at startup — verified on Bun 1.3.13), so
+ *     `cli-preflight.ts` re-execs gbrain once with the sanitized environment
+ *     whenever this returns a non-empty list; a self-spawn that must inherit
+ *     the quarantined view still passes `env: process.env`.
  *   - Key presence, not value. A value the operator exported from the shell
  *     is ALSO dropped while a cwd .env assigns the same key: Bun's `${VAR}`
  *     expansion makes the two indistinguishable, and for this fixed security
@@ -166,16 +267,16 @@ export function quarantineCwdDotenv(
   dir: string = process.cwd(),
   opts: QuarantineOpts = {},
 ): string[] {
-  const present = CWD_DOTENV_PROTECTED_KEYS.filter((k) => env[k] !== undefined);
-  if (present.length === 0) return [];
-  const assigned = new Set<string>();
-  for (const [k] of dotenvAssignments(dir)) assigned.add(k);
   const dropped: string[] = [];
-  for (const key of present) {
-    if (!assigned.has(key)) continue;
+  const seen = new Set<string>();
+  for (const [key] of dotenvAssignments(dir)) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (env[key] === undefined || !isCwdDotenvProtectedKey(key)) continue;
     delete env[key];
     dropped.push(key);
   }
+  dropped.sort();
   if (dropped.length > 0) {
     (opts.warn ?? ((line: string) => console.error(line)))(formatQuarantineWarning(dropped));
   }
