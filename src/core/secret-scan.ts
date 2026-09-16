@@ -804,17 +804,22 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
 // across both patterns — join. A value past either cap is still redacted at
 // its claimed span; only its echoes are the accepted miss.
 //
-// The pass is at most ECHO_MAX_UNIQUE `indexOf` sweeps over the ORIGINAL
-// text, one per value, collecting candidate occurrences that are resolved
-// leftmost-longest and spliced INTO THE UNCLAIMED GAPS between claimed spans.
-// Two earlier forms were wrong: one `replaceAll` per unique value was
-// O(unique × text) (why the cap exists), and a single escaped-alternation
-// RegExp was O(text × Σ|values|) on prefix-sharing values — 64 claimed
-// bearer values of 4 KB sharing a 4000-char prefix ahead of a 1 MB tail of
-// the prefix character took ~24 s (the bearer class is unbounded, so an
-// attacker-influenced page can plant them); the per-value substring sweeps
-// take milliseconds on the same input, and the value-length cap bounds the
-// per-candidate compare. Matching only ever runs over the original text,
+// The pass is a streaming merge over the ORIGINAL text: per value, the
+// position of its next occurrence at or beyond the emit cursor (found by
+// `indexOf` resuming at the cursor); at each step the leftmost-longest
+// occurrence that fits inside the current UNCLAIMED GAP is emitted and the
+// cursor advances. Retained state is O(values) however long the text is —
+// occurrences are never collected into a list, which on a repetitive tail
+// (2 MiB of `A` against 64 claimed values of 20–83 `A`s) meant ~3 M candidate
+// objects and ~230 MB of RSS for 64 findings, ahead of message truncation.
+// Two earlier forms were also wrong on time: one `replaceAll` per unique
+// value was O(unique × text) (why the count cap exists), and a single
+// escaped-alternation RegExp was O(text × Σ|values|) on prefix-sharing
+// values — 64 claimed bearer values of 4 KB sharing a 4000-char prefix ahead
+// of a 1 MB tail of the prefix character took ~24 s (the bearer class is
+// unbounded, so an attacker-influenced page can plant them); the per-value
+// substring seeks take milliseconds on the same input, and the value-length
+// cap bounds each compare. Matching only ever runs over the original text,
 // never over emitted `<REDACTED:…>` tokens: a claimed bearer value that
 // spells a pattern name (`high_entropy_assignment` is 23 bearer-class
 // characters) used to turn a sibling token into `<REDACTED:<REDACTED:bearer>>`
@@ -916,54 +921,79 @@ export function planRedaction(text: string, opts: RedactOpts = {}): RedactionPla
   return { redactions, echoValues, text, claimed };
 }
 
-interface EchoCandidate {
-  pos: number;
-  len: number;
-  pattern: string;
+/**
+ * Echo-sweep state for one `applyRedaction` call: the dictionary values
+ * longest-first (a tie at one position resolves to the longest, so a value
+ * that is a prefix of another never cuts the longer echo short) and, per
+ * value, the position of its next occurrence at or beyond the emit cursor
+ * (-1 once exhausted). Occurrences are discovered LAZILY as the cursor
+ * advances and are never materialized as a list: a repetitive tail (2 MiB of
+ * `A` against 64 claimed values of 20–83 `A`s) has O(text × Σ 1/|value|)
+ * non-overlapping occurrences — ~3 M candidate objects, ~230 MB of RSS for
+ * 64 findings when they were collected up front — while this state is
+ * O(values) however long the text is. Each value's `indexOf` resumes at the
+ * cursor and is re-sought only once the cursor has passed its cached
+ * position, so the whole sweep stays O(values × text).
+ */
+interface EchoSweep {
+  values: string[];
+  tokens: string[];
+  next: Int32Array;
 }
 
-/**
- * Every occurrence of every dictionary value in the ORIGINAL text (one
- * non-overlapping `indexOf` sweep per value), sorted leftmost-then-longest so
- * the splice takes the longest echo at any position and a value that is a
- * prefix of another never cuts the longer one short.
- */
-function findEchoes(text: string, values: EchoDictionary): EchoCandidate[] {
-  const out: EchoCandidate[] = [];
-  for (const [value, pattern] of values) {
-    for (let i = text.indexOf(value); i !== -1; i = text.indexOf(value, i + value.length)) {
-      out.push({ pos: i, len: value.length, pattern });
-    }
-  }
-  out.sort((a, b) => a.pos - b.pos || b.len - a.len);
-  return out;
+function startEchoSweep(text: string, dict: EchoDictionary): EchoSweep {
+  const entries = [...dict].sort((a, b) => b[0].length - a[0].length);
+  const values = entries.map((e) => e[0]);
+  const tokens = entries.map((e) => `<REDACTED:${e[1]}>`);
+  const next = new Int32Array(values.length);
+  for (let k = 0; k < values.length; k++) next[k] = text.indexOf(values[k]!);
+  return { values, tokens, next };
 }
 
 /**
  * Splice a plan: `<REDACTED:pattern>` over every claimed span, and over every
- * echo-dictionary occurrence that lies ENTIRELY inside an unclaimed gap. The
- * dictionary is read now, not at plan time — a caller that planned several
- * fields into one map gets every field's values here.
+ * echo-dictionary occurrence that lies ENTIRELY inside an unclaimed gap,
+ * leftmost-longest. The dictionary is read now, not at plan time — a caller
+ * that planned several fields into one map gets every field's values here.
+ * Output is emitted incrementally as the cursor advances; nothing but the
+ * output parts and the O(values) sweep state is retained.
  */
 export function applyRedaction(plan: RedactionPlan): string {
   const { text, claimed, echoValues } = plan;
   if (claimed.length === 0 && echoValues.size === 0) return text;
-  const echoes = findEchoes(text, echoValues);
+  const sweep = echoValues.size > 0 ? startEchoSweep(text, echoValues) : null;
   const parts: string[] = [];
-  let ei = 0;
-  // Copy text[from, to) through with the echo candidates that fit inside it.
-  // A candidate that starts inside an earlier emission (a claimed span or a
-  // longer echo at the same position) or runs into the claimed span ahead is
-  // dropped — matching never touches an emitted token.
+  // Copy text[from, to) through, splicing the echo occurrences inside it. At
+  // each step the leftmost (then longest) occurrence at or beyond the cursor
+  // that fits before `to` is emitted; one that runs into the claimed span
+  // ahead is left alone and re-sought past that span — matching never
+  // touches an emitted token.
   const emitGap = (from: number, to: number): void => {
     let at = from;
-    while (ei < echoes.length && echoes[ei]!.pos < to) {
-      const e = echoes[ei++]!;
-      if (e.pos < at || e.pos + e.len > to) continue;
-      parts.push(text.slice(at, e.pos), `<REDACTED:${e.pattern}>`);
-      at = e.pos + e.len;
+    if (sweep) {
+      const { values, tokens, next } = sweep;
+      while (at < to) {
+        let best = -1;
+        let bestPos = to;
+        for (let k = 0; k < values.length; k++) {
+          let p = next[k]!;
+          if (p === -1) continue;
+          if (p < at) {
+            p = text.indexOf(values[k]!, at);
+            next[k] = p;
+            if (p === -1) continue;
+          }
+          if (p >= bestPos || p + values[k]!.length > to) continue;
+          best = k;
+          bestPos = p;
+        }
+        if (best === -1) break;
+        if (bestPos > at) parts.push(text.slice(at, bestPos));
+        parts.push(tokens[best]!);
+        at = bestPos + values[best]!.length;
+      }
     }
-    parts.push(text.slice(at, to));
+    if (at < to) parts.push(text.slice(at, to));
   };
   let cur = 0;
   for (const c of claimed) {

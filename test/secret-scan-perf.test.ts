@@ -328,6 +328,31 @@ describe(`the echo pass is at most ${ECHO_MAX_UNIQUE} substring sweeps over the 
     expect(result.text).toBe(Array.from({ length: ECHO_MAX_UNIQUE }, () => 'Bearer <REDACTED:bearer>').join(' ') + '\n' + tail);
     expect(ms).toBeLessThan(300);
   });
+
+  test(`the repetitive-tail adversary — ${ECHO_MAX_UNIQUE} claimed values of 20..83 repeated \`A\`s, then a 2 MiB \`A\` tail: heap delta < 64 MiB, RSS delta < 96 MiB, < 1500ms, no run of 20 \`A\`s survives`, () => {
+    // Retained memory must be independent of text size. Collecting every
+    // non-overlapping occurrence of every value up front is O(text × Σ
+    // 1/|value|) objects — ~3 M candidates here, ~230 MB of RSS for 64
+    // findings (and redactSession runs BEFORE message truncation). The
+    // streaming merge keeps O(values) state and emits as it goes.
+    const vals = Array.from({ length: ECHO_MAX_UNIQUE }, (_, k) => 'A'.repeat(20 + k));
+    const tail = 'A'.repeat(2 << 20);
+    const text = vals.map((v) => `Bearer ${v}`).join('\n') + '\n' + tail;
+    const gc = (globalThis as { Bun?: { gc?: (force: boolean) => void } }).Bun?.gc;
+    gc?.(true);
+    const before = process.memoryUsage();
+    let result!: ReturnType<typeof redactFindings>;
+    const ms = elapsedMs(() => { result = redactFindings(text); });
+    const after = process.memoryUsage();
+    expect(result.redactions.length).toBe(ECHO_MAX_UNIQUE);
+    expect(/A{20}/.test(result.text)).toBe(false);
+    // 2 MiB = 25266 × 83 + 74 and 74 is itself a claimed length, so the tail
+    // is covered wall to wall by echo tokens.
+    expect(result.text.split('\n').at(-1)!.replaceAll('<REDACTED:bearer>', '')).toBe('');
+    expect((after.heapUsed - before.heapUsed) / (1 << 20)).toBeLessThan(64);
+    expect((after.rss - before.rss) / (1 << 20)).toBeLessThan(96);
+    expect(ms).toBeLessThan(1500);
+  });
 });
 
 describe('redactFindings is linear in unique values (span-splice, not replaceAll per value)', () => {

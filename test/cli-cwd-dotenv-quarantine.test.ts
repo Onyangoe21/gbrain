@@ -546,31 +546,47 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
   // are actually installed in the wrapper. The child's graceful shutdown is
   // modelled by an operator-EXPORTED guardrails module: it replaces the child's
   // own prompt SIGTERM exit with a delayed exit(0) and writes a marker first.
-  function gracefulSigtermProvider(): { path: string; marker: string; ready: string } {
-    const d = mkdtempSync(join(tmpdir(), 'gbrain-e43-provider-'));
+  /**
+   * An operator-EXPORTED guardrails module that runs `prelude` first, reports
+   * its pid through a READY file, then holds its import open — so the real
+   * cli.ts child stays alive inside the guardrails loader until a signal (or
+   * the watchdog) ends it. `marker` is a path the prelude may write.
+   */
+  function holdingProvider(prelude: (files: { marker: string }) => string[] = () => []): { path: string; marker: string; ready: string } {
+    const d = mkdtempSync(join(tmpdir(), 'gbrain-hold-provider-'));
     scratch.push(d);
-    const marker = join(d, 'GRACEFUL_DONE');
+    const marker = join(d, 'MARKER');
     const ready = join(d, 'READY');
     const path = join(d, 'provider.mjs');
     writeFileSync(path, [
       `import { writeFileSync, renameSync } from 'node:fs';`,
-      // The child's cli.ts handler would exit 143 at once; this fixture models a command that shuts down gracefully instead.
-      `process.removeAllListeners('SIGTERM');`,
-      `process.on('SIGTERM', () => { setTimeout(() => { writeFileSync(${JSON.stringify(marker)}, 'ran'); process.exit(0); }, ${GRACEFUL_EXIT_DELAY_MS}); });`,
+      ...prelude({ marker }),
       `writeFileSync(${JSON.stringify(ready + '.tmp')}, String(process.pid)); renameSync(${JSON.stringify(ready + '.tmp')}, ${JSON.stringify(ready)});`,
       `setInterval(() => {}, ${KEEPALIVE_INTERVAL_MS});`,
-      // Hold the import open: the child stays alive inside the guardrails loader until SIGTERM arrives.
-      `await new Promise(() => {});`,
-      `export default { id: 'fixture-e4-3', classify() {} };`,
+      `await new Promise(() => {});`, // hold the import open
+      `export default { id: 'fixture-hold', classify() {} };`,
       '',
     ].join('\n'));
     return { path, marker, ready };
   }
   const hopDirsIn = (tmp: string) => readdirSync(tmp).filter((n) => n.startsWith('gbrain-hop-'));
+  /** Poll `cond` until true or `ms` elapsed. */
+  async function within(ms: number, cond: () => boolean): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (cond()) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return cond();
+  }
 
   test("through cli.ts: SIGTERM to the wrapper — the wrapper outlives the child's graceful exit(0), relays 0, the marker is present, the neutral dir is removed", async () => {
     const { dir } = hostileRepo(() => 'GBRAIN_ALLOW_SHELL_JOBS=1'); // protected, NOT the guardrails key → quarantine + re-run, no refusal
-    const provider = gracefulSigtermProvider();
+    // The child's cli.ts handler would exit 143 at once; this models a command that shuts down gracefully instead.
+    const provider = holdingProvider(({ marker }) => [
+      `process.removeAllListeners('SIGTERM');`,
+      `process.on('SIGTERM', () => { setTimeout(() => { writeFileSync(${JSON.stringify(marker)}, 'ran'); process.exit(0); }, ${GRACEFUL_EXIT_DELAY_MS}); });`,
+    ]);
     const hopTmp = mkdtempSync(join(tmpdir(), 'gbrain-e43-hoptmp-')); // private TMPDIR: the neutral dir is created — and must be removed — in here
     scratch.push(hopTmp);
     const env = hermeticEnv(dir, { GBRAIN_GUARDRAILS_MODULE: provider.path, TMPDIR: hopTmp });
@@ -590,6 +606,42 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
       expect(hopDirsIn(hopTmp)).toEqual([]); // finally { rmSync(neutral) } ran
       expect(stderr).toContain('Ignoring GBRAIN_ALLOW_SHELL_JOBS because');
       expect(await gone(childPid)).toBe(true);
+    } finally {
+      clearTimeout(timer);
+      if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
+    }
+  });
+
+  // E5-1 (review cycle 5): a supervisor that tracks the WRAPPER pid escalates
+  // to SIGKILL on it (ChildWorkerSupervisor.restartCurrentChild); SIGKILL
+  // cannot be forwarded, so the re-run used to survive as an orphan while the
+  // supervisor started a replacement. The hop marker now carries the wrapper's
+  // pid and the verified re-run runs a 1 s die-with-parent watchdog on
+  // `process.ppid` (LIVE in Bun 1.3.13 — measured: it flips to the reaper's pid
+  // after the parent dies, whether it exited or was SIGKILLed). The child also
+  // removes the (empty) neutral dir the wrapper's own `finally` never reached.
+  const WATCHDOG_NOTICE_MS = 4_000; // the watchdog ticks every second; allow for a loaded box
+  test('SIGKILL on the wrapper: the re-run notices within seconds, exits (137) and removes the neutral dir the wrapper could not', async () => {
+    const { dir } = hostileRepo(() => 'GBRAIN_ALLOW_SHELL_JOBS=1');
+    const provider = holdingProvider();
+    const hopTmp = mkdtempSync(join(tmpdir(), 'gbrain-e51-hoptmp-'));
+    scratch.push(hopTmp);
+    const env = hermeticEnv(dir, { GBRAIN_GUARDRAILS_MODULE: provider.path, TMPDIR: hopTmp });
+    const proc = Bun.spawn([process.execPath, CLI_PATH, '--version'], { cwd: dir, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const stdoutP = new Response(proc.stdout).text();
+    const stderrP = new Response(proc.stderr).text(); // resolves when the LAST writer (the child) closes the inherited pipe
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* exited */ } }, CHILD_KILL_AFTER_MS);
+    let childPid = 0;
+    try {
+      childPid = await waitReady(provider.ready);
+      expect(childPid).not.toBe(proc.pid);
+      expect(hopDirsIn(hopTmp)).toHaveLength(1);
+      proc.kill('SIGKILL'); // the supervisor's escalation, aimed at the pid it tracks: the wrapper
+      await proc.exited;
+      expect(await within(WATCHDOG_NOTICE_MS, () => { try { process.kill(childPid, 0); return false; } catch { return true; } })).toBe(true); // the re-run is gone
+      expect(await within(WATCHDOG_NOTICE_MS, () => hopDirsIn(hopTmp).length === 0)).toBe(true); // …and it cleaned up the neutral dir
+      const [stderr] = await Promise.all([stderrP, stdoutP]);
+      expect(stderr).toContain('[env] sanitized re-run lost its wrapper (killed); exiting');
     } finally {
       clearTimeout(timer);
       if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
@@ -648,6 +700,50 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
     const r = await runCli([process.execPath, '--smol', entry, '--preflight'], dir, hermeticEnv(dir));
     expect(r.exitCode).toBe(7);
     expect(r.stdout).toContain('EXECARGV=["--smol"]');
+  });
+
+  // E5-2 (review cycle 5): execArgv was copied verbatim, so a RELATIVE runtime
+  // path (`bun --preload ./probe.ts src/cli.ts`) resolved from the EMPTY neutral
+  // dir and the re-run died with `preload not found`. Path-bearing runtime
+  // flags (--preload/-r/--require/--import, --config/-c, --env-file,
+  // --tsconfig-override; both `--flag value` and `--flag=value` — Bun reports
+  // both spellings verbatim) now have a relative value resolved against the
+  // ORIGINAL cwd. pre.ts appends one line per load: parent + re-run = 2.
+  const EXECARGV_BODY = `process.stdout.write('EXECARGV=' + JSON.stringify(process.execArgv) + '\\n');\nprocess.exit(7);`;
+  function countingPreload(dir: string): { rel: string; abs: string; loads: string } {
+    const loads = join(dir, 'PRELOAD_LOADS');
+    writeFileSync(join(dir, 'tooling', 'pre.ts'), `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(loads)}, process.pid + '\\n');\n`);
+    return { rel: './tooling/pre.ts', abs: join(dir, 'tooling', 'pre.ts'), loads };
+  }
+  const loadCount = (loads: string) => (existsSync(loads) ? readFileSync(loads, 'utf8').trim().split('\n').length : 0);
+
+  const relativeSpellings: Array<[label: string, argv: (rel: string) => string[]]> = [
+    ['--preload ./x (two entries)', (rel) => ['--preload', rel]],
+    ['--preload=./x (one entry)', (rel) => [`--preload=${rel}`]],
+    ['-r ./x', (rel) => ['-r', rel]],
+    ['--smol before --import ./x (order kept)', (rel) => ['--smol', '--import', rel]],
+  ];
+  for (const [label, argv] of relativeSpellings) {
+    test.skipIf(!GIT_BIN)(`a relative runtime path survives the hop: ${label} → loads in the parent AND the re-run, no "preload not found"`, async () => {
+      const { dir, entry } = hostileGitRepo({ entryBody: EXECARGV_BODY });
+      const pre = countingPreload(dir);
+      const r = await runCli([process.execPath, ...argv(pre.rel), entry, '--preflight'], dir, hermeticEnv(dir));
+      expect(r.stderr).not.toContain('preload not found');
+      expect(r.exitCode).toBe(7);
+      expect(loadCount(pre.loads)).toBe(2);
+      // The re-run's execArgv carries the ABSOLUTE spelling, other flags untouched, order preserved.
+      const expected = argv(pre.rel).map((a) => a.replace(pre.rel, realpathSync(pre.abs)));
+      expect(r.stdout).toContain(`EXECARGV=${JSON.stringify(expected)}`);
+    });
+  }
+
+  test.skipIf(!GIT_BIN)('control: an absolute --preload path is passed through unchanged (still loads twice)', async () => {
+    const { dir, entry } = hostileGitRepo({ entryBody: EXECARGV_BODY });
+    const pre = countingPreload(dir);
+    const r = await runCli([process.execPath, '--preload', pre.abs, entry, '--preflight'], dir, hermeticEnv(dir));
+    expect(r.exitCode).toBe(7);
+    expect(loadCount(pre.loads)).toBe(2);
+    expect(r.stdout).toContain(`EXECARGV=${JSON.stringify(['--preload', pre.abs])}`);
   });
 
   // A3-4 (red team): a relative `TMPDIR=t` in the .env would make mkdtemp return

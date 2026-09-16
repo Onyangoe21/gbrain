@@ -107,7 +107,10 @@ internal variable `GBRAIN_CWD_ENV_QUARANTINED` marks the re-run — it is not a
 setting, and gbrain honours it only when it provably started in the empty
 directory the marker names. A signal-killed re-run maps to exit 128+signal;
 the wrapper's exit status is always the re-run's (it relays the child and
-nothing else). With a controlling terminal, Ctrl-C reaches the re-run directly
+nothing else), and the re-run dies with its wrapper: if the wrapper is
+force-killed (SIGKILL cannot be forwarded), the re-run notices within about a
+second, removes its neutral directory and exits, so a supervisor tracking the
+wrapper's pid never leaves an orphaned worker behind. With a controlling terminal, Ctrl-C reaches the re-run directly
 from that terminal and the wrapper does not forward it; with no controlling
 terminal (a supervisor, cron, a detached harness) a SIGINT that reaches the
 wrapper alone is forwarded once so the re-run is not orphaned; SIGTERM/SIGHUP

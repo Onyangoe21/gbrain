@@ -4,7 +4,8 @@
  *
  *   0. Sanitized re-run detection. When this process IS the re-run described
  *      in step 1b (verified, never trusted on the marker's say-so — see
- *      "Loop guard"), switch back to the caller's directory and skip step 1:
+ *      "Loop guard"), switch back to the caller's directory, arm the
+ *      die-with-wrapper watchdog (see "Die with the wrapper") and skip step 1:
  *      the parent already quarantined and warned.
  *   1. `quarantineCwdDotenv()` — drop every protected key (env-trust.ts: the
  *      security-relevant GBRAIN_* keys plus the loader / git / node / XDG /
@@ -61,12 +62,13 @@
  *
  * ## Loop guard
  *
- * The re-run carries `GBRAIN_CWD_ENV_QUARANTINED=<JSON {cwd, neutral}>`. The
- * marker is NOT trusted by itself — a hostile .env could plant one (the key is
- * also on the protected list, so a planted copy is dropped and named in the
- * warning). It is honoured only when ALL of: it parses to two strings, this
- * process's startup cwd IS `neutral` (realpath-compared), and `neutral`
- * contains none of the `.env` family. A process started from a hostile
+ * The re-run carries `GBRAIN_CWD_ENV_QUARANTINED=<JSON {cwd, neutral,
+ * wrapperPid}>`. The marker is NOT trusted by itself — a hostile .env could
+ * plant one (the key is also on the protected list, so a planted copy is
+ * dropped and named in the warning). It is honoured only when ALL of: it
+ * parses to two strings (`wrapperPid` is informational — a positive integer
+ * or ignored), this process's startup cwd IS `neutral` (realpath-compared),
+ * and `neutral` contains none of the `.env` family. A process started from a hostile
  * directory fails the second check (its startup cwd has a `.env`) and the
  * third if it names its own directory — so it ignores the marker entirely
  * and never chdirs on one. Termination is structural: the re-run's startup
@@ -108,6 +110,35 @@
  *     child, and it is always forwarded.)
  * Exit status: the re-run's code, or 128+signal when a signal killed it
  * (shell convention).
+ *
+ * ## Die with the wrapper
+ *
+ * SIGKILL cannot be forwarded. A supervisor that tracks the pid it spawned —
+ * the WRAPPER's — and escalates to SIGKILL (minions/supervisor.ts
+ * `restartCurrentChild`, job-isolation children, hook pushes) would leave the
+ * real re-run running as an orphan while a replacement starts. So the marker
+ * carries the wrapper's pid and a VERIFIED re-run arms a watchdog: every
+ * second it compares `process.ppid` with that pid (Bun's `process.ppid` is
+ * live — it flips to the reaper's pid once the parent is gone, whether it
+ * exited or was killed; verified on 1.3.13) and, when they differ, prints one
+ * line, removes the now-orphaned neutral dir (`rmdirSync` — it is empty by
+ * construction, and a non-recursive remove can never take anything else
+ * with it) and exits 137, mirroring the SIGKILL the wrapper took. The timer
+ * is `unref()`ed so it never keeps a finished command alive. A marker without
+ * a usable `wrapperPid` (planted, foreign, older) arms nothing.
+ *
+ * ## Runtime flags across the hop
+ *
+ * `bun <flags> src/cli.ts` re-inserts `process.execArgv` into the re-run (a
+ * compiled binary has none). Bun reports path-bearing flags verbatim in both
+ * spellings (`["--preload", "./x"]` and `["--preload=./x"]`) and resolves a
+ * relative value against the process cwd — which for the re-run is the EMPTY
+ * neutral dir, so `--preload ./probe.ts` died with `preload not found`. For
+ * `--preload`/`-r`/`--require`/`--import`, `--config`/`-c`, `--env-file` and
+ * `--tsconfig-override`, a value that is `./`- or `../`-relative, or a bare
+ * relative name that exists in the original cwd, is resolved against the
+ * ORIGINAL cwd; absolute values, bare package specifiers and every other
+ * flag pass through untouched, in order.
  *
  * ## HOME after the drop
  *
@@ -170,9 +201,9 @@
  * merge, so a planted HOME does not actually reach `configDir()` — the check
  * is belt-and-braces against that implementation detail changing.
  */
-import { closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync } from 'fs';
+import { closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmdirSync, rmSync } from 'fs';
 import { constants as osConstants, homedir, tmpdir, userInfo } from 'os';
-import { dirname, join } from 'path';
+import { dirname, isAbsolute, join, resolve } from 'path';
 import {
   CWD_DOTENV_FILES,
   cwdDotenvAssignsKey,
@@ -194,6 +225,8 @@ interface HopMarker {
   cwd: string;
   /** The fresh empty directory the re-run was started in. */
   neutral: string;
+  /** The wrapper's pid, for the die-with-wrapper watchdog; absent → no watchdog. Informational, not part of verification. */
+  wrapperPid?: number;
 }
 
 function parseHopMarker(raw: string | undefined): HopMarker | null {
@@ -205,12 +238,30 @@ function parseHopMarker(raw: string | undefined): HopMarker | null {
       typeof (v as HopMarker).cwd === 'string' && (v as HopMarker).cwd !== '' &&
       typeof (v as HopMarker).neutral === 'string' && (v as HopMarker).neutral !== ''
     ) {
-      return { cwd: (v as HopMarker).cwd, neutral: (v as HopMarker).neutral };
+      const marker: HopMarker = { cwd: (v as HopMarker).cwd, neutral: (v as HopMarker).neutral };
+      const pid = (v as HopMarker).wrapperPid;
+      if (typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0) marker.wrapperPid = pid;
+      return marker;
     }
   } catch {
     // not JSON — a planted or foreign value; ignored
   }
   return null;
+}
+
+const WRAPPER_WATCHDOG_INTERVAL_MS = 1000;
+
+/** See "Die with the wrapper". Only ever called for a VERIFIED hop. */
+function installWrapperWatchdog(hop: HopMarker): void {
+  const wrapperPid = hop.wrapperPid;
+  if (wrapperPid === undefined) return;
+  const t = setInterval(() => {
+    if (process.ppid === wrapperPid) return;
+    console.error('[env] sanitized re-run lost its wrapper (killed); exiting');
+    try { rmdirSync(hop.neutral); } catch { /* already gone, or not empty — never ours to force */ }
+    process.exit(137);
+  }, WRAPPER_WATCHDOG_INTERVAL_MS);
+  t.unref(); // must never keep a finished command alive
 }
 
 /**
@@ -256,17 +307,59 @@ export function cwdIsOperatorConfigDir(cwd: string, assignments: readonly Dotenv
  * reports its virtual entrypoint as argv[1] (`/$bunfs/root/...`; `~BUN` on
  * Windows) and execPath IS gbrain, so the user args are the whole argv;
  * `bun src/cli.ts` needs the runtime flags (`--inspect`, `--preload`, … from
- * process.execArgv) and the entry file re-inserted — Bun reports the entry as
- * an absolute path, so it survives the neutral-cwd start (cli.ts computes
- * rawArgs as `process.argv.slice(2)` in both modes). null when there is no
- * re-runnable entry (`bun -e`).
+ * process.execArgv, relative paths resolved against `originalCwd` — see
+ * "Runtime flags across the hop") and the entry file re-inserted — Bun
+ * reports the entry as an absolute path, so it survives the neutral-cwd start
+ * (cli.ts computes rawArgs as `process.argv.slice(2)` in both modes). null
+ * when there is no re-runnable entry (`bun -e`).
  */
-function selfArgv(): string[] | null {
+function selfArgv(originalCwd: string): string[] | null {
   const entry = process.argv[1];
   const userArgs = process.argv.slice(2);
   if (!isScriptRuntime()) return userArgs;
   if (!entry || entry.startsWith('-')) return null;
-  return [...process.execArgv, entry, ...userArgs];
+  return [...resolveRuntimePaths(process.execArgv, originalCwd), entry, ...userArgs];
+}
+
+/** Bun runtime flags whose value is a filesystem path (or, for the preload family, a path OR a package specifier). */
+const PATH_RUNTIME_FLAGS: ReadonlySet<string> = new Set([
+  '--preload', '-r', '--require', '--import',
+  '--config', '-c',
+  '--env-file',
+  '--tsconfig-override',
+]);
+
+/** A path-flag value the re-run must see from `cwd`: relative → absolute; everything else verbatim. */
+function resolveRuntimePath(value: string, cwd: string): string {
+  if (value === '' || isAbsolute(value)) return value;
+  if (/^\.\.?(?:[\\/]|$)/.test(value)) return resolve(cwd, value); // ./x  ../x  .  ..
+  try {
+    if (existsSync(resolve(cwd, value))) return resolve(cwd, value); // a bare relative name that IS a file here (`--env-file .env.ci`)
+  } catch {
+    // unreadable — treat as a specifier
+  }
+  return value; // a package specifier (`--preload some-pkg`) or a non-path
+}
+
+/** `execArgv` with every path-bearing flag's relative value resolved against `cwd`; order and every other flag preserved. */
+function resolveRuntimePaths(execArgv: readonly string[], cwd: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < execArgv.length; i++) {
+    const arg = execArgv[i]!;
+    const eq = arg.indexOf('=');
+    const flag = eq === -1 ? arg : arg.slice(0, eq);
+    if (!PATH_RUNTIME_FLAGS.has(flag)) {
+      out.push(arg);
+      continue;
+    }
+    if (eq !== -1) {
+      out.push(`${flag}=${resolveRuntimePath(arg.slice(eq + 1), cwd)}`); // --flag=value
+      continue;
+    }
+    out.push(arg); // --flag value
+    if (i + 1 < execArgv.length) out.push(resolveRuntimePath(execArgv[++i]!, cwd));
+  }
+  return out;
 }
 
 /**
@@ -392,7 +485,7 @@ function makeNeutralDir(): string {
 const HOME_KEYS: readonly string[] = process.platform === 'win32' ? ['HOME', 'USERPROFILE'] : ['HOME'];
 
 async function reexecSanitized(originalCwd: string, dropped: readonly string[]): Promise<void> {
-  const argv = selfArgv();
+  const argv = selfArgv(originalCwd);
   if (!argv) return; // in-process view is clean; nothing re-runnable for the descendants' sake
   const neutral = makeNeutralDir();
   // The quarantine already deleted the dropped keys from process.env; they are
@@ -408,7 +501,7 @@ async function reexecSanitized(originalCwd: string, dropped: readonly string[]):
     const real = realHomeDir();
     if (real) env[key] = real;
   }
-  env[CWD_ENV_QUARANTINED_MARKER] = JSON.stringify({ cwd: originalCwd, neutral } satisfies HopMarker);
+  env[CWD_ENV_QUARANTINED_MARKER] = JSON.stringify({ cwd: originalCwd, neutral, wrapperPid: process.pid } satisfies HopMarker);
   let code: number;
   let signalCode: string | null;
   // See "Signals". Installed BEFORE the spawn; the spawn is synchronous in the
@@ -468,6 +561,7 @@ export async function runCliPreflight(): Promise<void> {
       console.error(`[env] cannot return to ${hop.cwd} after the sanitized re-run: ${(err as Error)?.message ?? String(err)}`);
       process.exit(1);
     }
+    installWrapperWatchdog(hop); // after the chdir: the neutral dir may be removed only from outside it
   } else {
     // Bun applied the STARTUP cwd's bunfig.toml to this process (script mode
     // only); the re-run started in the neutral dir, so it has nothing to say.
