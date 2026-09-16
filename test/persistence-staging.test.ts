@@ -39,7 +39,7 @@ beforeAll(async () => {
     }
     for (const engine of engines) {
       const cases: Fixture[] = [];
-      for (let i = 0; i < 7; i++) {
+      for (let i = 0; i < 9; i++) {
         const sourceId = `staging-case-${i}`;
         const root = join(home, `${engine.kind}-${i}`); mkdirSync(root);
         const path = join(root, 'page.md'); writeFileSync(path, 'original');
@@ -104,6 +104,35 @@ test('journaled flush failure removes owned stage and releases accounting only a
     expect(await f.engine.readPageSnapshot('page', { sourceId: f.sourceId })).toBeNull();
   }
 }));
+
+for (const [index, suffix] of [[7, ['page.md']], [8, ['missing', 'page.md']]] as const) {
+  test(`blocked file ancestor settles failed publication and releases its worktree (${index})`, async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    for (const cases of fixtures) {
+      const f = cases[index]; const { row, prepared } = await accepted(f);
+      const blocker = join(f.root, 'blocked'); writeFileSync(blocker, 'preserved blocker');
+      prepared.file.path = join(blocker, ...suffix);
+      let reserved = false;
+      const done = await publishMutation(f.engine, row, prepared, hostId, { boundary: async name => {
+        if (name !== 'prepared') return;
+        reserved = true;
+        expect((await getWriteRequestById(f.engine, row.id))!.recovery!.beforeHash).toBeNull();
+        expect(await bytes(f)).toBeGreaterThan(0);
+      } });
+      expect(reserved).toBe(true);
+      expect(done).toMatchObject({ state: 'failed', error_code: 'storage_error', recovery: null });
+      expect(readFileSync(blocker, 'utf8')).toBe('preserved blocker');
+      expect(readFileSync(f.path, 'utf8')).toBe('original');
+      expect(await f.engine.readPageSnapshot('page', { sourceId: f.sourceId })).toBeNull();
+      expect(await bytes(f)).toBe(0);
+      const retained = await getWriteRequestById(f.engine, row.id);
+      const next = await accepted(f);
+      expect((await publishMutation(f.engine, next.row, next.prepared, hostId)).state).toBe('committed');
+      expect(await getWriteRequestById(f.engine, row.id)).toEqual(retained);
+      expect(readFileSync(blocker, 'utf8')).toBe('preserved blocker');
+      expect(await bytes(f)).toBe(0);
+    }
+  }));
+}
 
 for (const [index, unexpected] of [[1, 'rep'], [2, 'unknown bytes']] as const) {
   test(`unexpected/partial staging is retained without releasing recovery capacity (${index})`, async () => withEnv({ GBRAIN_HOME: home }, async () => {

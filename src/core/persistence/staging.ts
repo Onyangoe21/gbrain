@@ -30,13 +30,26 @@ function stages(record: StagedRecovery): RecoveryStagingFile[] {
 }
 function statIfPresent(path: string) {
   try { return lstatSync(path); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  catch (error) {
+    // A regular-file ancestor also proves that this staging leaf is absent.
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return null;
+    throw error;
+  }
 }
 function flushParent(path: string): void {
   let fd: number | undefined;
-  try { fd = openSync(dirname(path), 'r'); fsyncSync(fd); }
+  try {
+    fd = openSync(dirname(path), 'r');
+    // Publication can fail because an ancestor is a file. Flush the directory
+    // containing that ancestor, rather than treating fsync(file) as fsync(dir).
+    if (!fstatSync(fd).isDirectory()) {
+      closeSync(fd); fd = undefined;
+      flushParent(dirname(path)); return;
+    }
+    fsyncSync(fd);
+  }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' && dirname(path) !== path) { flushParent(dirname(path)); return; }
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '') && dirname(path) !== path) { flushParent(dirname(path)); return; }
     if (!(process.platform === 'win32' && ['EISDIR','EPERM','EINVAL','ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? ''))) throw error;
   } finally { if (fd !== undefined) closeSync(fd); }
 }
