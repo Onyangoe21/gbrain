@@ -662,6 +662,7 @@ const SEEDED_GOOGLE = ['AIza', 'SyD1-Fake_Example0123456789abcdefGH'].join('');
 const SEEDED_STRIPE = ['sk_live_', '4eC39HqLyjWDarjtT1zdp7dc'].join('');
 const SEEDED_DB_URL = ['postgres://', 'dbuser', ':', 'p4ssw0rd', '@db.internal:5432/app'].join('');
 const SEEDED_ENTROPIC = ['aB3xK9mQ', '2pR7sT1vW4yZ8bC5'].join('');
+const SEEDED_OPAQUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
 
 function claudeCodeLine(type: 'user' | 'assistant', uuid: string, ts: string, content: string): string {
   return JSON.stringify({
@@ -677,20 +678,24 @@ function claudeCodeLine(type: 'user' | 'assistant', uuid: string, ts: string, co
 }
 
 describe('format-based redaction before write (unprefixed credential shapes)', () => {
-  test('claude-code session: JWT / account SID / connection string / cloud keys land as placeholders only', async () => {
+  test('claude-code session: JWT / account SID / connection string / cloud keys land as placeholders only — and a bare echo in ANOTHER message goes with them', async () => {
     const p = join(tmp, 'poc-session.jsonl');
     writeFileSync(
       p,
       [
         claudeCodeLine('user', 'seed-0000', '2026-08-25T23:00:00.000Z', `deploy is failing. service role key ${SEEDED_JWT} and project ref zfakerefzfakeref0000`),
-        claudeCodeLine('assistant', 'seed-0001', '2026-08-25T23:00:01.000Z', `twilio sid ${SEEDED_SID} and maps key ${SEEDED_GOOGLE} need rotating`),
+        // The opaque token appears BARE here, two messages before the header
+        // that claims it; the entropic value appears bare AFTER its claim.
+        claudeCodeLine('assistant', 'seed-0001', '2026-08-25T23:00:01.000Z', `twilio sid ${SEEDED_SID} and maps key ${SEEDED_GOOGLE} need rotating; the token ${SEEDED_OPAQUE} expired too`),
         claudeCodeLine('user', 'seed-0002', '2026-08-25T23:00:02.000Z', `stripe ${SEEDED_STRIPE} plus DATABASE_URL=${SEEDED_DB_URL} and SMTP_TOKEN=${SEEDED_ENTROPIC}`),
+        claudeCodeLine('assistant', 'seed-0003', '2026-08-25T23:00:03.000Z', `retried with the header Authorization: Bearer ${SEEDED_OPAQUE} and pasted ${SEEDED_ENTROPIC} into the env`),
       ].join('\n') + '\n',
     );
     const r = await runTranscriptsIngest(engine, baseOpts([p]));
     expect(r.sessionsImported).toBe(1);
     expect(r.pages.imported).toBe(1);
-    expect(r.redactions).toBeGreaterThanOrEqual(6);
+    // Seven CLAIMS; the two bare echoes add no count.
+    expect(r.redactions).toBeGreaterThanOrEqual(7);
 
     const slug = r.slugsTouched[0];
     const page = await engine.getPage(slug, { sourceId: 'default' });
@@ -698,15 +703,19 @@ describe('format-based redaction before write (unprefixed credential shapes)', (
     const body = page!.compiled_truth;
     // Positive control: harmless prose from the same page is present.
     expect(body).toContain('deploy is failing');
-    for (const v of [SEEDED_JWT, SEEDED_SID, SEEDED_GOOGLE, SEEDED_STRIPE, SEEDED_ENTROPIC, 'p4ssw0rd']) {
+    for (const v of [SEEDED_JWT, SEEDED_SID, SEEDED_GOOGLE, SEEDED_STRIPE, SEEDED_ENTROPIC, SEEDED_OPAQUE, 'p4ssw0rd']) {
       expect(body).not.toContain(v);
     }
     for (const tag of [
       '<REDACTED:jwt>', '<REDACTED:twilio>', '<REDACTED:google_api_key>', '<REDACTED:stripe>',
-      '<REDACTED:db_url_credentials>', '<REDACTED:high_entropy_assignment>',
+      '<REDACTED:db_url_credentials>', '<REDACTED:high_entropy_assignment>', '<REDACTED:bearer>',
     ]) {
       expect(body).toContain(tag);
     }
+    // The session-wide echo dictionary: the token's bare mention in an
+    // EARLIER message and the entropic value's in a LATER one are scrubbed.
+    expect(body).toContain('the token <REDACTED:bearer> expired too');
+    expect(body).toContain('pasted <REDACTED:high_entropy_assignment> into the env');
     // A project ref is an identifier, not a credential — deliberately kept.
     expect(body).toContain('zfakerefzfakeref0000');
     // Whatever session metadata rode along carries no seeded value either.

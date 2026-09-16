@@ -335,3 +335,49 @@ describe('non-GBRAIN hijack families (A2)', () => {
     expect(warnings[0]).toContain(CWD_DOTENV_REMEDIATION);
   });
 });
+
+// ── Review cycle 4 (E4-1): shell-startup files + interpreter homes ───────────
+//
+// Every non-interactive shell gbrain's children start (git hooks gbrain writes,
+// `sh -c` in workspace-push and shell jobs) sources $BASH_ENV first; an
+// imported SHELLOPTS=xtrace with a `$(…)` PS4 runs on every traced command;
+// PYTHONHOME / PERLLIB / GCONV_PATH relocate code the interpreters and glibc
+// load. None of these carry a listed prefix, so each is an exact key here;
+// BASH_FUNC_ (exported-function injection) is a prefix family.
+describe('shell-startup / interpreter-home family (review cycle 4)', () => {
+  const SHELL_STARTUP_KEYS = [
+    'BASH_ENV', 'SHELLOPTS', 'PS4', 'BASHOPTS', 'PROMPT_COMMAND', 'ZDOTDIR',
+    'PYTHONHOME', 'PERLLIB', 'GCONV_PATH',
+  ];
+
+  test('each shell-startup / interpreter-home key is an exact protected toolchain key', () => {
+    for (const k of SHELL_STARTUP_KEYS) {
+      expect(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).toContain(k);
+      expect(isCwdDotenvProtectedKey(k)).toBe(true);
+    }
+    expect(new Set(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).size).toBe(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS.length);
+  });
+
+  test('BASH_FUNC_ is a protected prefix (exported-function injection), by prefix not by exact name', () => {
+    expect(CWD_DOTENV_PROTECTED_PREFIXES).toContain('BASH_FUNC_');
+    for (const k of ['BASH_FUNC_git%%', 'BASH_FUNC_ls()', 'BASH_FUNC_x']) expect(isCwdDotenvProtectedKey(k)).toBe(true);
+    // Neighbours that must keep loading from a cwd .env.
+    for (const k of ['BASH_VERSION', 'BASH', 'ENVIRONMENT', 'PS1', 'SHELL', 'PYTHONDONTWRITEBYTECODE', 'PERL_BADLANG']) {
+      expect(isCwdDotenvProtectedKey(k)).toBe(false);
+    }
+  });
+
+  test('a planted BASH_ENV (the ${PWD}-expanded shape) is dropped from the env and named in the ONE warning', () => {
+    const dir = tmpProject({ '.env': 'BASH_ENV=${PWD}/tooling/rc.sh\nSHELLOPTS=xtrace\nPS4=$(touch /tmp/x)\nPROJECT_NAME=demo\n' });
+    const env: Record<string, string | undefined> = {
+      BASH_ENV: `${dir}/tooling/rc.sh`, SHELLOPTS: 'xtrace', PS4: '$(touch /tmp/x)', PROJECT_NAME: 'demo', PATH: '/usr/bin',
+    };
+    const warnings: string[] = [];
+    expect(quarantineCwdDotenv(env, dir, { warn: (m) => warnings.push(m) })).toEqual(['BASH_ENV', 'PS4', 'SHELLOPTS']);
+    for (const k of ['BASH_ENV', 'PS4', 'SHELLOPTS']) expect(k in env).toBe(false);
+    expect(env.PROJECT_NAME).toBe('demo');
+    expect(env.PATH).toBe('/usr/bin');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('Ignoring BASH_ENV, PS4, SHELLOPTS because a .env file in the current directory assigns it');
+  });
+});

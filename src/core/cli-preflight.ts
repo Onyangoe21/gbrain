@@ -78,23 +78,66 @@
  * ## Signals
  *
  * Handlers are installed BEFORE the spawn (a signal in the gap would take the
- * default action, kill the wrapper and orphan the re-run). SIGTERM and SIGHUP
- * — which a supervisor sends to the wrapper pid alone — are always forwarded.
- * SIGINT depends on whether a terminal is attached:
- *   - stdin IS a tty: the re-run shares the wrapper's foreground process
- *     group, so the terminal delivers Ctrl-C to it directly; the wrapper does
- *     NOT forward (a second delivery would consume a `once('SIGINT')`
+ * default action, kill the wrapper and orphan the re-run). The wrapper has no
+ * duties of its own, so every listener some earlier module attached for the
+ * forwarded signals is removed first: cli.ts installs its cleanup handlers
+ * (process-cleanup.ts, SIGTERM → exit 143 / SIGHUP → exit 129) in its
+ * `import.meta.main` block before `main()` reaches this preflight, and with
+ * both attached a SIGTERM made the wrapper exit 143 before the re-run had
+ * finished and before the neutral dir was removed. The wrapper's exit is
+ * ALWAYS the child's. SIGTERM and SIGHUP — which a supervisor sends to the
+ * wrapper pid alone — are always forwarded. SIGINT depends on whether the
+ * process has a CONTROLLING TERMINAL (probed by opening `/dev/tty`; the
+ * stdio `isTTY` flags on Windows), not on whether stdin is a tty:
+ *   - a controlling terminal exists: the re-run shares the wrapper's
+ *     foreground process group, so the terminal delivers Ctrl-C to it
+ *     directly — ALSO when stdin/stdout/stderr are redirected
+ *     (`serve --http </dev/null >log 2>&1` in a foreground shell). The wrapper
+ *     does NOT forward (a second delivery would consume a `once('SIGINT')`
  *     graceful-shutdown handler such as serve-http's and turn Ctrl-C into an
  *     abrupt kill) and ignores the signal itself so it survives to relay the
  *     re-run's exit status.
- *   - stdin is NOT a tty (a supervisor, cron, an agent harness, a pipe): no
- *     terminal exists to do process-group delivery, so a SIGINT that reaches
- *     the wrapper pid alone would otherwise orphan the re-run. Each received
+ *   - no controlling terminal (a supervisor, cron, a detached agent harness):
+ *     nothing does process-group delivery, so a SIGINT that reaches the
+ *     wrapper pid alone would otherwise orphan the re-run. Each received
  *     SIGINT is forwarded once. (A harness that signals the whole group
- *     instead delivers twice here — accepted: no tty, no graceful Ctrl-C
- *     expectation.)
+ *     instead delivers twice here — accepted: no terminal, no graceful Ctrl-C
+ *     expectation. A harness WITH a controlling terminal that signals the
+ *     wrapper pid alone with SIGINT is not forwarded — the terminal is the
+ *     delivery channel there; SIGTERM is what such harnesses send to stop a
+ *     child, and it is always forwarded.)
  * Exit status: the re-run's code, or 128+signal when a signal killed it
  * (shell convention).
+ *
+ * ## HOME after the drop
+ *
+ * HOME / USERPROFILE are on the protected list (a cron/systemd unit often has
+ * HOME unset, and a planted value then reaches process.env and every child).
+ * Dropping them must not leave the re-run with NO home at all: git fails
+ * (`Author identity unknown`, `$HOME not set`) and every raw
+ * `process.env.HOME || ''` read resolves cwd-relative INTO the checkout. So
+ * when the quarantine dropped HOME (USERPROFILE on Windows), the sanitized env
+ * gets it back from `os.userInfo().homedir` — Bun derives that from the REAL
+ * startup environ (passwd when the variable was unset) BEFORE the .env merge,
+ * so the planted value never reaches it (verified on Bun 1.3.13). Only a
+ * DROPPED key is restored: a home that was simply never set stays unset, so a
+ * hopped run and a plain run see the same environment.
+ *
+ * ## Script mode + cwd bunfig.toml
+ *
+ * The compiled binary is built with `--no-compile-autoload-bunfig`, so a cwd
+ * `bunfig.toml` is inert for it. The documented install (`bun install -g
+ * github:…`, `git clone` + `bun link`) maps the `gbrain` bin to src/cli.ts,
+ * which runs as an ordinary Bun SCRIPT — and for a script Bun applies the cwd
+ * bunfig.toml before any of the script's code: a top-level `preload` has
+ * already run by the time preflight starts. Nothing here can undo that; only
+ * `bun --config=/dev/null <entry>` suppresses it (verified on Bun 1.3.13: no
+ * `-c`/`--no-bunfig` spelling and no `BUN_CONFIG_*` variable does). What
+ * preflight CAN do is say so: when it detects the shape (script runtime + a
+ * top-level `preload` in the startup cwd's bunfig.toml) it prints one stderr
+ * line. The checkout that contains the running entry itself (a contributor's
+ * own repo, whose bunfig is theirs) is exempt; the sanitized re-run started in
+ * the neutral dir never saw a bunfig and does not repeat the warning.
  *
  * ## GBRAIN_GUARDRAILS_MODULE: fail closed, not open
  *
@@ -119,12 +162,17 @@
  * load the operator's own `.env` as a "cwd .env". That file is operator-owned,
  * so the quarantine and the guardrails loader's cwd check are skipped when
  * `realpath(cwd) === realpath(configDir())` — but ONLY when no cwd .env file
- * assigns GBRAIN_HOME (a hostile checkout could otherwise point GBRAIN_HOME at
- * itself to manufacture the collision).
+ * assigns any key the config dir is DERIVED from: GBRAIN_HOME, HOME or
+ * USERPROFILE (a hostile checkout laid out as `<checkout>/.gbrain` could
+ * otherwise try to point the home at itself to manufacture the collision; a
+ * planted home is never the operator's config dir). Measured on Bun 1.3.13,
+ * `os.homedir()` is captured from the real startup environ before the .env
+ * merge, so a planted HOME does not actually reach `configDir()` — the check
+ * is belt-and-braces against that implementation detail changing.
  */
-import { existsSync, mkdtempSync, realpathSync, rmSync } from 'fs';
-import { constants as osConstants, homedir, tmpdir } from 'os';
-import { join } from 'path';
+import { closeSync, constants as fsConstants, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync } from 'fs';
+import { constants as osConstants, homedir, tmpdir, userInfo } from 'os';
+import { dirname, join } from 'path';
 import {
   CWD_DOTENV_FILES,
   cwdDotenvAssignsKey,
@@ -184,8 +232,18 @@ function verifiedHop(startupCwd: string): HopMarker | null {
   return marker;
 }
 
-function cwdIsOperatorConfigDir(cwd: string, assignments: readonly DotenvAssignment[]): boolean {
-  if (cwdDotenvAssignsKey('GBRAIN_HOME', assignments)) return false;
+/** The keys `configDir()` is derived from; a cwd .env assigning any of them forfeits the cwd == config dir exemption. */
+const CONFIG_DIR_SOURCE_KEYS: readonly string[] = ['GBRAIN_HOME', 'HOME', 'USERPROFILE'];
+
+/**
+ * True when `cwd` IS the operator's config dir (see "cwd == config dir") and
+ * no cwd .env file assigns a key the config dir is derived from. Exported for
+ * tests.
+ */
+export function cwdIsOperatorConfigDir(cwd: string, assignments: readonly DotenvAssignment[]): boolean {
+  for (const key of CONFIG_DIR_SOURCE_KEYS) {
+    if (cwdDotenvAssignsKey(key, assignments)) return false;
+  }
   try {
     return realpathSync(cwd) === realpathSync(configDir());
   } catch {
@@ -206,11 +264,108 @@ function cwdIsOperatorConfigDir(cwd: string, assignments: readonly DotenvAssignm
 function selfArgv(): string[] | null {
   const entry = process.argv[1];
   const userArgs = process.argv.slice(2);
-  const bunfsEntry = entry !== undefined && (/^\/\$bunfs\//.test(entry) || /[\\/]~BUN[\\/]/.test(entry));
-  const devRuntime = /[/\\](bun|node)(\.exe)?$/.test(process.execPath);
-  if (bunfsEntry || !devRuntime) return userArgs;
+  if (!isScriptRuntime()) return userArgs;
   if (!entry || entry.startsWith('-')) return null;
   return [...process.execArgv, entry, ...userArgs];
+}
+
+/**
+ * True when this process is `bun <entry>` (the dev runtime or a `bun install
+ * -g` / `bun link` install running src/cli.ts through its shebang), false for
+ * a compiled binary (execPath IS gbrain; the entry is a `/$bunfs/` virtual
+ * path, `~BUN` on Windows).
+ */
+function isScriptRuntime(): boolean {
+  const entry = process.argv[1];
+  const bunfsEntry = entry !== undefined && (/^\/\$bunfs\//.test(entry) || /[\\/]~BUN[\\/]/.test(entry));
+  const devRuntime = /[/\\](bun|node)(\.exe)?$/.test(process.execPath);
+  return !bunfsEntry && devRuntime;
+}
+
+/**
+ * The one line preflight prints for the shape described in "Script mode + cwd
+ * bunfig.toml". Exported for tests.
+ */
+export const SCRIPT_MODE_BUNFIG_WARNING =
+  '[env] gbrain is running as a bun script (not the compiled binary) and the bunfig.toml in the current ' +
+  'directory declares a top-level preload — Bun ran it before gbrain started. A cwd bunfig.toml is untrusted: ' +
+  'run gbrain from a directory you control, or start it as `bun --config=/dev/null <path-to-gbrain/src/cli.ts> …`.';
+
+/**
+ * Does `bunfig.toml` in `dir` declare a TOP-LEVEL `preload` (the one Bun
+ * applies to `bun <entry>`; a `[test]`-section preload applies to `bun test`
+ * only)? Lines before the first `[section]` header are the top level.
+ * Fail-quiet: unreadable → false (Bun would have failed on it first).
+ */
+function bunfigDeclaresTopLevelPreload(dir: string): boolean {
+  let text: string;
+  try {
+    text = readFileSync(join(dir, 'bunfig.toml'), 'utf-8');
+  } catch {
+    return false;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) return false; // first section header: top level ends
+    if (/^\s*preload\s*=/.test(line)) return true;
+  }
+  return false;
+}
+
+/** The startup cwd is the checkout that contains the running entry (`<root>/src/cli.ts`). */
+function cwdIsOwnCheckout(startupCwd: string): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(startupCwd) === realpathSync(dirname(dirname(entry)));
+  } catch {
+    return false;
+  }
+}
+
+function warnScriptModeBunfig(startupCwd: string): void {
+  if (!isScriptRuntime()) return;
+  if (!bunfigDeclaresTopLevelPreload(startupCwd)) return;
+  if (cwdIsOwnCheckout(startupCwd)) return;
+  console.error(SCRIPT_MODE_BUNFIG_WARNING);
+}
+
+/**
+ * Does this process have a controlling terminal — i.e. will a terminal deliver
+ * Ctrl-C to the whole foreground process group (wrapper AND re-run) itself?
+ * POSIX: `open("/dev/tty")` succeeds exactly then (ENXIO otherwise), whatever
+ * stdin/stdout/stderr are redirected to. Windows has no /dev/tty; the stdio
+ * `isTTY` flags are the closest proxy there.
+ */
+function hasControllingTerminal(): boolean {
+  if (process.platform === 'win32') {
+    return Boolean(process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY);
+  }
+  try {
+    closeSync(openSync('/dev/tty', fsConstants.O_RDONLY | fsConstants.O_NOCTTY));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The operator's real home for "HOME after the drop": `os.userInfo().homedir`
+ * (Bun: the startup environ's value, passwd when unset — never the merged
+ * .env value), then `os.homedir()`. undefined when neither is available
+ * (uid-less containers throw from userInfo).
+ */
+function realHomeDir(): string | undefined {
+  try {
+    const h = userInfo().homedir;
+    if (h) return h;
+  } catch {
+    // no passwd entry for this uid — fall through
+  }
+  try {
+    return homedir() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -233,15 +388,25 @@ function makeNeutralDir(): string {
   return realpathSync(dir);
 }
 
-async function reexecSanitized(originalCwd: string): Promise<void> {
+/** The home variables restored after a drop (see "HOME after the drop"): HOME everywhere, USERPROFILE on Windows. */
+const HOME_KEYS: readonly string[] = process.platform === 'win32' ? ['HOME', 'USERPROFILE'] : ['HOME'];
+
+async function reexecSanitized(originalCwd: string, dropped: readonly string[]): Promise<void> {
   const argv = selfArgv();
   if (!argv) return; // in-process view is clean; nothing re-runnable for the descendants' sake
   const neutral = makeNeutralDir();
   // The quarantine already deleted the dropped keys from process.env; they are
-  // NOT added back (not even empty — see "Why the re-run").
+  // NOT added back (not even empty — see "Why the re-run") …
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
+  }
+  // … except a dropped HOME, which comes back as the operator's REAL home
+  // (see "HOME after the drop") — the planted value is still discarded.
+  for (const key of HOME_KEYS) {
+    if (!dropped.includes(key) || env[key] !== undefined) continue;
+    const real = realHomeDir();
+    if (real) env[key] = real;
   }
   env[CWD_ENV_QUARANTINED_MARKER] = JSON.stringify({ cwd: originalCwd, neutral } satisfies HopMarker);
   let code: number;
@@ -252,11 +417,17 @@ async function reexecSanitized(originalCwd: string): Promise<void> {
   const forward = (sig: NodeJS.Signals) => () => {
     try { child?.kill(sig); } catch { /* already exited */ }
   };
+  // The wrapper's only job is to relay the child. Any listener an earlier
+  // module attached for these signals (cli.ts's cleanup handlers: SIGTERM →
+  // exit 143 / SIGHUP → exit 129, installed before main()) would exit the
+  // wrapper on its own schedule — before the child has finished and before the
+  // neutral dir is removed. Remove them; the forwarders below are the only ones.
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.removeAllListeners(sig);
   process.on('SIGTERM', forward('SIGTERM'));
   process.on('SIGHUP', forward('SIGHUP'));
-  // tty: the terminal already delivered Ctrl-C to the child; only outlive it.
-  // no tty: nothing else will deliver it — forward.
-  process.on('SIGINT', process.stdin.isTTY ? () => {} : forward('SIGINT'));
+  // controlling terminal: it already delivered Ctrl-C to the child; only outlive it.
+  // none: nothing else will deliver it — forward.
+  process.on('SIGINT', hasControllingTerminal() ? () => {} : forward('SIGINT'));
   try {
     child = Bun.spawn([process.execPath, ...argv], {
       cwd: neutral,
@@ -287,7 +458,8 @@ export const GUARDRAILS_ASSIGNED_BY_CWD_DOTENV =
   'belongs in your shell environment or in ~/.gbrain/.env (never in a project .env).';
 
 export async function runCliPreflight(): Promise<void> {
-  const hop = verifiedHop(process.cwd());
+  const startupCwd = process.cwd();
+  const hop = verifiedHop(startupCwd);
   if (hop) {
     delete process.env[CWD_ENV_QUARANTINED_MARKER]; // never inherited further: a later self-spawn decides for itself
     try {
@@ -296,6 +468,10 @@ export async function runCliPreflight(): Promise<void> {
       console.error(`[env] cannot return to ${hop.cwd} after the sanitized re-run: ${(err as Error)?.message ?? String(err)}`);
       process.exit(1);
     }
+  } else {
+    // Bun applied the STARTUP cwd's bunfig.toml to this process (script mode
+    // only); the re-run started in the neutral dir, so it has nothing to say.
+    warnScriptModeBunfig(startupCwd);
   }
   const cwd = process.cwd();
   const assignments = parseCwdDotenv(cwd);
@@ -307,7 +483,7 @@ export async function runCliPreflight(): Promise<void> {
       console.error(GUARDRAILS_ASSIGNED_BY_CWD_DOTENV);
       process.exit(1);
     }
-    if (dropped.length > 0) await reexecSanitized(cwd);
+    if (dropped.length > 0) await reexecSanitized(cwd, dropped);
   }
   loadGbrainEnvFile(configDir);
   if (process.env.GBRAIN_GUARDRAILS_MODULE) {

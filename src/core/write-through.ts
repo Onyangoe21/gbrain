@@ -282,6 +282,13 @@ function scannerSourcePath(scanRoot: string, filePath: string): string {
  * A NULL `source_path` means the page was born via put/capture and has no
  * file of record yet — the slug-derived path stays correct for those.
  *
+ * `opts.includeDeleted`: resolve from a soft-deleted row too. The default
+ * reads ACTIVE rows only (a tombstone must not steer a live write), but the
+ * purge remediation path in `delete_page` retries the artifact removal for a
+ * TOMBSTONE — whose recorded `source_path` the active-row read would miss,
+ * falling back to the slug-derived twin and reporting a clean
+ * `file_not_present` while the real file survives for sync to resurrect.
+ *
  * Shared by `writePageThrough` AND the facts fence writer (#4204): the fence
  * appends to the page's file, so both writers MUST compute the identical
  * path or the fence lands in a file sync never reads back and the next
@@ -291,6 +298,7 @@ export async function resolvePageWriteTarget(
   engine: BrainEngine,
   slug: string,
   sourceId: string,
+  opts: { includeDeleted?: boolean } = {},
 ): Promise<PageWriteTarget> {
   let filePath: string;
   let writeRoot: string;
@@ -307,7 +315,7 @@ export async function resolvePageWriteTarget(
   const sourceLocalPath = rawLocalPath ? msysToNativePath(rawLocalPath) : null;
 
   const pathRows = await engine.executeRaw<{ source_path: string | null; source_uri: string | null }>(
-    `SELECT source_path, source_uri FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+    `SELECT source_path, source_uri FROM pages WHERE source_id = $1 AND slug = $2${opts.includeDeleted ? '' : ' AND deleted_at IS NULL'} LIMIT 1`,
     [sourceId, slug],
   );
   const recordedPath = sanitizeRecordedSourcePath(pathRows[0]?.source_path);

@@ -8,7 +8,7 @@
 
 import type { Operation } from './contract.ts';
 import { OperationError } from './contract.ts';
-import { assertSourceInCallerScope, sourceScopeOpts } from './context.ts';
+import { assertSourceInCallerScope, assertSourceInCallerWriteScope, sourceScopeOpts } from './context.ts';
 import { resolveAuthCapabilities } from '../harness/capabilities.ts';
 
 // --- v0.28: whoami + sources management ---
@@ -193,10 +193,12 @@ const sources_remove: Operation = {
     'Hard-remove a source (cascades pages/chunks/embeddings). Refuses to ' +
     'delete the auto-managed clone dir unless its resolved path is confined ' +
     'under $GBRAIN_HOME/clones/ (realpath+lstat — symlink-safe). For most ' +
-    'workflows prefer sources_archive for the soft-delete path. Confined to ' +
-    "the caller's resolved source scope (#4433): an out-of-scope id answers " +
-    'not_found, indistinguishable from a nonexistent source. Only the trusted ' +
-    'local CLI (`gbrain sources remove`) can remove any source.',
+    'workflows prefer the soft-delete path (`gbrain sources archive`). ' +
+    "Confined to the caller's WRITE authority, not its read scope: an untrusted " +
+    'caller may remove only its own write source (a federated read grant naming ' +
+    'a source does not make it removable); any other id answers not_found, ' +
+    'indistinguishable from a nonexistent source. Only the trusted local CLI ' +
+    '(`gbrain sources remove`) can remove any source.',
   params: {
     id: { type: 'string', required: true, description: "Source id to remove, as listed by sources_list (e.g. 'wiki'). A source id, not a page slug." },
     confirm_destructive: {
@@ -213,11 +215,13 @@ const sources_remove: Operation = {
   mutating: true,
   scope: 'sources_admin',
   handler: async (ctx, p) => {
-    // Source isolation on the DESTRUCTIVE path (#4433 wave-L, shared helper
-    // with sources_status): a `sources_admin` token pinned to one source must
-    // not be able to hard-delete another source's pages; out-of-scope ids
-    // answer not_found (anti-enumeration), trusted local CLI passes.
-    assertSourceInCallerScope(ctx, p.id as string);
+    // Source isolation on the DESTRUCTIVE path keys on WRITE authority (O4-1;
+    // supersedes the #4433 wave-L read-ladder check that let a federated read
+    // grant hard-delete a sibling source): a `sources_admin` token may remove
+    // only its own write source; out-of-authority ids answer not_found
+    // (anti-enumeration), an unbound client keeps full authority, trusted
+    // local CLI passes. sources_status keeps the READ helper.
+    assertSourceInCallerWriteScope(ctx, p.id as string);
     const { removeSource } = await import('../sources-ops.ts');
     return removeSource(ctx.engine, {
       id: p.id as string,

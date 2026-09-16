@@ -15,7 +15,8 @@ import { tmpdir } from 'os';
 import {
   scanText, scanFiles, redactFindings, loadWorkspaceAllowlist, matchesGlob,
   globToRegExp, shannonEntropy, pathAllowlisted, SCAN_ALLOW_FILENAME,
-  PEM_BODY_MAX_CHARS, BEARER_ECHO_MIN_CHARS, BEARER_ECHO_MAX_UNIQUE,
+  PEM_BODY_MAX_CHARS, ECHO_MIN_CHARS_BEARER, ECHO_MIN_CHARS_ENTROPY, ECHO_MAX_UNIQUE,
+  ECHO_MAX_VALUE_CHARS, planRedaction, applyRedaction,
 } from '../src/core/secret-scan.ts';
 
 // Synthetic fixture values (never real keys).
@@ -520,12 +521,82 @@ describe('format-based detectors — ordering + catch-all attribution', () => {
     expect(scanText(`Bearer ${GHP}`).map((f) => f.pattern)).toEqual(['github_token']);
   });
 
-  test('a JWT used as a connection-string password attributes once (no double report)', () => {
+  test('a JWT used as a connection-string password: jwt reports the token once; db_url_credentials still covers the userinfo around it', () => {
+    // Attribution is first-wins (the JWT is never double-reported as a
+    // connection-string credential); coverage is the UNION (the username and
+    // the `@` the catch-all matched around the JWT are claimed as its slices).
     const url = ['postgres://', 'svc', ':', JWT, '@db.internal/app'].join('');
     const findings = scanText(url);
-    expect(findings.length).toBe(1);
+    expect(findings.filter((f) => f.pattern === 'jwt').length).toBe(1);
+    expect(findings.map((f) => f.pattern)).toEqual(['jwt', 'db_url_credentials', 'db_url_credentials']);
     const { text } = redactFindings(url);
+    expect(text).toBe('<REDACTED:db_url_credentials><REDACTED:jwt><REDACTED:db_url_credentials>db.internal/app');
     expect(text.includes(JWT)).toBe(false);
+    expect(text.includes('svc')).toBe(false);
+  });
+});
+
+// ── Union coverage ───────────────────────────────────────────────────────────
+//
+// The per-line dedupe is first-wins for ATTRIBUTION only. A later span that
+// partially overlaps an earlier claim has its UNCLAIMED slices claimed as hits
+// of the later pattern (value = the slice), so nothing a pattern matched is
+// left in the output or a preview; a fully covered later span is skipped.
+// Discarding the whole later span used to ship the entire password of a
+// database URL whose username was a vendor-shaped id.
+describe('union coverage — a later span overlapping an earlier claim still covers its uncovered slices', () => {
+  const PW = ['s3cr3t', 'P4ssw0rdXyz'].join('');
+  const EXPECTED = '<REDACTED:db_url_credentials><REDACTED:twilio><REDACTED:db_url_credentials>db.internal/app';
+
+  test('a database URL whose USERNAME is a vendor-shaped id: username AND password redacted, in the text and in every preview', () => {
+    const url = ['postgres://', TWILIO_SID, ':', PW, '@db.internal/app'].join('');
+    const findings = scanText(url);
+    // One record per claimed span: the id, then the two db_url slices around it.
+    expect(findings.map((f) => f.pattern)).toEqual(['twilio', 'db_url_credentials', 'db_url_credentials']);
+    for (const f of findings) {
+      expect(f.redactedPreview).toBe(EXPECTED);
+      expect(f.redactedPreview.includes(PW)).toBe(false);
+      expect(f.redactedPreview.includes(TWILIO_SID)).toBe(false);
+    }
+    const { text, redactions } = redactFindings(url);
+    expect(text).toBe(EXPECTED);
+    expect(redactions.length).toBe(3);
+  });
+
+  test('the slices carry their own fingerprints, so a slice can be allowlisted like any finding', () => {
+    const url = ['postgres://', TWILIO_SID, ':', PW, '@db.internal/app'].join('');
+    const [, , tail] = scanText(url);
+    const { text, redactions } = redactFindings(url, { allowlist: [tail!.fingerprint] });
+    expect(redactions.map((r) => r.pattern)).toEqual(['twilio', 'db_url_credentials']);
+    expect(text).toBe(`<REDACTED:db_url_credentials><REDACTED:twilio>:${PW}@db.internal/app`);
+  });
+
+  test('a FULLY covered later span is skipped: Bearer <vendor key> reports the vendor only, no bearer record', () => {
+    for (const key of [ANTHROPIC, GHP, `gbrain_at_${GBRAIN_HEX}`]) {
+      const { text, redactions } = redactFindings(`Authorization: Bearer ${key}`);
+      expect(redactions.length).toBe(1);
+      expect(redactions[0]!.pattern).not.toBe('bearer');
+      expect(text).toBe(`Authorization: Bearer <REDACTED:${redactions[0]!.pattern}>`);
+    }
+  });
+
+  test('a JWT inside a longer opaque bearer token: jwt keeps the JWT, bearer covers the tail', () => {
+    const tail = ['.extra', 'Segment0123456789'].join('');
+    const line = `Authorization: Bearer ${JWT}${tail}`;
+    expect(scanText(line).map((f) => f.pattern)).toEqual(['jwt', 'bearer']);
+    const { text } = redactFindings(line);
+    expect(text).toBe('Authorization: Bearer <REDACTED:jwt><REDACTED:bearer>');
+    expect(text.includes(tail)).toBe(false);
+  });
+
+  test('a span split around TWO earlier claims yields one slice per gap', () => {
+    // Two vendor ids inside one connection-string span: `user` is a twilio
+    // SID and the password a JWT — the catch-all covers the scheme, the `:`
+    // between them and the trailing `@`.
+    const url = ['mysql://', TWILIO_SID, ':', JWT, '@h/db'].join('');
+    const { text, redactions } = redactFindings(url);
+    expect(redactions.map((r) => r.pattern)).toEqual(['twilio', 'jwt', 'db_url_credentials', 'db_url_credentials', 'db_url_credentials']);
+    expect(text).toBe('<REDACTED:db_url_credentials><REDACTED:twilio><REDACTED:db_url_credentials><REDACTED:jwt><REDACTED:db_url_credentials>h/db');
   });
 });
 
@@ -622,10 +693,10 @@ describe('high-entropy assignment requires a digit in the value', () => {
 // buildPreview renders a WINDOW around the hit (not the whole line) and
 // redacts every claimed span inside it; redactFindings rebuilds the text by
 // splicing `<REDACTED:pattern>` over exactly the CLAIMED spans (sorted by
-// absolute offset, one pass) — not by replaceAll per unique value — and then
-// runs ONE bounded extra pass over bare echoes of the bearer values it
-// claimed (pinned in its own describe below). Values below are synthetic and
-// runtime-joined from >= 2 fragments.
+// absolute offset, one pass) — not by replaceAll per unique value — and fills
+// the unclaimed gaps with the bounded echo pass over the bearer / high-entropy
+// values it claimed (pinned in its own describe below). Values below are
+// synthetic and runtime-joined from >= 2 fragments.
 describe('redactFindings — span-splice semantics and preview window', () => {
   const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
   /** PREVIEW_MAX_CHARS (160) plus a leading and a trailing ellipsis. */
@@ -644,22 +715,21 @@ describe('redactFindings — span-splice semantics and preview window', () => {
     expect(redactions.map((r) => r.pattern)).toEqual(['bearer', 'db_url_credentials']);
   });
 
-  test('redacts exactly the claimed spans (every pattern but bearer): the corpus write agrees with what scanText reports', () => {
+  test('redacts exactly the claimed spans (every pattern outside the echo pass): the corpus write agrees with what scanText reports', () => {
     // Documented semantic delta from the replaceAll form: a claimed value's
-    // bytes at a position the scanner did NOT claim (embedded inside a longer
-    // identifier, or a bare re-occurrence no pattern anchors) are left as-is,
-    // so `redactFindings(t).text` never redacts something `scanText(t)` would
-    // not have reported. The ONE exception is the bounded bearer echo pass,
-    // pinned in the next describe. A vendor-prefixed key repeated bare IS
-    // claimed on its own and both occurrences go; a keyword-anchored entropic
-    // value echoed bare is NOT redacted (the deliberate boundary, see below).
-    const HI = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
-    const text = `k=${OPENAI} again ${OPENAI}\napi_key = "${HI}"\nid=prefix${HI}\nbare ${HI}\n`;
-    const findings = scanText(text, { highEntropy: true });
-    expect(findings.map((f) => [f.pattern, f.line])).toEqual([['openai', 1], ['openai', 1], ['high_entropy_assignment', 2]]);
-    const { text: out, redactions } = redactFindings(text, { highEntropy: true });
+    // bytes at a position the scanner did NOT claim (embedded past its left
+    // boundary inside a longer identifier) are left as-is, so
+    // `redactFindings(t).text` never redacts something `scanText(t)` would
+    // not have reported. The exception is the bounded echo pass over the
+    // bearer + high_entropy_assignment values (pinned in the next describe);
+    // vendor shapes lose nothing by staying outside it — a repeat that clears
+    // the boundary IS claimed on its own and both occurrences go.
+    const text = `k=${OPENAI} again ${OPENAI}\nid=prefix${OPENAI}\nsid ${TWILIO_SID} vs x${TWILIO_SID}\n`;
+    const findings = scanText(text);
+    expect(findings.map((f) => [f.pattern, f.line])).toEqual([['openai', 1], ['openai', 1], ['twilio', 3]]);
+    const { text: out, redactions } = redactFindings(text);
     expect(redactions.length).toBe(findings.length);
-    expect(out).toBe(`k=<REDACTED:openai> again <REDACTED:openai>\napi_key = "<REDACTED:high_entropy_assignment>"\nid=prefix${HI}\nbare ${HI}\n`);
+    expect(out).toBe(`k=<REDACTED:openai> again <REDACTED:openai>\nid=prefix${OPENAI}\nsid <REDACTED:twilio> vs x${TWILIO_SID}\n`);
   });
 
   test('a per-line span running into a PEM block: both spans redact, nothing claimed survives', () => {
@@ -730,18 +800,23 @@ describe('redactFindings — span-splice semantics and preview window', () => {
   });
 });
 
-// ── Bounded bearer echo pass ─────────────────────────────────────────────────
+// ── Bounded echo pass (bearer + high_entropy_assignment) ─────────────────────
 //
-// An opaque bearer token is claimed only where `Bearer ` anchors it, and a
-// transcript routinely echoes the same token bare (in a tool call's header,
-// then alone in the assistant's reply). After the span-splice, redactFindings
-// runs ONE `String.replace` with a single escaped alternation of the unique
-// bearer values it claimed (longest first, first BEARER_ECHO_MAX_UNIQUE
-// values in claim order, values >= BEARER_ECHO_MIN_CHARS). The pass adds no
-// findings and is deliberately NOT extended to high_entropy_assignment.
-describe('redactFindings — bounded bearer echo pass', () => {
+// A bearer token is claimed only where `Bearer ` anchors it and an entropic
+// value only where its keyword does, yet a transcript routinely echoes the
+// same value bare (in a tool call's header, then alone in the reply; a pasted
+// `PASSWORD=` line, then the value in prose). redactFindings collects the
+// values those two patterns claim (ECHO_MAX_UNIQUE unique values in claim
+// order — ONE cap across both patterns — each clearing its pattern's floor
+// and at most ECHO_MAX_VALUE_CHARS long) and redacts every remaining
+// occurrence with that pattern's token. The pass runs per-value `indexOf`
+// sweeps over the ORIGINAL text and splices into the unclaimed gaps — never
+// an alternation RegExp (quadratic on prefix-sharing values, see the perf
+// file), never over already-emitted tokens. It adds no findings.
+describe('redactFindings — bounded echo pass', () => {
   const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
   const unique = (k: number) => `${OPAQUE_VALUE}${k.toString(36).padStart(4, 'z')}`;
+  const HI = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
 
   test('the transcript shape: anchored in a tool call, echoed bare and embedded in the reply — every site is redacted, only the claim is counted', () => {
     const text = `tool: curl -H "Authorization: Bearer ${OPAQUE_VALUE}" https://api.example/v1\nassistant: the token ${OPAQUE_VALUE} expired; id=prefix${OPAQUE_VALUE} embeds it\n`;
@@ -754,15 +829,19 @@ describe('redactFindings — bounded bearer echo pass', () => {
     expect(out.includes(OPAQUE_VALUE)).toBe(false);
   });
 
-  test('a bare high-entropy value is NOT echo-redacted (deliberate boundary, documented delta)', () => {
-    // A real transcript claims thousands of unique entropic values; any
-    // per-value re-scan there would re-open the O(unique values × text) cost
-    // the span-splice removed. The pass stops at bearer on purpose.
-    const HI = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
-    const text = `api_key = "${HI}"\nthen the agent pasted ${HI} again\n`;
+  test('a keyword-anchored high-entropy value echoed bare (and embedded) is redacted as <REDACTED:high_entropy_assignment>', () => {
+    // The transcripts lane runs with highEntropy on, so a pasted `.env` line
+    // followed by the value in prose used to ship the prose copy.
+    const text = `PASSWORD=${HI}\nthen the agent pasted ${HI} again; id=x${HI}y\n`;
     const { text: out, redactions } = redactFindings(text, { highEntropy: true });
     expect(redactions.map((r) => r.pattern)).toEqual(['high_entropy_assignment']);
-    expect(out).toBe(`api_key = "<REDACTED:high_entropy_assignment>"\nthen the agent pasted ${HI} again\n`);
+    expect(out).toBe('PASSWORD=<REDACTED:high_entropy_assignment>\nthen the agent pasted <REDACTED:high_entropy_assignment> again; id=x<REDACTED:high_entropy_assignment>y\n');
+  });
+
+  test('each echo carries the token of the pattern that claimed the value', () => {
+    const text = `Bearer ${OPAQUE_VALUE} TOKEN=${HI}\necho ${HI} and ${OPAQUE_VALUE}\n`;
+    const { text: out } = redactFindings(text, { highEntropy: true });
+    expect(out).toBe('Bearer <REDACTED:bearer> TOKEN=<REDACTED:high_entropy_assignment>\necho <REDACTED:high_entropy_assignment> and <REDACTED:bearer>\n');
   });
 
   test('a vendor key behind Bearer keeps its vendor attribution everywhere; the echo pass has nothing to do', () => {
@@ -773,30 +852,61 @@ describe('redactFindings — bounded bearer echo pass', () => {
     expect(out).toBe('Bearer <REDACTED:anthropic>\nbare <REDACTED:anthropic>\n');
   });
 
-  test(`the cap is exactly ${BEARER_ECHO_MAX_UNIQUE} unique values in claim order; the next value's echo is the accepted miss`, () => {
-    expect(BEARER_ECHO_MAX_UNIQUE).toBe(64);
-    const vals = Array.from({ length: BEARER_ECHO_MAX_UNIQUE + 1 }, (_, k) => unique(k));
-    const text = vals.map((v) => `Bearer ${v}`).join('\n') + `\necho ${vals[0]} ${vals[BEARER_ECHO_MAX_UNIQUE - 1]} ${vals[BEARER_ECHO_MAX_UNIQUE]}`;
+  test("other patterns' values are not echoed: a vendor key embedded past its boundary stays (it re-matches on its own wherever it clears the boundary)", () => {
+    const { text: out } = redactFindings(`k=${OPENAI}\nid=prefix${OPENAI}\n`);
+    expect(out).toBe(`k=<REDACTED:openai>\nid=prefix${OPENAI}\n`);
+  });
+
+  test(`the cap is exactly ${ECHO_MAX_UNIQUE} unique values in claim order; the next value's echo is the accepted miss`, () => {
+    expect(ECHO_MAX_UNIQUE).toBe(64);
+    const vals = Array.from({ length: ECHO_MAX_UNIQUE + 1 }, (_, k) => unique(k));
+    const text = vals.map((v) => `Bearer ${v}`).join('\n') + `\necho ${vals[0]} ${vals[ECHO_MAX_UNIQUE - 1]} ${vals[ECHO_MAX_UNIQUE]}`;
     const { text: out, redactions } = redactFindings(text);
     // Every CLAIM past the cap is still redacted and counted — the cap bounds
     // the echo pass, not the splice.
-    expect(redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE + 1);
-    expect(out.endsWith(`echo <REDACTED:bearer> <REDACTED:bearer> ${vals[BEARER_ECHO_MAX_UNIQUE]}`)).toBe(true);
-    expect(out.split('<REDACTED:bearer>').length - 1).toBe(BEARER_ECHO_MAX_UNIQUE + 1 + 2);
+    expect(redactions.length).toBe(ECHO_MAX_UNIQUE + 1);
+    expect(out.endsWith(`echo <REDACTED:bearer> <REDACTED:bearer> ${vals[ECHO_MAX_UNIQUE]}`)).toBe(true);
+    expect(out.split('<REDACTED:bearer>').length - 1).toBe(ECHO_MAX_UNIQUE + 1 + 2);
+  });
+
+  test('the cap is ONE budget across both patterns: 32 bearer + 32 entropy values fill it, a 65th (entropy) value does not echo', () => {
+    const bearers = Array.from({ length: 32 }, (_, k) => unique(k));
+    const entropics = Array.from({ length: 33 }, (_, k) => `${HI}${k.toString(36).padStart(4, 'q')}`);
+    const text = [
+      ...bearers.map((v) => `Bearer ${v}`),
+      ...entropics.map((v) => `PASSWORD=${v}`),
+      `echo ${bearers[0]} ${bearers[31]} ${entropics[0]} ${entropics[31]} ${entropics[32]}`,
+    ].join('\n');
+    const { text: out, redactions } = redactFindings(text, { highEntropy: true });
+    expect(redactions.length).toBe(65);
+    expect(out.endsWith(`echo <REDACTED:bearer> <REDACTED:bearer> <REDACTED:high_entropy_assignment> <REDACTED:high_entropy_assignment> ${entropics[32]}`)).toBe(true);
   });
 
   test('repeated claims of one value take one cap slot (the cap counts unique values, not occurrences)', () => {
-    const text = Array.from({ length: BEARER_ECHO_MAX_UNIQUE }, () => `Bearer ${unique(0)}`).join('\n') + `\nBearer ${unique(1)}\necho ${unique(1)}`;
+    const text = Array.from({ length: ECHO_MAX_UNIQUE }, () => `Bearer ${unique(0)}`).join('\n') + `\nBearer ${unique(1)}\necho ${unique(1)}`;
     const { text: out, redactions } = redactFindings(text);
-    expect(redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE + 1);
+    expect(redactions.length).toBe(ECHO_MAX_UNIQUE + 1);
     expect(out.endsWith('echo <REDACTED:bearer>')).toBe(true);
   });
 
-  test(`the echo floor is exactly ${BEARER_ECHO_MIN_CHARS} — the bearer class floor, restated (pinned so an edit is a visible edit)`, () => {
-    expect(BEARER_ECHO_MIN_CHARS).toBe(20);
+  test(`the floors are exactly ${ECHO_MIN_CHARS_BEARER} (bearer) and ${ECHO_MIN_CHARS_ENTROPY} (high_entropy_assignment) — each rule's own floor, restated (pinned so an edit is a visible edit)`, () => {
+    expect(ECHO_MIN_CHARS_BEARER).toBe(20);
+    expect(ECHO_MIN_CHARS_ENTROPY).toBe(12);
     const v20 = ['opaque', 'Tok0123456789X'].join('');
     expect(v20.length).toBe(20);
     expect(redactFindings(`Bearer ${v20}\necho ${v20}`).text).toBe('Bearer <REDACTED:bearer>\necho <REDACTED:bearer>');
+    const v12 = ['aB3x', 'Z9qL7mN2'].join('');
+    expect(v12.length).toBe(12);
+    expect(redactFindings(`TOKEN=${v12}\necho ${v12}`, { highEntropy: true }).text).toBe('TOKEN=<REDACTED:high_entropy_assignment>\necho <REDACTED:high_entropy_assignment>');
+  });
+
+  test(`a value longer than ${ECHO_MAX_VALUE_CHARS} chars is redacted at its claim but does not echo (the length cap)`, () => {
+    expect(ECHO_MAX_VALUE_CHARS).toBe(512);
+    const v512 = 'aB3xZ9qL7m'.repeat(51) + 'Q2';
+    expect(v512.length).toBe(512);
+    expect(redactFindings(`Bearer ${v512}\necho ${v512}`).text).toBe('Bearer <REDACTED:bearer>\necho <REDACTED:bearer>');
+    const v513 = v512 + 'z';
+    expect(redactFindings(`Bearer ${v513}\necho ${v513}`).text).toBe(`Bearer <REDACTED:bearer>\necho ${v513}`);
   });
 
   test('an allowlisted bearer value is neither claimed nor echo-redacted (declared safe)', () => {
@@ -807,18 +917,89 @@ describe('redactFindings — bounded bearer echo pass', () => {
     expect(out).toBe(text);
   });
 
-  test('a claimed value that is a prefix of another: the alternation matches longest first, neither echo is cut short', () => {
+  test('a claimed value that is a prefix of another: leftmost-longest, neither echo is cut short', () => {
     const short = OPAQUE_VALUE;
     const long = OPAQUE_VALUE + 'MORE0';
     const text = `Bearer ${short}\nBearer ${long}\necho ${long} then ${short}`;
     expect(redactFindings(text).text).toBe('Bearer <REDACTED:bearer>\nBearer <REDACTED:bearer>\necho <REDACTED:bearer> then <REDACTED:bearer>');
   });
 
-  test('regex metacharacters in the bearer class (`.` `+`) are escaped in the alternation', () => {
+  test('values match literally: `.` and `+` in the bearer class are not metacharacters', () => {
     const v = ['abc.def+ghi', '=jkl~mno/pqr012345'].join('');
     expect(redactFindings(`Bearer ${v}\nbare ${v}`).text).toBe('Bearer <REDACTED:bearer>\nbare <REDACTED:bearer>');
-    // An unescaped `.` would also have matched this near-miss.
     const nearMiss = v.replace('.', 'X');
     expect(redactFindings(`Bearer ${v}\nbare ${nearMiss}`).text).toBe(`Bearer <REDACTED:bearer>\nbare ${nearMiss}`);
+  });
+
+  test('the echo pass never touches an emitted token: a bearer value spelling a pattern name cannot nest', () => {
+    // `high_entropy_assignment` is 23 bearer-class characters. Running the
+    // echo pass over the SPLICED output turned the sibling token into
+    // `<REDACTED:<REDACTED:bearer>>`; matching over the original text's
+    // unclaimed gaps cannot.
+    const text = `Authorization: Bearer high_entropy_assignment\nPASSWORD=${HI}\n`;
+    const { text: out, redactions } = redactFindings(text, { highEntropy: true });
+    expect(redactions.map((r) => r.pattern)).toEqual(['bearer', 'high_entropy_assignment']);
+    expect(out).toBe('Authorization: Bearer <REDACTED:bearer>\nPASSWORD=<REDACTED:high_entropy_assignment>\n');
+    expect(out.includes('<REDACTED:<')).toBe(false);
+  });
+
+  test('an echo that straddles a claimed span is left to the claim (nothing is emitted twice, nothing is skipped)', () => {
+    // Line 2's connection string claims `…:<OPAQUE>@`; the bearer echo of
+    // OPAQUE inside it is entirely within the claimed span and is not
+    // re-emitted; the bare echo on line 3 is.
+    const url = ['postgres://', 'svc', ':', OPAQUE_VALUE, '@db.internal/app'].join('');
+    const { text: out } = redactFindings(`Bearer ${OPAQUE_VALUE}\n${url}\nbare ${OPAQUE_VALUE}\n`);
+    expect(out).toBe('Bearer <REDACTED:bearer>\n<REDACTED:db_url_credentials>db.internal/app\nbare <REDACTED:bearer>\n');
+  });
+});
+
+// ── Session-wide dictionary: planRedaction + applyRedaction ──────────────────
+//
+// A multi-field document (a transcript session) plans every field into ONE
+// shared map first and applies afterwards, so an echo in an earlier field of
+// a value claimed in a later field is scrubbed too. Same floors, same single
+// cap; the plan's `redactions` are unchanged by the echo pass.
+describe('planRedaction / applyRedaction — one echo dictionary across several texts', () => {
+  const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
+  const HI = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
+
+  test('a value claimed in a LATER text is scrubbed from an EARLIER one once every plan is applied after every scan', () => {
+    const echoValues = new Map<string, string>();
+    const a = planRedaction(`the token ${OPAQUE_VALUE} expired`, { echoValues });
+    const b = planRedaction(`Authorization: Bearer ${OPAQUE_VALUE}`, { echoValues });
+    const c = planRedaction(`pasted ${HI} into the env`, { echoValues, highEntropy: true });
+    const d = planRedaction(`SMTP_PASSWORD=${HI}`, { echoValues, highEntropy: true });
+    expect(a.redactions).toEqual([]);
+    expect(b.redactions.map((r) => r.pattern)).toEqual(['bearer']);
+    expect(c.redactions).toEqual([]);
+    expect(d.redactions.map((r) => r.pattern)).toEqual(['high_entropy_assignment']);
+    expect([...echoValues]).toEqual([[OPAQUE_VALUE, 'bearer'], [HI, 'high_entropy_assignment']]);
+    expect(applyRedaction(a)).toBe('the token <REDACTED:bearer> expired');
+    expect(applyRedaction(b)).toBe('Authorization: Bearer <REDACTED:bearer>');
+    expect(applyRedaction(c)).toBe('pasted <REDACTED:high_entropy_assignment> into the env');
+    expect(applyRedaction(d)).toBe('SMTP_PASSWORD=<REDACTED:high_entropy_assignment>');
+  });
+
+  test('the shared map is one budget across texts: a value claimed past the cap in a later text does not echo anywhere', () => {
+    const echoValues = new Map<string, string>();
+    const vals = Array.from({ length: ECHO_MAX_UNIQUE + 1 }, (_, k) => `${OPAQUE_VALUE}${k.toString(36).padStart(4, 'z')}`);
+    const early = planRedaction(`seen first: ${vals[ECHO_MAX_UNIQUE]} and ${vals[0]}`, { echoValues });
+    const plans = vals.map((v) => planRedaction(`Bearer ${v}`, { echoValues }));
+    expect(echoValues.size).toBe(ECHO_MAX_UNIQUE);
+    expect(echoValues.has(vals[ECHO_MAX_UNIQUE]!)).toBe(false);
+    expect(applyRedaction(early)).toBe(`seen first: ${vals[ECHO_MAX_UNIQUE]} and <REDACTED:bearer>`);
+    // The over-cap CLAIM is still redacted at its own span.
+    expect(applyRedaction(plans[ECHO_MAX_UNIQUE]!)).toBe('Bearer <REDACTED:bearer>');
+  });
+
+  test('redactFindings returns the dictionary it collected', () => {
+    const { echoValues } = redactFindings(`Bearer ${OPAQUE_VALUE}`);
+    expect([...echoValues]).toEqual([[OPAQUE_VALUE, 'bearer']]);
+    expect(redactFindings('nothing here').echoValues.size).toBe(0);
+  });
+
+  test('a text with no claims and a non-empty shared map is still swept (the echo pass is not gated on local claims)', () => {
+    const echoValues = new Map<string, string>([[OPAQUE_VALUE, 'bearer']]);
+    expect(applyRedaction(planRedaction(`just ${OPAQUE_VALUE}`, { echoValues }))).toBe('just <REDACTED:bearer>');
   });
 });

@@ -224,8 +224,11 @@ describe('delete_page purge — immediate removal for the trusted local CLI only
     const res = await delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', purge: true }) as Record<string, unknown>;
     expect(res.status).toBe('purged');
     // Shape pin: ONE response shape for status purged — the remediation path
-    // reports why no artifact removal ran instead of omitting the field.
-    expect(res.write_through).toEqual({ removed: false, skipped: 'already_soft_deleted' });
+    // RETRIES the artifact removal against the tombstone's recorded path and
+    // reports the real outcome (here: no repo is configured, so nothing to
+    // unlink) instead of a fabricated 'already_soft_deleted' skip. The
+    // retry itself is pinned by test/pages-purge-artifact.test.ts.
+    expect(res.write_through).toEqual({ removed: false, skipped: 'no_repo_configured' });
     expect((await deletedAtBySource('shared/doc')).default).toBeUndefined();
     // Unknown slug is still a clean not-found, even with purge.
     await expect(delete_page.handler(ctxOf({ remote: false }), { slug: 'shared/doc', purge: true }))

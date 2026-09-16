@@ -105,8 +105,11 @@ guardrails loader runs). It is **never** honored from a `.env` file in the
 not be able to choose what your gbrain executes. When a cwd `.env` assigns
 `GBRAIN_GUARDRAILS_MODULE`, gbrain drops the variable, prints one stderr line
 (`[env] Ignoring GBRAIN_GUARDRAILS_MODULE because a .env file in the current
-directory assigns it …`) and re-runs itself with the sanitized environment so
-nothing it spawns sees the value either. Running gbrain from *inside*
+directory assigns it …`) and then — because it cannot tell a value you exported
+from the file's — refuses to run rather than re-running without your firewall
+(the fail-closed rule below). Every other protected variable is dropped the same
+way and gbrain re-runs itself with the sanitized environment so nothing it
+spawns sees the value either. Running gbrain from *inside*
 `~/.gbrain` is the one exception: that `.env` is your own, and it is honored
 without a warning. The same rule covers the other security-relevant `GBRAIN_*`
 variables and the loader / git / node / proxy / AI-CLI hijack families — see

@@ -9,16 +9,18 @@
  * 210 KB of `-apikey`: ~42 s; 2000 PEM headers without END ahead of a 1 MB
  * tail: ~3.8 s; 20000 PEM headers on ONE line ahead of an 8 MB newline-free
  * tail: ~8 s (~30 s at 23 MB); redacting a 1 MB transcript with ~5k unique
- * values: ~3 s). The thresholds sit 2-50x above the fixed timings and
- * 10-1000x below the broken ones, so they bind on a regression without
- * flaking on a loaded CI box.
+ * values: ~3 s; the echo pass as ONE escaped-alternation RegExp over 64
+ * claimed 4 KB bearer values sharing a 4000-char prefix ahead of a 1 MB tail
+ * of the prefix character: ~24 s). The thresholds sit 2-50x above the fixed
+ * timings and 10-1000x below the broken ones, so they bind on a regression
+ * without flaking on a loaded CI box.
  *
  * Every credential-shaped value is synthetic and runtime-joined from >= 2
  * fragments; constant names keep scanner keywords away from the `=`.
  */
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'crypto';
-import { BEARER_ECHO_MAX_UNIQUE, redactFindings, scanText } from '../src/core/secret-scan.ts';
+import { ECHO_MAX_UNIQUE, ECHO_MAX_VALUE_CHARS, redactFindings, scanText } from '../src/core/secret-scan.ts';
 
 function elapsedMs(fn: () => void): number {
   const t0 = performance.now();
@@ -276,32 +278,55 @@ describe('PEM_BLOCK_RE is linear in headers and text', () => {
   });
 });
 
-describe('the bearer echo pass is one bounded regex over the text', () => {
-  // At most BEARER_ECHO_MAX_UNIQUE alternatives, one String.replace: the cost
-  // is O(text × alternatives) with the alternative count capped, never one
-  // replaceAll per unique value (5000 unique Bearer tokens on one line stays
-  // under the 200 ms pin below with only the first 64 in the alternation).
-  const vals = Array.from({ length: BEARER_ECHO_MAX_UNIQUE }, (_, k) => `${OPAQUE}${k.toString(36).padStart(4, 'z')}`);
+describe(`the echo pass is at most ${ECHO_MAX_UNIQUE} substring sweeps over the text`, () => {
+  // One `indexOf` sweep per dictionary value (the count is capped, the value
+  // length is capped at ECHO_MAX_VALUE_CHARS), candidates spliced into the
+  // unclaimed gaps. Never one replaceAll per unique value (5000 unique Bearer
+  // tokens on one line stays under the 200 ms pin below with only the first
+  // 64 in the dictionary) and never a single escaped-alternation RegExp,
+  // which was O(text × Σ|values|) on prefix-sharing values (the last pin).
+  const vals = Array.from({ length: ECHO_MAX_UNIQUE }, (_, k) => `${OPAQUE}${k.toString(36).padStart(4, 'z')}`);
 
   test('64 unique bearer claims ahead of an 8 MB tail with no echo: redact < 400ms', () => {
     const text = vals.map((v) => `Bearer ${v}`).join(' ') + '\n' + 'x'.repeat(8 << 20);
     let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
     const ms = elapsedMs(() => { result = redactFindings(text); });
-    expect(result.redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE);
+    expect(result.redactions.length).toBe(ECHO_MAX_UNIQUE);
     expect(result.text.includes(OPAQUE)).toBe(false);
     expect(ms).toBeLessThan(400);
   });
 
-  test('the adversarial tail — 4 MB of bearer-class chars sharing the values\' prefix, so every 7th position is a candidate start for all 64 alternatives: < 1500ms', () => {
-    // Bounds the alternation's constant factor: each candidate position walks
-    // the shared prefix once per alternative before failing. Linear in the
-    // text, bounded by the cap; the ~370 ms measured is the accepted cost.
+  test('the adversarial tail — 4 MB of bearer-class chars sharing the values\' prefix, so every 7th position is a candidate start for all 64 values: < 1500ms', () => {
+    // Each sweep rejects a candidate position after the shared prefix; 64
+    // sweeps over 4 MB. Linear in the text, bounded by the cap.
     const text = vals.map((v) => `Bearer ${v}`).join(' ') + '\n' + 'opaqueT'.repeat((4 << 20) / 7);
     let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
     const ms = elapsedMs(() => { result = redactFindings(text); });
-    expect(result.redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE);
+    expect(result.redactions.length).toBe(ECHO_MAX_UNIQUE);
     expect(result.text.includes(OPAQUE)).toBe(false);
     expect(ms).toBeLessThan(1500);
+  });
+
+  test(`the every-position adversary — ${ECHO_MAX_UNIQUE} claimed values of ${ECHO_MAX_VALUE_CHARS} chars sharing a 500-char prefix ahead of a 1 MB tail of the prefix character: < 300ms (the alternation form took ~24 s)`, () => {
+    // The bearer class is `{20,}`, so an attacker-influenced page can plant
+    // long prefix-sharing tokens. With the alternation, every position of the
+    // tail was a candidate start that walked the shared prefix once per
+    // alternative — O(text × Σ|values|). Per-value substring sweeps stay
+    // linear here, and the value-length cap bounds each compare.
+    const prefix = 'A'.repeat(500);
+    const vals512 = Array.from({ length: ECHO_MAX_UNIQUE }, (_, k) => prefix + k.toString(36).padStart(ECHO_MAX_VALUE_CHARS - prefix.length, 'B'));
+    expect(vals512.every((v) => v.length === ECHO_MAX_VALUE_CHARS)).toBe(true);
+    const tail = 'A'.repeat(1 << 20);
+    const text = vals512.map((v) => `Bearer ${v}`).join(' ') + '\n' + tail;
+    let result!: ReturnType<typeof redactFindings>;
+    const ms = elapsedMs(() => { result = redactFindings(text); });
+    expect(result.redactions.length).toBe(ECHO_MAX_UNIQUE);
+    expect(result.redactions.every((r) => r.pattern === 'bearer')).toBe(true);
+    // Every value joined the dictionary (exactly at the length cap) and the
+    // tail carries no echo, so it comes through intact.
+    expect(result.echoValues.size).toBe(ECHO_MAX_UNIQUE);
+    expect(result.text).toBe(Array.from({ length: ECHO_MAX_UNIQUE }, () => 'Bearer <REDACTED:bearer>').join(' ') + '\n' + tail);
+    expect(ms).toBeLessThan(300);
   });
 });
 
@@ -313,7 +338,7 @@ describe('redactFindings is linear in unique values (span-splice, not replaceAll
     // transcript ~1 MB and mostly non-secret, as a real session is.
     const prose = 'the quick brown fox jumps over the lazy dog and keeps going for a while yet more prose to pad it out';
     const base = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
-    const values = Array.from({ length: 5000 }, (_, k) => base + k.toString(36).padStart(6, 'q'));
+    const values = Array.from({ length: 5000 }, (_, k) => base + k.toString(36).padStart(6, 'Q'));
     const lines: string[] = [];
     for (const v of values) lines.push(`api_key = "${v}"`, prose, prose);
     const text = lines.join('\n');
@@ -327,7 +352,34 @@ describe('redactFindings is linear in unique values (span-splice, not replaceAll
     expect(ms).toBeLessThan(400);
   });
 
-  test('5000 UNIQUE Bearer tokens on one line: redact < 200ms (was ~360 ms; the echo pass adds only its 64-alternative regex)', () => {
+  test('1 MB transcript with 5000 UNIQUE high-entropy values, each echoed bare once: only the first 64 echoes are scrubbed, < 400ms', () => {
+    // The echo pass now covers high_entropy_assignment. What keeps this
+    // linear is the dictionary cap: 64 sweeps over the text, not 5000 —
+    // echoes of values past the cap are the documented, accepted miss (their
+    // CLAIMS are still redacted).
+    const prose = 'the quick brown fox jumps over the lazy dog and keeps going for a while yet more prose to pad it out';
+    const base = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
+    // Uppercase pad: base36 renders lowercase, so `Q0` can never collide with
+    // a padded single digit the way a lowercase `q` pad did (k=936 → `q0`).
+    const values = Array.from({ length: 5000 }, (_, k) => base + k.toString(36).padStart(6, 'Q'));
+    expect(new Set(values).size).toBe(5000);
+    const lines: string[] = [];
+    for (const v of values) lines.push(`api_key = "${v}"`, `then the agent pasted ${v} into the shell`, prose);
+    const text = lines.join('\n');
+    expect(text.length).toBeGreaterThan(1024 * 1024);
+    let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
+    const ms = elapsedMs(() => { result = redactFindings(text, { highEntropy: true }); });
+    expect(result.redactions.length).toBe(5000);
+    expect(result.text.split('<REDACTED:high_entropy_assignment>').length - 1).toBe(5000 + ECHO_MAX_UNIQUE);
+    expect(result.text.includes(values[0]!)).toBe(false);
+    expect(result.text.includes(values[ECHO_MAX_UNIQUE - 1]!)).toBe(false);
+    // The 65th value: claim redacted, bare echo survives.
+    expect(result.text).toContain(`then the agent pasted ${values[ECHO_MAX_UNIQUE]} into the shell`);
+    expect(result.text).not.toContain(`api_key = "${values[ECHO_MAX_UNIQUE]}"`);
+    expect(ms).toBeLessThan(400);
+  });
+
+  test('5000 UNIQUE Bearer tokens on one line: redact < 200ms (was ~360 ms; the echo pass adds only its 64 sweeps)', () => {
     const line = Array.from({ length: 5000 }, (_, k) => `Bearer ${OPAQUE}${k.toString(36).padStart(4, 'z')}`).join(' ');
     let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
     const ms = elapsedMs(() => { result = redactFindings(line); });

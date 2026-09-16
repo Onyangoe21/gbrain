@@ -73,7 +73,14 @@ Compiled `gbrain` binaries are built with `--no-compile-autoload-bunfig`, so a
 `bunfig.toml` in the working directory is inert — it cannot preload code into
 the binary before gbrain starts (a CI guard keeps every build invocation
 flagged). The development runtime `bun src/cli.ts` stays bun-native; a
-contributor's own working directory is trusted.
+contributor's own working directory is trusted. Script-mode installs
+(`bun install -g github:garrytan/gbrain`, `git clone` + `bun link`) run
+`src/cli.ts` as an ordinary Bun script, and Bun applies the current
+directory's `bunfig.toml` before any gbrain code runs — gbrain prints a
+one-line warning when it finds a top-level `preload` there, but it cannot
+undo it. Only the compiled binary ignores a cwd `bunfig.toml`; run script-mode
+gbrain from directories you control, or use the release binary in untrusted
+checkouts.
 
 **The trust boundary.** Security-relevant variables are honored from your
 shell environment, from a service `EnvironmentFile`, and from
@@ -85,11 +92,12 @@ that one of those files *assigns* (whatever the value — an expanded
 process), drops the variable and prints one line to stderr:
 
 ```
-[env] Ignoring GBRAIN_GUARDRAILS_MODULE because a .env file in the current directory assigns it — cwd .env files are untrusted for security settings. Export it from your shell or set it in ~/.gbrain/.env.
+[env] Ignoring GBRAIN_PLUGIN_PATH because a .env file in the current directory assigns it — cwd .env files are untrusted for security settings. Export it from your shell or set it in ~/.gbrain/.env.
 ```
 
-When a `.env` file in the current directory assigns any protected variable,
-gbrain drops it, prints one `[env] Ignoring …` line, and then re-runs itself
+When a `.env` file in the current directory assigns any protected variable
+(`GBRAIN_GUARDRAILS_MODULE` is the one exception — it refuses to run instead,
+see below), gbrain drops it, prints one `[env] Ignoring …` line, and then re-runs itself
 once from an empty temporary directory with the sanitized environment, switches
 back to your directory, and exits with that run's status. The re-run's
 environment simply lacks the dropped variables (they are never carried as empty
@@ -98,11 +106,15 @@ gbrain spawns — git, the claude CLI, workers — inherits the clean view. The
 internal variable `GBRAIN_CWD_ENV_QUARANTINED` marks the re-run — it is not a
 setting, and gbrain honours it only when it provably started in the empty
 directory the marker names. A signal-killed re-run maps to exit 128+signal;
-with a terminal attached, Ctrl-C reaches the re-run directly from your
-terminal and the wrapper does not forward it; with no terminal (a supervisor,
-cron, a pipe) a SIGINT that reaches the wrapper alone is forwarded once so the
-re-run is not orphaned; SIGTERM/SIGHUP sent to the wrapper are always
-forwarded. gbrain processes that gbrain itself starts from
+the wrapper's exit status is always the re-run's (it relays the child and
+nothing else). With a controlling terminal, Ctrl-C reaches the re-run directly
+from that terminal and the wrapper does not forward it; with no controlling
+terminal (a supervisor, cron, a detached harness) a SIGINT that reaches the
+wrapper alone is forwarded once so the re-run is not orphaned; SIGTERM/SIGHUP
+sent to the wrapper are always forwarded. When the dropped variable was a
+planted `HOME`, the re-run receives your real home directory (derived from the
+startup environment, never from the file) so git identity and `~/`-relative
+paths keep working. gbrain processes that gbrain itself starts from
 that directory (a supervised worker, a background push) repeat the step once
 for their own subtree. This costs nothing when the working directory has no
 `.env`, or when nothing protected is assigned there.
@@ -138,7 +150,11 @@ for their own subtree. This costs nothing when the working directory has no
   re-run's neutral directory and every temp write resolve through, `HOME` and
   `USERPROFILE` (inert while exported, but where `HOME` is unset a planted
   value would relocate `~/.gitconfig`, `~/.ssh` and `~/.gbrain` into the
-  checkout), `EDITOR`/`VISUAL`/`PAGER`, ssh askpass
+  checkout), the shell-startup and interpreter-home family the
+  non-interactive shells gbrain's children start would read (`BASH_ENV`,
+  `SHELLOPTS`/`PS4`, `BASHOPTS`, `PROMPT_COMMAND`, `ZDOTDIR`, `PYTHONHOME`,
+  `PERLLIB`, `GCONV_PATH`, and exported functions under the `BASH_FUNC_*`
+  prefix), `EDITOR`/`VISUAL`/`PAGER`, ssh askpass
   programs, interpreter preload for Python/Perl/Ruby helpers, HTTP(S)/ALL proxy
   variables in both spellings, and every AI-provider endpoint or credential
   variable gbrain's gateway reads from the environment (`CLAUDE_CONFIG_DIR`,
@@ -184,7 +200,8 @@ assigns this gbrain-specific key; your own setting belongs in your shell or in
 - *Your own config directory.* Running gbrain from inside `~/.gbrain` (or
   `$GBRAIN_HOME/.gbrain`) makes its `.env` the "cwd `.env`". That file is
   yours, so it is honored without a warning — unless a cwd `.env` assigns
-  `GBRAIN_HOME` itself, which is never treated as your config directory.
+  any key the config directory is derived from (`GBRAIN_HOME`, `HOME`,
+  `USERPROFILE`); a planted home is never treated as your config directory.
 - *Server deployments.* `GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, `GBRAIN_HTTP_CORS_ORIGIN`
   and `GBRAIN_HTTP_TRUST_PROXY` are deliberately not on the list so documented
   container deployments that co-locate them keep working — launch
@@ -539,8 +556,11 @@ complete. If you find a live credential in a page:
 
    `--purge` is honored only by the local CLI; remote/MCP callers keep the
    72-hour soft delete. It removes the row and its chunks, links and raw session
-   metadata with no recovery window. Verify with `gbrain get <slug>` (expects
-   not found).
+   metadata with no recovery window, and it refuses to report success while
+   the page's markdown file remains on disk: it retries the removal and, if the
+   file still cannot be removed, stops with `storage_error` naming the path so
+   you can fix permissions and re-run (the row stays soft-deleted until the
+   file is gone). Verify with `gbrain get <slug>` (expects not found).
 3. **Check the other copies.** The brain-repo git history, a synced working
    tree, an export directory or a compiled context file may still hold the
    value; rewrite/re-push or regenerate those as needed.

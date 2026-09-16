@@ -26,8 +26,8 @@
  * What the quarantine covers: the code-loading, exec-target, root-redirect,
  * endpoint-redirect and posture-widening GBRAIN_* keys
  * (`CWD_DOTENV_PROTECTED_KEYS`) AND the loader / git / node / XDG-config /
- * TLS-trust / pager-editor / proxy / AI-endpoint hijack families a cwd .env
- * could plant for the programs gbrain spawns (`CWD_DOTENV_PROTECTED_PREFIXES`,
+ * TLS-trust / pager-editor / proxy / AI-endpoint / shell-startup hijack families
+ * a cwd .env could plant for the programs gbrain spawns (`CWD_DOTENV_PROTECTED_PREFIXES`,
  * `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`) — `isCwdDotenvProtectedKey` is the
  * single predicate. Routing/tuning GBRAIN_* keys and everything not listed
  * still load from a cwd .env. Dropping is in-process; making the drop reach
@@ -211,6 +211,7 @@ export const CWD_DOTENV_PROTECTED_PREFIXES: readonly string[] = [
   'BUN_',        // bun runtime hijack for bun-based children: BUN_OPTIONS (--preload), BUN_INSTALL, BUN_CONFIG_*
   'NPM_CONFIG_', // npm registry / script-shell / node-options redirection for npm-based children
   'npm_config_', // the lowercase spelling npm actually reads
+  'BASH_FUNC_',  // exported-function injection (`BASH_FUNC_name%%=() {…}`): bash imports the body as a function into every child shell
 ];
 
 /**
@@ -252,6 +253,17 @@ export const CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS: readonly string[] = [
   'PERL5OPT',                     // implicit perl -M module load
   'RUBYOPT',                      // implicit ruby -r preload
   'RUBYLIB',                      // ruby library path
+  // --- shell startup files / interpreter homes: every NON-INTERACTIVE shell gbrain's children start (the git hooks gbrain writes, `sh -c` in workspace-push and shell jobs) reads these before its first command ---
+  'BASH_ENV',                     // bash sources this file at the start of every non-interactive shell — arbitrary code before the script's first line
+  // `ENV` (sh/ksh startup file) is deliberately NOT listed: every shell gbrain's children run reads it for INTERACTIVE shells only, and `ENV=production` is a routine key in project .env files.
+  'SHELLOPTS',                    // imported read-only into every bash: an inherited `xtrace` turns PS4 into code that runs on every traced command
+  'PS4',                          // the xtrace prompt — expanded, `$(…)` command substitution included, before each traced command
+  'BASHOPTS',                     // imported shopt set for every bash (expand_aliases, sourcepath, …) — changes how the child parses its own script
+  'PROMPT_COMMAND',               // executed before every bash prompt — any interactive child shell (an $EDITOR's shell escape, a hook that drops to a shell) runs it
+  'ZDOTDIR',                      // relocates zsh's startup files: .zshenv is sourced by EVERY zsh, scripts included
+  'PYTHONHOME',                   // relocates the python stdlib → the interpreter imports planted code on start (PYTHONPATH is listed above)
+  'PERLLIB',                      // perl's other library-path variable (PERL5LIB is listed above)
+  'GCONV_PATH',                   // glibc loads iconv gconv modules — shared objects — from this directory on any charset conversion, in every glibc-linked child
   // --- proxy MITM of every HTTP client gbrain or its children run -----------
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
   'http_proxy', 'https_proxy', 'all_proxy',

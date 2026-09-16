@@ -12,7 +12,7 @@ import { clampSearchLimit } from '../engine.ts';
 import type { Page, PageType } from '../types.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { writePageThrough, deletePageThrough, resolvePageWriteTarget, withNoRepoWriteThroughWarning, type WriteThroughResult } from '../write-through.ts';
+import { writePageThrough, deletePageThrough, resolvePageWriteTarget, withNoRepoWriteThroughWarning, type PageWriteTarget, type WriteThroughResult } from '../write-through.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -1104,9 +1104,15 @@ async function runAutoLink(
 
 /** What a purge cannot reach — surfaced on every purged response so a credential remediation never stops at the row. */
 const PURGE_RESIDUALS = 'Brain-repo git history, synced working-tree copies, exports, compiled context files and slug-keyed derived rows (takes, open loops, file records) may still hold the content — rotate the credential and rewrite or regenerate those copies.';
+/** A purge that leaves the markdown file behind is not a purge (the next sync re-imports it): an unlink ERROR fails closed, naming the path, and the row stays soft-deleted so the operator fixes the cause and re-runs. Non-error skips (no repo, disabled, file absent) proceed. */
+function assertPurgeArtifactGone(slug: string, wt: { removed: boolean; error?: string }, target: PageWriteTarget | undefined): void {
+  if (wt.removed || wt.error === undefined) return;
+  const path = target?.ok ? target.filePath : 'its markdown file';
+  throw new OperationError('storage_error', `purge ${slug}: could not remove ${path}: ${wt.error}`, 'Fix the file permissions (or remove the file by hand) and re-run `gbrain delete <slug> --purge`; the row stays soft-deleted until its file is gone.');
+}
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential); the response names the copies a purge cannot reach (git history, exports, derived rows) — rotate first. Remote/MCP callers asking for purge get permission_denied (the soft-delete path stays available to them); status purged always carries write_through.',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential); the response names the copies a purge cannot reach (git history, exports, derived rows) — rotate first. A purge never reports success while the page\'s markdown file remains: on an already-soft-deleted page it retries the file removal against the recorded path, and a removal error (permissions) fails with storage_error naming the file — fix it and re-run; the row stays soft-deleted until the file is gone. Remote/MCP callers asking for purge get permission_denied (the soft-delete path stays available to them); status purged always carries write_through.',
   params: {
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },
     source_id: { type: 'string', description: "#4329: source holding the row to soft-delete (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId. Remote callers may only target their write source — federated read grants do not confer delete access." },
@@ -1163,9 +1169,21 @@ const delete_page: Operation = {
         throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug (and source_id on a multi-source brain).');
       }
       if (purge) {
-        // Remediation path: the tombstone already exists (its artifact went with the earlier soft-delete); finish the removal. Same response shape as the live-row purge.
+        // Remediation path (O4-2): the earlier soft-delete's unlink may have
+        // FAILED (permissions), leaving the credential-bearing .md for the next
+        // sync to resurrect — so RETRY the removal against the tombstone's OWN
+        // recorded path (the active-row resolution above misses it) and fail
+        // closed on error before the row is dropped. Same response shape as
+        // the live-row purge; the outcome is the real one, never a fabricated skip.
+        const tombstoneTarget = isSandboxSubagent
+          ? undefined
+          : await resolvePageWriteTarget(ctx.engine, slug, wtSourceId, { includeDeleted: true });
+        const retried = isSandboxSubagent
+          ? { removed: false, skipped: 'subagent_sandbox' as const }
+          : await deletePageThrough(ctx.engine, slug, { sourceId: wtSourceId, logger: ctx.logger, target: tombstoneTarget });
+        assertPurgeArtifactGone(slug, retried, tombstoneTarget);
         await ctx.engine.deletePage(slug, sourceOpts);
-        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: { removed: false, skipped: 'already_soft_deleted' as const }, residuals: PURGE_RESIDUALS };
+        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: retried, residuals: PURGE_RESIDUALS };
       }
       return { status: 'already_soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), deleted_at: existing.deleted_at };
     }
@@ -1180,7 +1198,10 @@ const delete_page: Operation = {
       : await deletePageThrough(ctx.engine, slug, { sourceId: wtSourceId, logger: ctx.logger, target });
     if (purge) {
       // Soft-delete first (artifact removal + the same audit shape), then the
-      // hard primitive: cascades through chunks/links/raw_data via FKs.
+      // hard primitive: cascades through chunks/links/raw_data via FKs. An
+      // artifact-removal ERROR fails closed here too — the row stays a
+      // tombstone and the re-run resumes on the remediation path above.
+      assertPurgeArtifactGone(slug, writeThrough, target);
       await ctx.engine.deletePage(slug, sourceOpts);
       return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough, residuals: PURGE_RESIDUALS };
     }

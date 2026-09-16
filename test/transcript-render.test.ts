@@ -379,3 +379,65 @@ describe('redactSession — format-based classes reach text, speaker, title and 
     expect(red.session.messages[0].text).toBe('credentials = DefaultAzureCredential()');
   });
 });
+
+// ── Session-wide echo dictionary ─────────────────────────────────────────────
+//
+// redactSession plans every persisted field into ONE echo dictionary before
+// applying any of them, so a bearer / high-entropy value claimed in one field
+// is scrubbed where it recurs bare in ANY other field, in either order.
+// Redacting fields independently shipped the cross-message echo. Echoes add
+// no findings: redactionCount stays the number of CLAIMS.
+describe('redactSession — the echo dictionary spans every field of the session', () => {
+  const CLAUDE = { harness: 'claude-code', sessionId: 'echo-0001' } as const;
+
+  test('a tool message carries the Bearer header, the assistant echoes the bare token in ANOTHER message: both scrubbed, count unchanged', () => {
+    const two = session(
+      [
+        { role: 'user', timestamp: '2026-08-25T23:00:00.000Z', text: `tool output: curl -H "Authorization: Bearer ${SEEDED_OPAQUE}" https://api.example/v1` },
+        { role: 'assistant', timestamp: '2026-08-25T23:00:01.000Z', text: `the token ${SEEDED_OPAQUE} expired; rotate it` },
+      ],
+      CLAUDE,
+    );
+    const red = redactSession(two, { userPatternsPath: '/nonexistent' });
+    expect(red.redactionCount).toBe(1);
+    expect(red.session.messages[0].text).toBe('tool output: curl -H "Authorization: Bearer <REDACTED:bearer>" https://api.example/v1');
+    expect(red.session.messages[1].text).toBe('the token <REDACTED:bearer> expired; rotate it');
+    const content = renderSessionParts(red).parts[0].content;
+    expect(content).not.toContain(SEEDED_OPAQUE);
+    expect(content.split('<REDACTED:bearer>').length - 1).toBe(2);
+  });
+
+  test('order does not matter: a bare echo in an EARLIER message than the claim is scrubbed too', () => {
+    const reversed = session(
+      [
+        { role: 'assistant', timestamp: '2026-08-25T23:00:00.000Z', text: `retrying with ${SEEDED_OPAQUE} now` },
+        { role: 'user', timestamp: '2026-08-25T23:00:01.000Z', text: `tool output: Authorization: Bearer ${SEEDED_OPAQUE}` },
+      ],
+      CLAUDE,
+    );
+    const red = redactSession(reversed, { userPatternsPath: '/nonexistent' });
+    expect(red.redactionCount).toBe(1);
+    expect(red.session.messages[0].text).toBe('retrying with <REDACTED:bearer> now');
+    expect(red.session.messages[1].text).toBe('tool output: Authorization: Bearer <REDACTED:bearer>');
+  });
+
+  test('a high-entropy assignment in one message reaches its bare echoes in the title, a speaker label and raw metadata', () => {
+    const spread = session(
+      [
+        { role: 'user', timestamp: '2026-08-25T23:00:00.000Z', speaker: `ops ${SEEDED_ENTROPIC}`, text: `see ${SEEDED_ENTROPIC} in the env` },
+        { role: 'assistant', timestamp: '2026-08-25T23:00:01.000Z', text: `env has SMTP_TOKEN=${SEEDED_ENTROPIC} set` },
+      ],
+      { ...CLAUDE, title: `rotate ${SEEDED_ENTROPIC}`, raw: { note: SEEDED_ENTROPIC, count: 2 } },
+    );
+    const red = redactSession(spread, { userPatternsPath: '/nonexistent' });
+    expect(red.redactionCount).toBe(1);
+    expect(JSON.stringify(red.session)).not.toContain(SEEDED_ENTROPIC);
+    expect(red.session.messages[0].text).toBe('see <REDACTED:high_entropy_assignment> in the env');
+    expect(red.session.messages[0].speaker).toBe('ops <REDACTED:high_entropy_assignment>');
+    expect(red.session.messages[1].text).toBe('env has SMTP_TOKEN=<REDACTED:high_entropy_assignment> set');
+    expect(red.session.meta.title).toBe('rotate <REDACTED:high_entropy_assignment>');
+    expect(red.session.meta.raw!.note).toBe('<REDACTED:high_entropy_assignment>');
+    expect(red.session.meta.raw!.count).toBe(2);
+    expect(renderSessionParts(red).parts[0].content).not.toContain(SEEDED_ENTROPIC);
+  });
+});

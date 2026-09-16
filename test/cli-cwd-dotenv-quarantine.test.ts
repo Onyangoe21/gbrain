@@ -12,10 +12,12 @@
  * the file, so it doubles as the harness self-check.
  */
 import { spawn as nodeSpawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, describe, expect, test } from 'bun:test';
+import { cwdIsOperatorConfigDir } from '../src/core/cli-preflight.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 function findRepoRoot(from: string): string {
   let dir = from;
@@ -72,6 +74,9 @@ function hermeticEnv(cwd: string, extra: Record<string, string> = {}): Record<st
 // numeric literal) so the run-unit-shard timeout-pin lint reads it as a kill
 // timer, not a hand-pinned test timeout; the test itself inherits the bunfig default.
 const CHILD_KILL_AFTER_MS = 55_000;
+// Fixture-body timings (interpolated into the spawned entries' source).
+const KEEPALIVE_INTERVAL_MS = 1000;   // an idle setInterval that keeps a signal-test child alive
+const GRACEFUL_EXIT_DELAY_MS = 400;   // a graceful-shutdown handler's delay before it exits
 
 async function runCli(cmd: string[], cwd: string, env: Record<string, string>) {
   const proc = Bun.spawn(cmd, { cwd, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
@@ -440,27 +445,68 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
     }
   });
 
-  // A3-5(b): the mirror case. With NO tty there is no process-group delivery, so
-  // a SIGINT that reaches the wrapper pid alone (a supervisor, cron, an agent
-  // harness) would orphan the re-run under ignore-only. The non-tty wrapper
-  // forwards it once; the re-run's handler runs (exit 97).
-  test.skipIf(!GIT_BIN)('SIGINT to a non-tty wrapper is forwarded once: the re-run receives it and exits 97', async () => {
+  // A3-5(b) + E4-6: the mirror case. With NO controlling terminal there is no
+  // process-group delivery, so a SIGINT that reaches the wrapper pid alone (a
+  // supervisor, cron, a detached agent harness) would orphan the re-run under
+  // ignore-only. Such a wrapper forwards it once; the re-run's handler runs
+  // (exit 97). `detached: true` starts the wrapper in its own session, which is
+  // what actually detaches it from the terminal `bun test` may be running in —
+  // piped stdio alone does not (E4-6 below).
+  test.skipIf(!GIT_BIN)('SIGINT to a wrapper with NO controlling terminal (own session) is forwarded once: the re-run receives it and exits 97', async () => {
     const { dir, entry, ready } = hostileGitRepo({
       entryBody: [
         `process.on('SIGINT', () => process.exit(97));`,
         `writeReady(process.pid);`,
-        `setInterval(() => {}, 1000);`,
+        `setInterval(() => {}, ${KEEPALIVE_INTERVAL_MS});`,
       ].join('\n'),
     });
-    const proc = Bun.spawn([process.execPath, entry, '--preflight'], { cwd: dir, env: hermeticEnv(dir), stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const proc = nodeSpawn(process.execPath, [entry, '--preflight'], { cwd: dir, env: hermeticEnv(dir), detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    proc.stdout!.resume(); proc.stderr!.resume(); // drain
+    const exited = new Promise<number | null>((resolve) => proc.on('exit', (code) => resolve(code)));
     const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* exited */ } }, CHILD_KILL_AFTER_MS);
     try {
       const childPid = await waitReady(ready);
       expect(childPid).not.toBe(proc.pid); // the handler ran in the re-run
-      proc.kill('SIGINT'); // wrapper pid only — no tty ⇒ no group delivery
-      const code = await proc.exited;
-      expect(code).toBe(97);
+      proc.kill('SIGINT'); // wrapper pid only — no controlling terminal ⇒ nothing else delivers it
+      expect(await exited).toBe(97);
       expect(await gone(childPid)).toBe(true);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  // E4-6 (review cycle 4): `process.stdin.isTTY` was the proxy for "a terminal
+  // delivers Ctrl-C to the whole group". `gbrain serve --http </dev/null` in a
+  // foreground terminal has a non-tty stdin AND a controlling terminal, so
+  // Ctrl-C reached wrapper and child and the wrapper forwarded a SECOND SIGINT,
+  // aborting the child's once('SIGINT') graceful handler (exit 130). The wrapper
+  // now probes for a controlling terminal (open("/dev/tty")) and forwards only
+  // when there is none. `script` provides the pty; the shell inside it redirects
+  // ALL THREE stdio to non-tty files — the `</dev/null >log 2>&1` shape.
+  test.skipIf(!GIT_BIN || !SCRIPT_BIN)('Ctrl-C with a controlling terminal but all three stdio non-tty: the wrapper does NOT forward; the once() graceful handler completes (exit 42)', async () => {
+    const { dir, entry, ready } = hostileGitRepo({
+      entryBody: [
+        `process.once('SIGINT', () => { setTimeout(() => process.exit(42), ${GRACEFUL_EXIT_DELAY_MS}); });`,
+        `writeReady(process.pid);`,
+        `setInterval(() => {}, ${KEEPALIVE_INTERVAL_MS});`,
+      ].join('\n'),
+    });
+    const out = join(dir, 'wrapper.out');
+    const err = join(dir, 'wrapper.err');
+    const cmd = `${process.execPath} ${entry} --preflight </dev/null >${out} 2>${err}`;
+    const proc = Bun.spawn([SCRIPT_BIN!, '-qec', cmd, '/dev/null'], {
+      cwd: dir, env: hermeticEnv(dir), stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    });
+    const drain = (async () => { for await (const _ of proc.stdout) { /* mux pty output */ } })();
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* exited */ } }, CHILD_KILL_AFTER_MS);
+    try {
+      await waitReady(ready);
+      proc.stdin!.write('\x03'); // terminal Ctrl-C → pty → the foreground group (wrapper AND re-run)
+      proc.stdin!.flush();
+      const code = await proc.exited;
+      await drain;
+      expect(code).toBe(42);
+      expect(readFileSync(err, 'utf8')).toContain('[env] Ignoring'); // the wrapper's stderr really was the file, not the pty
     } finally {
       clearTimeout(timer);
     }
@@ -487,6 +533,108 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
     } finally {
       clearTimeout(timer);
     }
+  });
+
+  // E4-3 (review cycle 4): cli.ts installs its own SIGTERM/SIGHUP handlers
+  // (process-cleanup.ts: cleanup pass → exit 143/129) in its import.meta.main
+  // block, BEFORE main() reaches preflight. In the wrapper a SIGTERM therefore
+  // ran BOTH that handler and the forwarder, and the wrapper exited 143 before
+  // the re-run finished and before the neutral dir was removed. The wrapper has
+  // no duties of its own, so reexecSanitized removes every pre-existing listener
+  // for the forwarded signals: its exit is ALWAYS the child's. This pin goes
+  // through the REAL cli.ts (not the preflight-only entry) so cli.ts's handlers
+  // are actually installed in the wrapper. The child's graceful shutdown is
+  // modelled by an operator-EXPORTED guardrails module: it replaces the child's
+  // own prompt SIGTERM exit with a delayed exit(0) and writes a marker first.
+  function gracefulSigtermProvider(): { path: string; marker: string; ready: string } {
+    const d = mkdtempSync(join(tmpdir(), 'gbrain-e43-provider-'));
+    scratch.push(d);
+    const marker = join(d, 'GRACEFUL_DONE');
+    const ready = join(d, 'READY');
+    const path = join(d, 'provider.mjs');
+    writeFileSync(path, [
+      `import { writeFileSync, renameSync } from 'node:fs';`,
+      // The child's cli.ts handler would exit 143 at once; this fixture models a command that shuts down gracefully instead.
+      `process.removeAllListeners('SIGTERM');`,
+      `process.on('SIGTERM', () => { setTimeout(() => { writeFileSync(${JSON.stringify(marker)}, 'ran'); process.exit(0); }, ${GRACEFUL_EXIT_DELAY_MS}); });`,
+      `writeFileSync(${JSON.stringify(ready + '.tmp')}, String(process.pid)); renameSync(${JSON.stringify(ready + '.tmp')}, ${JSON.stringify(ready)});`,
+      `setInterval(() => {}, ${KEEPALIVE_INTERVAL_MS});`,
+      // Hold the import open: the child stays alive inside the guardrails loader until SIGTERM arrives.
+      `await new Promise(() => {});`,
+      `export default { id: 'fixture-e4-3', classify() {} };`,
+      '',
+    ].join('\n'));
+    return { path, marker, ready };
+  }
+  const hopDirsIn = (tmp: string) => readdirSync(tmp).filter((n) => n.startsWith('gbrain-hop-'));
+
+  test("through cli.ts: SIGTERM to the wrapper — the wrapper outlives the child's graceful exit(0), relays 0, the marker is present, the neutral dir is removed", async () => {
+    const { dir } = hostileRepo(() => 'GBRAIN_ALLOW_SHELL_JOBS=1'); // protected, NOT the guardrails key → quarantine + re-run, no refusal
+    const provider = gracefulSigtermProvider();
+    const hopTmp = mkdtempSync(join(tmpdir(), 'gbrain-e43-hoptmp-')); // private TMPDIR: the neutral dir is created — and must be removed — in here
+    scratch.push(hopTmp);
+    const env = hermeticEnv(dir, { GBRAIN_GUARDRAILS_MODULE: provider.path, TMPDIR: hopTmp });
+    const proc = Bun.spawn([process.execPath, CLI_PATH, '--version'], { cwd: dir, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+    const stdoutP = new Response(proc.stdout).text();
+    const stderrP = new Response(proc.stderr).text();
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* exited */ } }, CHILD_KILL_AFTER_MS);
+    let childPid = 0;
+    try {
+      childPid = await waitReady(provider.ready);
+      expect(childPid).not.toBe(proc.pid); // the provider loaded in the re-run, not in the wrapper
+      expect(hopDirsIn(hopTmp)).toHaveLength(1); // the neutral dir exists while the child runs
+      proc.kill('SIGTERM');
+      const [code, stderr] = await Promise.all([proc.exited, stderrP, stdoutP]);
+      expect(code).toBe(0); // the CHILD's exit — not cli.ts's own 143
+      expect(existsSync(provider.marker)).toBe(true); // written by the child's delayed handler BEFORE the wrapper exited
+      expect(hopDirsIn(hopTmp)).toEqual([]); // finally { rmSync(neutral) } ran
+      expect(stderr).toContain('Ignoring GBRAIN_ALLOW_SHELL_JOBS because');
+      expect(await gone(childPid)).toBe(true);
+    } finally {
+      clearTimeout(timer);
+      if (childPid) { try { process.kill(childPid, 'SIGKILL'); } catch { /* already gone */ } }
+    }
+  });
+
+  // E4-5 (review cycle 4): dropping a planted HOME must not leave the re-run
+  // with NO $HOME — git then fails (`Author identity unknown`, `$HOME not set`)
+  // and every raw `process.env.HOME || ''` read resolves INTO the checkout. The
+  // sanitized env gets HOME back from os.userInfo().homedir, which Bun derives
+  // from the REAL startup environ (passwd when HOME was unset) before the .env
+  // merge — the planted value never reaches it (measured on Bun 1.3.13).
+  const HOME_PROBE_BODY = `process.stdout.write('HOME=' + JSON.stringify(process.env.HOME ?? null) + '\\n');\nprocess.exit(7);`;
+  /** What the wrapper will resolve: userInfo().homedir for a process started with `env` (HOME unset → passwd). */
+  async function homeSeenBy(env: Record<string, string>): Promise<string> {
+    const p = Bun.spawn(
+      [process.execPath, '--no-env-file', '-e', 'process.stdout.write(require("node:os").userInfo().homedir)'],
+      { env, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
+    );
+    const [out] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+    return out;
+  }
+
+  test.skipIf(!GIT_BIN)('a planted HOME (HOME unset at spawn) is dropped AND the re-run gets the real home back — never the planted path, never empty', async () => {
+    const { dir, entry } = hostileGitRepo({ envLines: (d) => [`HOME=${d}`, 'PROJECT_NAME=demo'], entryBody: HOME_PROBE_BODY });
+    const env = hermeticEnv(dir);
+    delete env.HOME; // cron/systemd shape: nothing exported HOME, so Bun fills it from the .env
+    const expected = await homeSeenBy(env);
+    expect(expected.length).toBeGreaterThan(0);
+    expect(expected).not.toBe(dir);
+    const r = await runCli([process.execPath, entry, '--preflight'], dir, env);
+    expect(r.exitCode).toBe(7);
+    expect(r.stdout).toContain(`HOME=${JSON.stringify(expected)}`);
+    const warnings = warningLines(r.stderr);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('Ignoring HOME because a .env file in the current directory assigns it');
+  });
+
+  test.skipIf(!GIT_BIN)("an exported HOME shadowed by a .env assignment (key-presence false drop) comes back as the operator's own value", async () => {
+    const { dir, entry } = hostileGitRepo({ envLines: (d) => [`HOME=${d}`], entryBody: HOME_PROBE_BODY });
+    const env = hermeticEnv(dir); // HOME exported (scratch home): Bun keeps it, the quarantine still drops it (presence, not value)
+    const r = await runCli([process.execPath, entry, '--preflight'], dir, env);
+    expect(r.exitCode).toBe(7);
+    expect(r.stdout).toContain(`HOME=${JSON.stringify(env.HOME)}`);
+    expect(warningLines(r.stderr)[0]).toContain('Ignoring HOME because');
   });
 
   // A3-6(i): a dev-runtime re-run (`bun src/cli.ts`) must re-insert the runtime
@@ -620,6 +768,51 @@ describe('running gbrain from inside its own config dir', () => {
     expect(r.stderr).toContain("refusing to run without the operator's firewall");
     expect(r.stdout).not.toMatch(/^gbrain \d/);
   });
+
+  // E4-2 (review cycle 4): the exemption compares cwd with configDir(), which
+  // is derived from HOME / USERPROFILE / GBRAIN_HOME. A cwd .env that assigns
+  // ANY of those cannot be the operator's own file — a planted home is never
+  // the operator's config dir — so the exemption is refused for all three, not
+  // just GBRAIN_HOME. Unit: the predicate itself.
+  test('cwdIsOperatorConfigDir: refused when the cwd .env assigns HOME / USERPROFILE / GBRAIN_HOME; granted for a genuine collision', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-e42-home-'));
+    scratch.push(home);
+    const cfgDir = join(home, '.gbrain');
+    mkdirSync(cfgDir);
+    await withEnv({ GBRAIN_HOME: home }, () => {
+      expect(cwdIsOperatorConfigDir(cfgDir, [['UNRELATED', '1']])).toBe(true);                // control: a genuine collision
+      expect(cwdIsOperatorConfigDir(cfgDir, [['GBRAIN_GUARDRAILS_MODULE', '/x']])).toBe(true); // the operator's own security key in their own .env
+      for (const key of ['GBRAIN_HOME', 'HOME', 'USERPROFILE']) {
+        expect(cwdIsOperatorConfigDir(cfgDir, [[key, home]])).toBe(false);
+      }
+      expect(cwdIsOperatorConfigDir(join(home, 'elsewhere'), [['UNRELATED', '1']])).toBe(false); // not the config dir at all
+    });
+  });
+
+  // E4-2 e2e — the forged-home shape. HOME and GBRAIN_HOME are both ABSENT from
+  // the spawn env (a cron / systemd unit), the checkout is laid out as
+  // <hostile>/.gbrain and its .env assigns HOME=<hostile> (Bun sets it because
+  // nothing exported it) next to GBRAIN_GUARDRAILS_MODULE. Measured on Bun
+  // 1.3.13: os.homedir() is captured from the REAL environ before the .env
+  // merge, so configDir() never followed the planted HOME and the collision was
+  // not manufactured even before the predicate change — this pins the invariant
+  // that must hold either way: exemption refused, the planted module never
+  // loads, preflight fails closed, and the warning names HOME.
+  test('forged home: cwd = <hostile>/.gbrain whose .env assigns HOME (HOME + GBRAIN_HOME unset at spawn) — module not loaded, exit 1, warning names HOME', async () => {
+    const { dir, marker } = hostileRepo(() => 'UNRELATED=1'); // the probe module lives here
+    const fakeCfg = join(dir, '.gbrain');
+    mkdirSync(fakeCfg);
+    writeFileSync(join(fakeCfg, '.env'), `HOME=${dir}\nGBRAIN_GUARDRAILS_MODULE=${join(dir, 'tooling', 'probe.ts')}\n`);
+    const env = hermeticEnv(fakeCfg);
+    delete env.HOME;
+    delete env.GBRAIN_HOME; // the cron/systemd shape: Bun fills HOME from the .env because nothing exported it
+    const r = await runCli([process.execPath, CLI_PATH, '--version'], fakeCfg, env);
+    expect(existsSync(marker)).toBe(false);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('[env] Ignoring GBRAIN_GUARDRAILS_MODULE, HOME because a .env file in the current directory assigns it');
+    expect(r.stderr).toContain("refusing to run without the operator's firewall");
+    expect(r.stdout).not.toMatch(/^gbrain \d/);
+  });
 });
 
 
@@ -656,6 +849,84 @@ describe('a cwd bunfig.toml cannot preload code into the compiled binary', () =>
     expect(existsSync(marker)).toBe(false); // --no-compile-autoload-bunfig made it inert
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toMatch(/^gbrain \d/);
+  });
+});
+
+// ── E4-4 (review cycle 4): script mode honours a cwd bunfig.toml — say so ────
+//
+// The documented install (`bun install -g github:…`, `git clone` + `bun link`)
+// maps the `gbrain` bin to src/cli.ts, so gbrain runs as an ordinary Bun
+// SCRIPT and Bun applies the cwd bunfig.toml — a top-level `preload` runs
+// before any gbrain code (measured on Bun 1.3.13: only `--config=/dev/null`
+// suppresses it; `-c`, `--no-bunfig`, `BUN_CONFIG_*` and a `[test]`-section
+// preload do not / do not apply). Preflight cannot undo what already ran; it
+// prints ONE stderr line naming the fact when it detects the shape — script
+// runtime + a top-level preload in the startup cwd's bunfig.toml — except when
+// the cwd IS the checkout containing the running entry (a contributor's own
+// repo). The compiled binary is protected at build time (pinned above).
+describe('script mode + cwd bunfig.toml: preflight names the already-applied preload (E4-4)', () => {
+  const SCRIPT_MODE_WARNING_HEAD =
+    '[env] gbrain is running as a bun script (not the compiled binary) and the bunfig.toml in the current directory declares a top-level preload';
+  const scriptModeWarnings = (stderr: string) => stderr.split('\n').filter((l) => l.startsWith(SCRIPT_MODE_WARNING_HEAD));
+
+  /** A dir whose bunfig.toml is `bunfig`; tooling/pre.ts drops the returned marker when Bun preloads it. */
+  function bunfigDir(bunfig: string, prefix = 'gbrain-script-bunfig-'): { dir: string; marker: string } {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    scratch.push(dir);
+    const marker = join(dir, 'PRELOAD_RAN');
+    mkdirSync(join(dir, 'tooling'));
+    writeFileSync(join(dir, 'tooling', 'pre.ts'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(marker)}, 'ran');\n`);
+    writeFileSync(join(dir, 'bunfig.toml'), bunfig);
+    return { dir, marker };
+  }
+  const TOP_LEVEL_PRELOAD = 'preload = ["./tooling/pre.ts"]\n';
+
+  test('bun src/cli.ts from a dir whose bunfig.toml has a top-level preload: the preload RUNS (Bun, before gbrain) and preflight prints the one-line warning', async () => {
+    const { dir, marker } = bunfigDir(TOP_LEVEL_PRELOAD);
+    const r = await runCli([process.execPath, CLI_PATH, '--version'], dir, hermeticEnv(dir));
+    expect(existsSync(marker)).toBe(true); // honest: script mode cannot prevent this — the warning IS the mitigation
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toMatch(/^gbrain \d/);
+    expect(scriptModeWarnings(r.stderr)).toHaveLength(1);
+  });
+
+  test('controls: a [test]-section preload (not applied by bun run) and no bunfig at all → no warning', async () => {
+    const testOnly = bunfigDir('[test]\npreload = ["./tooling/pre.ts"]\n');
+    const r1 = await runCli([process.execPath, CLI_PATH, '--version'], testOnly.dir, hermeticEnv(testOnly.dir));
+    expect(existsSync(testOnly.marker)).toBe(false);
+    expect(r1.exitCode).toBe(0);
+    expect(scriptModeWarnings(r1.stderr)).toEqual([]);
+    const none = mkdtempSync(join(tmpdir(), 'gbrain-clean-cwd-'));
+    scratch.push(none);
+    const r2 = await runCli([process.execPath, CLI_PATH, '--version'], none, hermeticEnv(none));
+    expect(r2.exitCode).toBe(0);
+    expect(scriptModeWarnings(r2.stderr)).toEqual([]);
+  });
+
+  test('the checkout containing the running entry is exempt; the same entry from a foreign preload dir warns; a hop warns exactly once (wrapper only)', async () => {
+    // A package-shaped checkout: <pkg>/src/entry.ts (preflight only) + <pkg>/bunfig.toml with a top-level preload.
+    const pkg = bunfigDir(TOP_LEVEL_PRELOAD, 'gbrain-script-pkg-');
+    mkdirSync(join(pkg.dir, 'src'));
+    const entry = join(pkg.dir, 'src', 'entry.ts');
+    writeFileSync(entry, `import { runCliPreflight } from ${JSON.stringify(PREFLIGHT_MODULE)};\nawait runCliPreflight();\nprocess.exit(3);\n`);
+    // cwd == the entry's own package root → a contributor's checkout → exempt.
+    const own = await runCli([process.execPath, entry], pkg.dir, hermeticEnv(pkg.dir));
+    expect(existsSync(pkg.marker)).toBe(true);
+    expect(own.exitCode).toBe(3);
+    expect(scriptModeWarnings(own.stderr)).toEqual([]);
+    // The same entry run from a foreign dir carrying a preload bunfig → warns.
+    const foreign = bunfigDir(TOP_LEVEL_PRELOAD);
+    const far = await runCli([process.execPath, entry], foreign.dir, hermeticEnv(foreign.dir));
+    expect(existsSync(foreign.marker)).toBe(true);
+    expect(far.exitCode).toBe(3);
+    expect(scriptModeWarnings(far.stderr)).toHaveLength(1);
+    // Foreign dir with BOTH a preload bunfig and a protected-key .env → the wrapper warns once; the re-run (started in the neutral dir) does not.
+    const hop = bunfigDir(TOP_LEVEL_PRELOAD);
+    writeFileSync(join(hop.dir, '.env'), 'GBRAIN_ALLOW_SHELL_JOBS=1\n');
+    const hopped = await runCli([process.execPath, entry], hop.dir, hermeticEnv(hop.dir));
+    expect(hopped.exitCode).toBe(3);
+    expect(scriptModeWarnings(hopped.stderr)).toHaveLength(1);
+    expect(warningLines(hopped.stderr)).toHaveLength(1);
   });
 });
 
