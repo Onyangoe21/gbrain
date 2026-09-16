@@ -225,6 +225,24 @@ const GIT_BIN = Bun.which('git');
 // util-linux `script` gives the wrapper a real pty so process.stdin.isTTY is
 // true — the only way to exercise the tty (ignore-only) SIGINT branch faithfully.
 const SCRIPT_BIN = Bun.which('script');
+/**
+ * The command line handed to `script -c`. `script` runs it through `$SHELL`
+ * (falling back to /bin/sh — hermeticEnv sets no SHELL), and the pty delivers
+ * Ctrl-C to the WHOLE foreground group, that shell included. Which /bin/sh it
+ * is then decides what `script` reports, not the wrapper or the re-run:
+ *   - bash waits for its foreground child and, when the child did NOT die of
+ *     SIGINT, treats the signal as handled and relays the child's status (42);
+ *   - dash (/bin/sh on Debian/Ubuntu, whose package also patches out upstream
+ *     dash's `sh -c cmd` → exec optimisation) remembers the SIGINT while it
+ *     waits, then re-raises it on itself once the child returns — `script` sees
+ *     a child killed by SIGINT and exits 128+2 = 130 although wrapper and
+ *     re-run both behaved (the ubuntu-latest-only failure of the two pty tests).
+ * `exec` replaces the shell with the wrapper, so no intermediate shell is left
+ * in the foreground group and the status `script` relays is the wrapper's under
+ * either shell. Redirections stay on the exec line: the shell applies them
+ * before it execs, so the all-stdio-non-tty shape below still holds.
+ */
+const ptyCommand = (argv: string, redirects = '') => `exec ${argv}${redirects}`;
 
 const HOSTILE_ENV_LINES = [
   'GBRAIN_ALLOW_SHELL_JOBS=1',
@@ -421,12 +439,12 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
     const { dir, entry, ready } = hostileGitRepo({
       entryBody: [
         // serve-http's shape: once('SIGINT') + a graceful-shutdown delay before exit.
-        `process.once('SIGINT', () => { setTimeout(() => process.exit(42), 300); });`,
+        `process.once('SIGINT', () => { setTimeout(() => process.exit(42), ${GRACEFUL_EXIT_DELAY_MS}); });`,
         `writeReady(process.pid);`,
-        `setInterval(() => {}, 1000);`,
+        `setInterval(() => {}, ${KEEPALIVE_INTERVAL_MS});`,
       ].join('\n'),
     });
-    const cmd = `${process.execPath} ${entry} --preflight`;
+    const cmd = ptyCommand(`${process.execPath} ${entry} --preflight`); // exec'd: see ptyCommand
     const proc = Bun.spawn([SCRIPT_BIN!, '-qec', cmd, '/dev/null'], {
       cwd: dir, env: hermeticEnv(dir), stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     });
@@ -493,7 +511,7 @@ describe('a cwd .env cannot reach the programs gbrain spawns (sanitized re-run)'
     });
     const out = join(dir, 'wrapper.out');
     const err = join(dir, 'wrapper.err');
-    const cmd = `${process.execPath} ${entry} --preflight </dev/null >${out} 2>${err}`;
+    const cmd = ptyCommand(`${process.execPath} ${entry} --preflight`, ` </dev/null >${out} 2>${err}`); // exec'd: see ptyCommand
     const proc = Bun.spawn([SCRIPT_BIN!, '-qec', cmd, '/dev/null'], {
       cwd: dir, env: hermeticEnv(dir), stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     });

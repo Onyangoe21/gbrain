@@ -89,6 +89,35 @@ export function dcrScopeViolation(requested: readonly string[], grantTypes: read
 }
 
 /**
+ * `scopes_supported` for OAuth discovery. The MCP SDK router emits ONE value
+ * into the RFC 8414 authorization-server document and the RFC 9728
+ * protected-resource document(s), so this is the single place that decides
+ * what a client reading discovery is told it may ask for:
+ *
+ *  - DCR enabled (either mode): exactly the anonymous-registration ceiling,
+ *    `read write`, in canonical order. Clients commonly copy `scopes_supported`
+ *    verbatim into their /register request; advertising a privileged scope
+ *    would steer every such client straight into `dcrScopeViolation` (HTTP 400)
+ *    even though the server is willing to register it at `read write`. The
+ *    tighter read-only ceiling for `client_credentials` registrations stays in
+ *    `dcrScopeViolation` — authorization_code is the DCR default and may hold
+ *    both, so advertising `read` alone would under-describe it.
+ *  - DCR disabled: every scope except operator-only `agent`, which also needs
+ *    delegation bindings no OAuth request can carry. Operator-registered
+ *    clients see the full set they may hold.
+ *
+ * Narrowed discovery never narrows an operator-registered client: one that
+ * omits `scope` at /authorize or /token receives its full registered set
+ * (`grantScopes` in oauth-grants.ts falls back to the row's scope), and an
+ * explicit request is intersected with its registration, not with this list.
+ */
+export function scopesSupportedForDiscovery(opts: { enableDcr: boolean }): Scope[] {
+  return opts.enableDcr
+    ? ALLOWED_SCOPES_LIST.filter((s) => DCR_REGISTRABLE_SCOPES.has(s))
+    : ALLOWED_SCOPES_LIST.filter((s) => s !== 'agent');
+}
+
+/**
  * Hierarchy table: which required scopes are implied by which granted scope.
  * `admin` implies all (escape hatch for legacy + super-admin tokens).
  * `write` implies `read`. The two `*_admin` siblings only imply themselves.

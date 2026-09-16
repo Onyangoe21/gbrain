@@ -6009,7 +6009,14 @@ A self-registered client goes through three gates:
    `agent` is rejected with HTTP 400 `invalid_client_metadata` (never silently
    narrowed), and the error text points at the operator path. Under
    `--enable-dcr-insecure`, a `client_credentials` registration is capped at
-   `read` — a grant that skips owner approval never carries `write`.
+   `read` — a grant that skips owner approval never carries `write`. While
+   DCR is enabled (either mode), OAuth discovery advertises the `read write`
+   self-registration ceiling as `scopes_supported` (authorization-server and
+   protected-resource metadata alike), so a client that registers with the
+   advertised scopes succeeds;
+   with DCR off, discovery lists every scope an operator-registered client
+   may hold. `agent` is never advertised — it needs delegation bindings no
+   OAuth request can carry.
 2. **Owner approval on `/authorize`.** Every authorization-code connection
    redirects to the admin dashboard, where you see the client, its redirect
    URI, and the requested scopes, and approve or deny. No code is minted

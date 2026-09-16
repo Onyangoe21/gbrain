@@ -49,7 +49,7 @@ import {
   dcrRegistrationContext,
   DEFAULT_DCR_TTL_MIN_SECONDS,
 } from '../core/oauth-provider.ts';
-import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { hasScope, scopesSupportedForDiscovery, normalizeScopesInput } from '../core/scope.ts';
 import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult } from '../mcp/dispatch.ts';
@@ -1216,7 +1216,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   const authRouterOptions: any = {
     provider: oauthProvider,
     issuerUrl,
-    scopesSupported: ALLOWED_SCOPES_LIST.filter(scope => scope !== 'agent'),
+    scopesSupported: scopesSupportedForDiscovery({ enableDcr }),
     resourceName: 'GBrain MCP Server',
     // Advertise /mcp as the protected resource (see mcpResourceUrl above).
     resourceServerUrl: mcpResourceUrl,

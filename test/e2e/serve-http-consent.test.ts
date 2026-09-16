@@ -144,3 +144,25 @@ test('a self-registered public client cannot obtain or redeem a code without own
   expect(refused.status).toBe(400);
   expect((await refused.json() as any).error).toBe('invalid_client');
 }, 15_000);
+
+/** With self-registration on, discovery advertises exactly what a self-registering client may request — and a client that copies it registers. */
+test('OAuth discovery advertises the self-registration ceiling and a client that copies it registers', async () => {
+  const metadata = await (await fetch(`${base}/.well-known/oauth-authorization-server`)).json() as any;
+  expect(metadata.scopes_supported).toEqual(['read', 'write']);
+  expect(new URL(metadata.registration_endpoint).pathname).toBe('/register');
+  const register = (scope: string) => fetch(`${base}/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+    client_name: 'synthetic discovered-scopes client', redirect_uris: ['https://client-example.invalid/cb'], grant_types: ['authorization_code', 'refresh_token'],
+    response_types: ['code'], token_endpoint_auth_method: 'none', scope }) });
+  const response = await register(metadata.scopes_supported.join(' '));
+  expect(response.status).toBe(201);
+  const client = await response.json() as any;
+  expect(client.scope.split(' ')).toEqual(metadata.scopes_supported);
+  for (const path of ['/.well-known/oauth-protected-resource/mcp', '/.well-known/oauth-protected-resource']) {
+    const resource = await (await fetch(`${base}${path}`)).json() as any;
+    expect(resource.scopes_supported).toEqual(metadata.scopes_supported);
+  }
+  // Narrowed discovery does not loosen the ceiling: an explicit privileged request is still refused.
+  const refused = await register('read write admin');
+  expect(refused.status).toBe(400);
+  expect((await refused.json() as any).error).toBe('invalid_client_metadata');
+}, 15_000);

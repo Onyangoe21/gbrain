@@ -84,6 +84,7 @@ function* dotenvAssignments(dir: string): Generator<DotenvAssignment> {
   for (const name of CWD_DOTENV_FILES) {
     let content: string;
     try {
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- name iterates the fixed CWD_DOTENV_FILES list and dir is the cwd under audit (process.cwd() by default); read-only scan of the .env files Bun auto-loads from there
       content = readFileSync(join(dir, name), 'utf-8');
     } catch {
       continue; // missing/unreadable file — nothing to guard against

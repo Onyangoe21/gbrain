@@ -300,6 +300,7 @@ const HIGH_ENTROPY_REQUIRES_DIGIT_RE = /[0-9]/;
 function compilePatterns(opts: ScanOpts): CompiledPattern[] {
   const out: CompiledPattern[] = CORE_PATTERNS.map((p) => ({
     name: p.name,
+    // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- p.source is a compile-time literal from CORE_PATTERNS (never caller input); every pattern uses bounded quantifiers, pinned by test/secret-scan-perf.test.ts
     re: new RegExp(p.prebuilt ? p.source : `(^|[^A-Za-z0-9_])(${p.source})`, 'g'),
     ...(p.precheck ? { precheck: p.precheck } : {}),
   }));

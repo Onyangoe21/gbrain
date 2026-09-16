@@ -318,10 +318,14 @@ wrappers. With `--enable-dcr` on, a self-registered client defaults to the
 `client_credentials` request is rejected with `invalid_client_metadata`.
 Operators who genuinely need the machine-to-machine grant on the registration
 endpoint opt in with `--enable-dcr-insecure` (which implies `--enable-dcr`);
-those anonymous machine clients are limited to `read`. A startup WARNING
-prints whenever DCR is enabled, and a second when the insecure grant is
-allowed. Pre-registering clients via the CLI / admin API is unchanged and
-accepts every scope.
+those anonymous machine clients are limited to `read`. While DCR is enabled,
+OAuth discovery advertises only the self-registration ceiling (`read write`)
+as `scopes_supported`, so a client that registers with the advertised scopes
+is accepted, and an explicit request above the ceiling is still refused. A
+startup WARNING prints whenever DCR is enabled, and a second when the insecure
+grant is allowed. Pre-registering clients via the CLI / admin API is unchanged
+and accepts every scope; discovery without DCR lists every scope such a client
+may hold.
 
 `gbrain doctor` (`oauth_client_scope_health`) warns about active clients that
 hold a scope beyond the self-registration ceiling but carry no operator grant

@@ -332,8 +332,10 @@ const PATH_RUNTIME_FLAGS: ReadonlySet<string> = new Set([
 /** A path-flag value the re-run must see from `cwd`: relative → absolute; everything else verbatim. */
 function resolveRuntimePath(value: string, cwd: string): string {
   if (value === '' || isAbsolute(value)) return value;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- value is a --preload/--env-file/... path the operator passed on THIS process's own bun command line (process.execArgv) and cwd is the process's own startup cwd; absolutizing it so the sanitized re-run (which starts in a neutral dir) sees the same file IS the point, and no fs operation happens here
   if (/^\.\.?(?:[\\/]|$)/.test(value)) return resolve(cwd, value); // ./x  ../x  .  ..
   try {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- same operator-supplied runtime-flag value against the process's own cwd; existsSync only decides whether a bare name is a file here or a package specifier
     if (existsSync(resolve(cwd, value))) return resolve(cwd, value); // a bare relative name that IS a file here (`--env-file .env.ci`)
   } catch {
     // unreadable — treat as a specifier
@@ -393,6 +395,7 @@ export const SCRIPT_MODE_BUNFIG_WARNING =
 function bunfigDeclaresTopLevelPreload(dir: string): boolean {
   let text: string;
   try {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- dir is the process's own startup cwd (process.cwd() in runCliPreflight) and the tail is the fixed literal 'bunfig.toml'; read-only probe for a top-level preload declaration
     text = readFileSync(join(dir, 'bunfig.toml'), 'utf-8');
   } catch {
     return false;
