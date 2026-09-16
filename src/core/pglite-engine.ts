@@ -4958,12 +4958,13 @@ export class PGLiteEngine implements BrainEngine {
   async getRawData(
     slug: string,
     source?: string,
-    opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean },
+    opts?: PageReadScope & { includeDeleted?: boolean },
   ): Promise<RawData[]> {
     // v0.31.8 (D21): build WHERE clause dynamically. Without opts.sourceId,
     // no source filter (preserves pre-v0.31.8 cross-source read).
     const where: string[] = ['p.slug = $1'];
     if (opts?.excludePrivate) where.push(privatePagesFilterFragment('p'));
+    if (!opts?.includeDeleted) where.push('p.deleted_at IS NULL'); // raw_data follows the page soft-delete
     const params: unknown[] = [slug];
     if (source) {
       params.push(source);

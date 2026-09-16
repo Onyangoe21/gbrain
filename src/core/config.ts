@@ -5,6 +5,7 @@ import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
 import { applyDbPlaneReadSideMerge, type DbPlaneEngineReader } from './config-db-merge.ts';
 import { loadConfigSnapshot } from './config-snapshot.ts';
 import { loadGbrainEnvFile } from './gbrain-env-file.ts';
+import { dotenvValuesForKey } from './env-trust.ts';
 import { REMOTE_PRIVATE_PAGES_KEY } from './search/private-visibility.ts';
 
 /**
@@ -644,68 +645,18 @@ export function loadConfigFileOnly(): GBrainConfig | null {
  * #427 guard — DATABASE_URL hijack via Bun's cwd .env auto-load.
  *
  * Bun merges `.env` files from the process cwd into process.env before any
- * user code runs. For a globally-installed tool that is a footgun: running
- * gbrain inside any checkout whose `.env` defines DATABASE_URL (Next.js,
- * Hono, Supabase, most web apps) silently retargets the brain at that app's
- * database. Reads hit the wrong DB; `apply-migrations` can write gbrain's
- * schema — including its DDL event trigger — into a production app database
- * (see the v0.42.8 report on #427).
- *
- * Bun gives no way to ask which vars came from a .env file (the merge
- * happens before module load), so we re-parse the .env files Bun auto-loads
- * from cwd and treat DATABASE_URL as "not operator-provided" when its value
- * matches one of them. Deliberate overrides still work two ways:
- *   - GBRAIN_DATABASE_URL: namespaced to this tool, never auto-ignored;
- *   - exporting DATABASE_URL in the shell: exported vars win over .env in
- *     Bun, and a deliberate export that happens to EQUAL the cwd .env value
- *     would have selected the same database anyway — ignoring it changes
- *     the outcome only by honoring the brain config, which is the safe
- *     reading of ambiguous intent.
- *
- * The file list is a superset of Bun's auto-load set across NODE_ENV values
- * so the guard doesn't depend on replicating Bun's exact selection logic.
+ * user code runs, so running gbrain inside any checkout whose `.env` defines
+ * DATABASE_URL (Next.js, Hono, Supabase, most web apps) would silently
+ * retarget the brain at that app's database — `apply-migrations` could write
+ * gbrain's schema into a production app database (the v0.42.8 report on #427).
+ * The cwd-.env parser (`CWD_DOTENV_FILES`, `dotenvValuesForKey`) lives in
+ * env-trust.ts beside the key-presence security quarantine; both symbols are
+ * re-exported here so import sites never chase the move. This guard keeps
+ * VALUE-match semantics: a DATABASE_URL equal to a cwd-.env assignment is
+ * file-origin; a deliberate export that happens to EQUAL it would have chosen
+ * the same database anyway, and GBRAIN_DATABASE_URL is never auto-ignored.
  */
-const CWD_DOTENV_FILES = [
-  '.env', '.env.local',
-  '.env.development', '.env.development.local',
-  '.env.production', '.env.production.local',
-  '.env.test', '.env.test.local',
-];
-
-/**
- * All values assigned to `key` across the .env files in `dir`. Collecting
- * every assignment (rather than emulating override order) keeps the guard
- * independent of dotenv precedence rules — a match against ANY assignment
- * means the value is file-origin. Exported for tests.
- */
-export function dotenvValuesForKey(key: string, dir: string = process.cwd()): Set<string> {
-  const values = new Set<string>();
-  const assignment = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/;
-  for (const name of CWD_DOTENV_FILES) {
-    let content: string;
-    try {
-      content = readFileSync(join(dir, name), 'utf-8');
-    } catch {
-      continue; // missing/unreadable file — nothing to guard against
-    }
-    for (const rawLine of content.split('\n')) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const m = line.match(assignment);
-      if (!m || m[1] !== key) continue;
-      let v = m[2].trim();
-      if ((v.startsWith('"') && v.endsWith('"') && v.length >= 2) ||
-          (v.startsWith("'") && v.endsWith("'") && v.length >= 2)) {
-        v = v.slice(1, -1);
-      } else {
-        const hash = v.indexOf(' #');
-        if (hash !== -1) v = v.slice(0, hash).trim();
-      }
-      if (v) values.add(v);
-    }
-  }
-  return values;
-}
+export { CWD_DOTENV_FILES, dotenvValuesForKey } from './env-trust.ts';
 
 let warnedCwdEnvDbUrlIgnored = false;
 

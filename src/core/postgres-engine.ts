@@ -4155,36 +4155,37 @@ export class PostgresEngine implements BrainEngine {
   async getRawData(
     slug: string,
     source?: string,
-    opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean },
+    opts?: PageReadScope & { includeDeleted?: boolean },
   ): Promise<RawData[]> {
     const sql = this.sql;
     const privacy = opts?.excludePrivate ? sql.unsafe(`AND ${privatePagesFilterFragment('p')}`) : sql``;
+    const alive = opts?.includeDeleted ? sql`` : sql`AND p.deleted_at IS NULL`; // raw_data follows the page soft-delete
     const sourceIds = opts?.sourceIds && opts.sourceIds.length > 0 ? opts.sourceIds : undefined;
     const sourceId = sourceIds ? undefined : opts?.sourceId;
     let rows;
     if (source && sourceIds) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
-        JOIN pages p ON p.id = rd.page_id ${privacy}
+        JOIN pages p ON p.id = rd.page_id ${privacy} ${alive}
         WHERE p.slug = ${slug} AND rd.source = ${source} AND p.source_id = ANY(${sourceIds}::text[])`;
     } else if (sourceIds) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
-        JOIN pages p ON p.id = rd.page_id ${privacy}
+        JOIN pages p ON p.id = rd.page_id ${privacy} ${alive}
         WHERE p.slug = ${slug} AND p.source_id = ANY(${sourceIds}::text[])`;
     } else if (source && sourceId) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
-        JOIN pages p ON p.id = rd.page_id ${privacy}
+        JOIN pages p ON p.id = rd.page_id ${privacy} ${alive}
         WHERE p.slug = ${slug} AND rd.source = ${source} AND p.source_id = ${sourceId}`;
     } else if (source) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
-        JOIN pages p ON p.id = rd.page_id ${privacy}
+        JOIN pages p ON p.id = rd.page_id ${privacy} ${alive}
         WHERE p.slug = ${slug} AND rd.source = ${source}`;
     } else if (sourceId) {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
-        JOIN pages p ON p.id = rd.page_id ${privacy}
+        JOIN pages p ON p.id = rd.page_id ${privacy} ${alive}
         WHERE p.slug = ${slug} AND p.source_id = ${sourceId}`;
     } else {
       rows = await sql`SELECT rd.source, rd.data, rd.fetched_at FROM raw_data rd
-        JOIN pages p ON p.id = rd.page_id ${privacy}
+        JOIN pages p ON p.id = rd.page_id ${privacy} ${alive}
         WHERE p.slug = ${slug}`;
     }
     return rows as unknown as RawData[];

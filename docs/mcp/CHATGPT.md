@@ -113,6 +113,20 @@ from the `/admin` dashboard or the CLI, then reconnect. Manual
 registration per step 2 above never hits this — you pick the scopes
 explicitly.
 
+**DCR scope ceiling.** The reverse also holds: a self-registering connector
+may request at most `read write`, and while `--enable-dcr` is on, OAuth
+discovery (`scopes_supported` in both the authorization-server and the
+protected-resource metadata) advertises exactly that set — so a connector
+that copies the advertised scopes into its registration succeeds. If it
+explicitly asks for `admin` anyway, registration fails with HTTP 400
+`invalid_client_metadata` rather than being quietly narrowed, and the
+connector shows a connection error. Either register the client manually
+(step 2) with the scopes you want, or let it self-register with `read
+write` and widen it afterwards with
+`gbrain auth rescope-client <client_id> --scopes ...`. Every self-registered
+connection also stops at the admin dashboard for your approval before a
+token is issued.
+
 ## Troubleshooting
 
 **"Invalid redirect_uri" during the ChatGPT connector OAuth handshake**

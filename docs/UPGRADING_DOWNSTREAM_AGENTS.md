@@ -355,8 +355,10 @@ do not opt in are unaffected.
 
 To adopt, follow `skills/migrations/v0.14.0.md`. The short version:
 
-1. Set `GBRAIN_ALLOW_SHELL_JOBS=1` on the worker process, then `gbrain jobs work`
-   (Postgres). On PGLite, every crontab invocation uses `--follow` for inline
+1. Start the worker with `gbrain jobs work --allow-shell-jobs` (equivalently,
+   export `GBRAIN_ALLOW_SHELL_JOBS=1` on the worker process; a `.env` in the
+   worker's directory cannot set it) (Postgres). On PGLite, every crontab
+   invocation uses `--follow` for inline
    execution; no persistent worker.
 2. Classify each of your host's cron entries: LLM-requiring (keep on gateway) vs
    deterministic (candidate for shell). Typical splits:

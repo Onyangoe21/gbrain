@@ -361,22 +361,24 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(meta.token_endpoint).toContain('/token');
     expect(meta.scopes_supported).toContain('read');
     expect(meta.scopes_supported).toContain('write');
-    expect(meta.scopes_supported).toContain('admin');
+    // This server runs with --enable-dcr: discovery advertises the
+    // self-registration ceiling, never a privileged scope
+    // (scopesSupportedForDiscovery in src/core/scope.ts).
+    expect(meta.scopes_supported).not.toContain('admin');
   });
 
-  // T2 (eng-review): scopes_supported advertises the full ALLOWED_SCOPES_LIST
-  // so MCP clients (Claude Desktop, ChatGPT, Perplexity) can discover the
-  // v0.28 sources_admin and users_admin scopes via standard discovery.
-  // Pre-v0.28 the list was hardcoded to ['read','write','admin'] in
-  // serve-http.ts:195 and this assertion would have failed.
-  test('OAuth metadata advertises all 5 v0.28 scopes (sources_admin + users_admin)', async () => {
+  // With --enable-dcr, scopes_supported is exactly the DCR ceiling (`read write`,
+  // canonical order) so a client that copies discovery into /register is
+  // accepted. The full operator list (admin, read, sources_admin, users_admin,
+  // write) is still advertised WITHOUT DCR — pinned by
+  // test/e2e/sources-remote-mcp.test.ts ('OAuth /.well-known advertises all 5 scopes').
+  test('OAuth metadata under --enable-dcr advertises exactly the self-registration ceiling', async () => {
     const res = await fetch(`${BASE}/.well-known/oauth-authorization-server`);
     const meta = await res.json() as any;
-    expect(meta.scopes_supported).toContain('sources_admin');
-    expect(meta.scopes_supported).toContain('users_admin');
-    expect(meta.scopes_supported).toEqual(
-      expect.arrayContaining(['admin', 'read', 'sources_admin', 'users_admin', 'write']),
-    );
+    expect(meta.scopes_supported).toEqual(['read', 'write']);
+    for (const privileged of ['admin', 'sources_admin', 'users_admin', 'agent']) {
+      expect(meta.scopes_supported).not.toContain(privileged);
+    }
   });
 
   // =========================================================================
@@ -402,9 +404,9 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(meta.resource).toBe(`${BASE}/mcp`);
     expect(meta.resource).not.toBe(`${BASE}/`);
     expect(meta.authorization_servers).toContain(`${BASE}/`);
-    expect(meta.scopes_supported).toEqual(
-      expect.arrayContaining(['admin', 'read', 'sources_admin', 'users_admin', 'write']),
-    );
+    // --enable-dcr server: the protected-resource document mirrors the AS
+    // metadata's self-registration ceiling.
+    expect(meta.scopes_supported).toEqual(['read', 'write']);
   });
 
   // Setting resourceServerUrl moves the SDK's document to the path-inserted

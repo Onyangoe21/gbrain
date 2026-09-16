@@ -1,5 +1,5 @@
 import { pageMutationSource, submitPageMutation } from '../persistence/page-mutations.ts';
-import { PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS } from '../persistence/params.ts';
+import { PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS, assertPurgeParams } from '../persistence/params.ts';
 /**
  * Page CRUD operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). Op consts stay module-private; `pagesOperations` below lists
@@ -343,23 +343,25 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.',
   params: {
     ...PAGE_MUTATION_PARAMS,
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },
     source_id: { type: 'string', description: "#4329: source holding the row to soft-delete (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId. Remote callers may only target their write source — federated read grants do not confer delete access." },
+    purge: { type: 'boolean', description: 'Hard-delete after coordinated artifact removal (no 72h recovery; status purged). Honored only for the trusted local CLI; remote/MCP callers get permission_denied (a non-boolean value is invalid_params) and keep the soft-delete path.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     pageMutationSource(ctx, p, 'delete_page');
+    assertPurgeParams(p, ctx.remote);
     if (ctx.dryRun) {
       if (typeof p.slug === 'string') {
         validatePageSlug(p.slug);
         enforceClientSlugFence(ctx, p.slug, 'delete_page');
         enforceSubagentSlugFence(ctx, p.slug, 'delete_page');
       }
-      return { dry_run: true, action: 'delete_page', slug: p.slug };
+      return { dry_run: true, action: p.purge === true ? 'purge_page' : 'delete_page', slug: p.slug };
     }
     return submitPageMutation(ctx, { operation: 'delete_page', params: p });
   },

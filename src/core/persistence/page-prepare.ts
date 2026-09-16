@@ -12,6 +12,7 @@ import { assertPageRevision, type PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { recordedPathFromFileUri, scannerSourcePath } from '../write-through.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
+import { assertPurgeParams } from './params.ts';
 import { authorizeWrite } from './authority.ts';
 import { digest, sha256 } from './digest.ts';
 import { getWorktreeBinding } from './ownership.ts';
@@ -25,6 +26,8 @@ import { preserveProtectedTakes } from './protected-takes.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { preparePageAdvisories, remoteLinkHint, pageNoopAdvisories } from './page-advisories.ts';
+
+const PURGE_RESIDUALS = 'Brain-repo git history, synced working-tree copies, exports, compiled context files and slug-keyed derived rows (takes, open loops, file records) may still hold the content — rotate the credential and rewrite or regenerate those copies.';
 
 function canonical(page: Pick<Page, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>, tags: string[]) {
   return { type: page.type, title: page.title, compiled_truth: page.compiled_truth, timeline: page.timeline ?? '',
@@ -108,11 +111,21 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     }
   }
   if (row.operation === 'delete_page') {
+    assertPurgeParams(p, row.authority.remote);
     if (!snapshot) throw new OperationError('page_not_found', 'Page not found.');
-    const noop = snapshot.page.deleted_at != null;
-    return { observedRevision, noop, file: await prepareFileTarget(engine, row, snapshot, null), apply: async tx => {
+    const purge = p.purge === true;
+    const noop = !purge && snapshot.page.deleted_at != null;
+    // Tombstones still own their recorded artifact. Purge always attempts its
+    // removal before the guarded hard-delete and receipt commit; failure rolls
+    // back to the prior row, and replay survives the eventual absence of that row.
+    return { observedRevision, noop, file: await prepareFileTarget(engine, row, snapshot, null, undefined, { allowMissing: purge }), apply: async tx => {
+      if (purge) {
+        await tx.deletePage(row.slug, source);
+        return { status: 'purged', slug: row.slug, source_id: row.source_id, residuals: PURGE_RESIDUALS };
+      }
       if (!noop) { await tx.createVersion(row.slug, source); await tx.softDeletePage(row.slug, source); }
-      return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop };
+      return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop,
+        recoverable_until: 'now + 72h via restore_page (remove immediately instead: gbrain delete <slug> --purge, local CLI only)' };
     } };
   }
   let content = preparedIntent?.content ?? p.content as string;

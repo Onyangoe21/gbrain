@@ -163,7 +163,7 @@ Every non-localOnly operation on the MCP surface: 125 tools across 23 areas. **S
 | `fetch` | Fetch the full text of one search result by its `id` (OpenAI deep-research contract: the search/fetch pair). | read |  |  |
 | `get_chunks` | Get content chunks for a page | read |  |  |
 | `get_page` | Read a page by slug (supports optional fuzzy matching). | read | yes |  |
-| `get_raw_data` | Retrieve raw data for a page | read |  |  |
+| `get_raw_data` | Retrieve raw data for a page. | read |  |  |
 | `get_versions` | Page version history | read |  |  |
 | `get_write_request` | Read your durable write receipt by request_id. | write | yes |  |
 | `list_pages` | List pages with optional filters. | read | yes |  |

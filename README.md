@@ -305,10 +305,14 @@ How the open-loop engine decides who's waiting: [`docs/guides/open-loops.md`](do
 Your other agents' histories import in one command. `gbrain transcripts ingest`
 parses agent session logs (Claude Code, Codex, OpenClaw, Hermes, Grok Build) and extracted
 consumer chat exports (ChatGPT / Claude.ai `conversations.json`) into readable
-conversation pages with provenance back to the exact session file. Secrets are
-scrubbed from message bodies, titles, speakers, and session metadata before
-anything is written, embedding is off by default for bulk backfills, and
-re-runs are free — unchanged sessions skip on content hash:
+conversation pages with provenance back to the exact session file. Pattern-based redaction runs over message bodies, titles, speakers, and session
+metadata before anything is written — vendor key prefixes, JWTs, cloud/API key
+shapes, `Bearer` headers, connection-string credentials, and high-entropy
+`KEY=`/`TOKEN=` assignments become `<REDACTED:…>` placeholders (preview with
+`--dry-run`; no pattern set is complete, so if a secret still lands see
+["If a secret reached the brain"](SECURITY.md#if-a-secret-reached-the-brain):
+rotate it, then `gbrain delete <slug> --purge`). Embedding is off by default
+for bulk backfills, and re-runs are free — unchanged sessions skip on content hash:
 
 ```bash
 gbrain transcripts ingest                    # discover importable session logs

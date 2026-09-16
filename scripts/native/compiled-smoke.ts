@@ -22,7 +22,7 @@ try {
     const addon = readFileSync(resolve(import.meta.dir, `../../native/locks/prebuilds/${target}.node`));
     if (!release.includes(addon)) throw new Error(`Release executable omitted native payload ${target}`);
   }
-  execFileSync(process.execPath, ['build', '--compile', '--outfile', binary,
+  execFileSync(process.execPath, ['build', '--compile', '--no-compile-autoload-bunfig', '--outfile', binary,
     resolve(import.meta.dir, 'compiled-probe.ts')], { stdio: 'inherit' });
   const holder = Bun.spawn([binary, lockPath, ready, 'hold'], { env, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' });
   children.push(holder);
