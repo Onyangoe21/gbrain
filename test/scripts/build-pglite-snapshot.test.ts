@@ -222,6 +222,34 @@ describe('snapshot lock ownership and atomic publication', () => {
     expect(readdirSync(dir).some(name => name.endsWith('.tmp'))).toBe(false);
   });
 
+  test('a process killed between publication renames leaves a stale version and can be recovered', async () => {
+    const paths = snapshotProfile('default', dir);
+    writeFileSync(paths.tar, 'old tar');
+    writeFileSync(paths.version, 'old version');
+    // Fault injection lives only in this subprocess. The real first rename
+    // completes, then SIGKILL prevents the second rename and all finally code.
+    const fixture = resolve(import.meta.dir, '../fixtures/snapshot-publication-crash.ts');
+    const child = Bun.spawn([process.execPath, fixture, dir, paths.tar], {
+      cwd: resolve(import.meta.dir, '../..'), stdout: 'pipe', stderr: 'pipe',
+    });
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect(stderr).toBe('');
+    expect(exitCode).not.toBe(0);
+    expect(child.signalCode).toBe('SIGKILL');
+    expect(readFileSync(paths.tar, 'utf8')).toBe('complete new tar');
+    expect(readFileSync(paths.version, 'utf8')).toBe('old version');
+    expect(existsSync(paths.lock)).toBe(true);
+    let builds = 0;
+    expect(await buildPgliteSnapshot('default', { fixtureDir: dir, log: quiet, buildData: async () => {
+      builds++;
+      return bytes('recovered tar');
+    }})).toBe('built');
+    expect(builds).toBe(1);
+    expect(readFileSync(paths.tar, 'utf8')).toBe('recovered tar');
+    expect(readFileSync(paths.version, 'utf8')).toContain(`dims=${DEFAULT_EMBEDDING_DIMENSIONS}\n`);
+    expect(existsSync(paths.lock)).toBe(false);
+  });
+
   test('lost ownership refuses publication and leaves the replacement owner intact', async () => {
     const paths = snapshotProfile('legacy', dir);
     const replacement = JSON.stringify(owner(process.pid, 'replacement-owner'));

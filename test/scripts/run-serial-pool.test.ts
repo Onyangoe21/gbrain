@@ -346,4 +346,74 @@ it('keeps a child alive', async () => {
       rmSync(marker, { force: true });
     }
   }, 20000);
+
+  it.each([false, true])('exclusive cancellation allows graceful cleanup and records incomplete timing (rescue: %s)', async (rescue) => {
+    const root = stageSandbox();
+    const file = 'test/brain-repo-durability.serial.test.ts';
+    const marker = join(root, 'exclusive.pid');
+    const cleanup = join(root, 'cleanup-complete');
+    const coverage = join(root, 'coverage');
+    writeFileSync(join(root, file), `import { it } from 'bun:test';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+it('allows exclusive registration cleanup to finish', async () => {
+  const attemptsFile = ${JSON.stringify(join(root, 'attempts'))};
+  const attempt = existsSync(attemptsFile) ? Number(readFileSync(attemptsFile, 'utf8')) + 1 : 1;
+  writeFileSync(attemptsFile, String(attempt));
+  if (${rescue} && attempt === 1) { process.kill(process.pid, 'SIGTERM'); return; }
+  let cancelling = false;
+  process.on('SIGTERM', () => {
+    if (cancelling) return;
+    cancelling = true;
+    writeFileSync(${JSON.stringify(join(root, 'received-term'))}, 'TERM');
+    // Deliberately outlast the pooled runner's one-second escalation grace.
+    // Finishing this cleanup proves exclusive work was not force-killed.
+    setTimeout(() => {
+      writeFileSync(${JSON.stringify(cleanup)}, 'finished');
+      process.exit(0);
+    }, 1500);
+  });
+  writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+  await new Promise(() => {});
+});`);
+    const runner = Bun.spawn(['bash', join(root, 'scripts/run-serial-tests.sh')], {
+      cwd: root,
+      env: { ...ENV, PATH: join(root, 'bin'), SHARD: '1/4', COVERAGE_DIR: coverage },
+      stdout: 'ignore', stderr: 'ignore',
+    });
+    let exclusivePid = 0;
+    const alive = () => {
+      if (!exclusivePid) return false;
+      try {
+        if (process.platform === 'linux' && /\) Z /.test(readFileSync(`/proc/${exclusivePid}/stat`, 'utf8'))) return false;
+        process.kill(exclusivePid, 0);
+        return true;
+      } catch { return false; }
+    };
+    try {
+      const readyDeadline = Date.now() + 10000;
+      while (!existsSync(marker) && Date.now() < readyDeadline) await Bun.sleep(20);
+      expect(existsSync(marker)).toBe(true);
+      exclusivePid = Number(readFileSync(marker, 'utf8'));
+      runner.kill('SIGTERM');
+      const exitDeadline = Date.now() + 5000;
+      while ((runner.exitCode === null || !existsSync(cleanup) || alive()) && Date.now() < exitDeadline) await Bun.sleep(20);
+      expect(runner.exitCode).toBe(143);
+      expect(readFileSync(join(root, 'received-term'), 'utf8')).toBe('TERM');
+      expect(readFileSync(cleanup, 'utf8')).toBe('finished');
+      expect(alive()).toBe(false);
+      expect(existsSync(join(coverage, 'lane-manifest.json'))).toBe(false);
+      const timing = JSON.parse(readFileSync(join(root, '.context/serial-timings.json'), 'utf8'));
+      expect(timing).toMatchObject({ lane: 'serial-1', complete: false });
+      expect(timing.files).toHaveLength(1);
+      expect(timing.files[0].file).toBe(file);
+      expect(timing.files[0].status).not.toBe('pass');
+      expect(timing.files[0].attempts).toHaveLength(rescue ? 2 : 1);
+      if (rescue) expect(timing.files[0].attempts[0].status).toBe('external-kill');
+    } finally {
+      runner.kill('SIGKILL');
+      if (alive()) { try { process.kill(exclusivePid, 'SIGKILL'); } catch { /* already exited */ } }
+      await runner.exited;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20000);
 });
