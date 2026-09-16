@@ -75,7 +75,8 @@ function registryWriteScenario(name: string, getEngine: () => BrainEngine) {
               ? await invalidateStaleSignatureEmbeddingsGuarded(engine, opts)
               : await engine.invalidateStaleSignatureEmbeddings(opts);
             expect(invalidated).toBe(1);
-            const chunks = await engine.getChunks(slug);
+            // Inspect the raw write-side state before a retrieval projection is sealed.
+            const chunks = await engine.getChunks(slug, { includeUnsealed: true });
             expect(chunks.map((chunk) => chunk.embedding_is_null)).toEqual([false, true]);
             await engine.deletePage(slug);
           }

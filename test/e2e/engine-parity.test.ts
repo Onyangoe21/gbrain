@@ -2487,7 +2487,7 @@ describeBoth('Engine parity — getCalleesOf bare-name fallback (#4670)', () => 
         type: 'code', page_kind: 'code', title: 'src/OrderService.cs (c_sharp)',
         compiled_truth: 'public async Task SubmitAsync() { ValidateRequest(); }', timeline: '',
       });
-      await eng.upsertChunks(slug, [{
+      await installFixtureChunks(eng, slug, [{
         chunk_index: 0,
         chunk_text: 'public async Task SubmitAsync() { ValidateRequest(); }',
         chunk_source: 'compiled_truth',

@@ -200,7 +200,7 @@ describe('#4670 — getCalleesOf bare-name fallback (opt-in)', () => {
       compiled_truth: 'public async Task SubmitAsync() { ValidateRequest(); }',
       timeline: '',
     });
-    await engine.upsertChunks('src-order-service-cs', [{
+    await installFixtureChunks(engine, 'src-order-service-cs', [{
       chunk_index: 0,
       chunk_text: 'public async Task SubmitAsync() { ValidateRequest(); }',
       chunk_source: 'compiled_truth',
