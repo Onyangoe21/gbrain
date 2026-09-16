@@ -326,8 +326,11 @@ accepts every scope.
 `gbrain doctor` (`oauth_client_scope_health`) warns about active clients that
 hold a scope beyond the self-registration ceiling but carry no operator grant
 record, with the exact `rescope-client` / `revoke-client` remedy. Remote
-`sources_remove` callers are confined to the sources their grant names (an
-out-of-scope id answers `not_found`), matching `sources_list` / `sources_status`.
+`sources_remove` callers may remove only their own write source (a federated
+read grant naming a source does not make it removable); any other id answers
+`not_found`, indistinguishable from a nonexistent source. `sources_status`
+keeps the read-scope confinement it shares with `sources_list`, and the local
+CLI keeps full operator authority.
 
 ### Owner approval for authorization-code connections
 

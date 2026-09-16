@@ -317,7 +317,8 @@ bare background shell except this skill saying don't.
 ### Rung 1 — Minion job + deadman (Postgres + worker)
 
 Requires: Postgres engine, a running `gbrain jobs work` worker, and — for
-the shell lane — `GBRAIN_ALLOW_SHELL_JOBS=1` on the worker. All the
+the shell lane — a worker started with `--allow-shell-jobs` (or
+`GBRAIN_ALLOW_SHELL_JOBS=1` exported on it). All the
 Preconditions above still hold: the flag defaults OFF, shell submission is
 CLI-only across the MCP trust boundary, and PGLite has no worker daemon
 (see Rung 3). Nothing in this section loosens that contract.
