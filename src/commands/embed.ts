@@ -1,5 +1,6 @@
 import { sanitizeRemoteBody } from '../core/remote-body.ts';
 import { readProjectionSnapshot, installPageProjection, installPageEmbeddings } from '../core/page-state/projections.ts';
+import { PageRevisionConflictError } from '../core/page-state/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { currentEmbeddingSignature } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
@@ -980,20 +981,24 @@ async function embedPage(
   quiet?: boolean,
 ) {
   const opts = sourceId ? { sourceId } : undefined;
-  const snapshot = await engine.readPageSnapshot(slug, opts);
-  const page = snapshot?.page;
-  if (!page) {
+  const initial = await engine.readPageSnapshot(slug, opts);
+  if (!initial) {
     throw new Error(`Page not found: ${slug}`);
   }
+  const origin = await readProjectionSnapshot(engine, slug, initial.page.source_id, { allowUnsealed: true });
+  if (!origin || origin.snapshot.revision !== initial.revision || origin.snapshot.page.id !== initial.page.id
+    || origin.snapshot.sourceIncarnation !== initial.sourceIncarnation) return;
+  const snapshot = origin.snapshot;
+  const page = snapshot.page;
 
   // Get existing chunks or create new ones.
   // In dryRun, we still chunk the text locally to count what WOULD be
   // embedded — but we never write chunks or call the embedding model.
-  let chunks = await engine.getChunks(slug, opts);
+  let chunks = page.text_projection_revision === snapshot.revision ? origin.chunks : [];
   if (chunks.length === 0) {
     const inputs: ChunkInput[] = [];
     // #4530: respect the active embedding model's per-input token limit.
-    const chunkOpts = { maxTokens: resolveMaxChunkTokens() };
+    const chunkOpts = { maxTokens: origin.maxChunkTokens };
     if (page.compiled_truth.trim()) {
       for (const c of chunkText(sanitizeRemoteBody(page.compiled_truth), chunkOpts)) {
         inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
@@ -1014,14 +1019,19 @@ async function embedPage(
     }
 
     if (inputs.length > 0) {
-      await installPageProjection(engine, snapshot!, inputs, { seal: true });
-      chunks = await engine.getChunks(slug, opts);
+      try {
+        await installPageProjection(engine, origin, inputs, { seal: true });
+      } catch (error) {
+        if (!(error instanceof PageRevisionConflictError)) throw error;
+        return;
+      }
+      chunks = await engine.getChunks(slug, { sourceId: page.source_id });
     }
   } else if (!dryRun) {
     // SUP-3874: legacy chunks may predate the model input-cap. Split them
     // before the embed call so one oversized row can't fail the page/sweep.
     const healed = await healOversizedPageChunks(engine, slug, {
-      sourceId,
+      sourceId: page.source_id,
       onSplit: (n) => serr(`  ${slug}: split ${n} oversized chunk(s) to fit embedding input limit`),
     });
     if (healed.changed) chunks = healed.chunks;
@@ -1066,7 +1076,7 @@ async function embedPage(
   let firstError: unknown;
   try {
     ({ embeddings, failed, firstError } = await embedPageTexts(
-      wrapChunkTextsForStoredMode(page, toEmbed),
+      wrapChunkTextsForStoredMode(prepared.snapshot.page, toEmbed),
       signal ? { abortSignal: signal } : {},
     ));
   } catch (e: unknown) {
@@ -1102,7 +1112,7 @@ async function embedPage(
   if (failed === 0 && toEmbed.length === chunks.length) {
     // #3507: a fully re-embedded per_chunk_synopsis page landed at the
     // title tier — keep the stamped mode honest.
-    await restampIfDemotedToTitleTier(engine, page, slug, page.source_id);
+    await restampIfDemotedToTitleTier(engine, prepared.snapshot.page, slug, page.source_id);
   }
   result.embedded += toEmbed.length - failed;
   if (failed > 0) {
@@ -1361,39 +1371,11 @@ async function embedAll(
  * contract (including `pages_processed`, which embedPage's own dry-run
  * branch increments for exactly this "examined, didn't write" case).
  *
- * Race note (review catch, three rounds — ACCEPTED RESIDUAL RISK, not
- * fully closed): between listing a page and writing its chunks, a
- * concurrent writer (sync, another `put_page`) could change or chunk the
- * SAME page. Two mitigations, both bounded — full atomicity (a
- * transaction/version-guarded conditional write inside `upsertChunks`)
- * would need a new engine primitive shared by every `upsertChunks` caller,
- * which is out of scope for a chunkless-page safety net:
- *   1. Immediately before writing, re-fetch the LIVE page via `getPage`
- *      and build `inputs` from ITS CURRENT content, not the batch-list
- *      snapshot — closes the "content changed but still chunkless"
- *      sub-case, not just the "chunks appeared" one.
- *   2. Re-check `getChunks` right after that same fetch — skip (don't
- *      overwrite) if chunks now exist AT THE TIME OF THE CHECK.
- * What this does NOT close: a writer that inserts chunks in the gap
- * BETWEEN step 2's check and the `upsertChunks` call immediately below it
- * (no intervening `await` other than that one call, but `upsertChunks`
- * itself is not conditioned on the check — this is still check-then-write,
- * not compare-and-swap) can still have its chunks overwritten — HONESTLY:
- * `upsertChunks` treats its input as the full desired chunk set for that
- * page and deletes any existing chunk_index absent from it, so a
- * concurrent writer's chunks landing in that exact gap CAN be replaced
- * with this sweep's stale-content chunks (embedding NULL). This is the
- * SAME check-then-write window `embedPage`'s existing single-page
- * chunkless branch already ships with today (that branch doesn't even
- * have step 2's re-check) — no new race CLASS is introduced, and the
- * window here is a single sequential getPage+getChunks+upsertChunks
- * instead of spanning a whole batch. The blast radius is bounded: the
- * page is NOT deleted or corrupted, just re-chunked from a stale
- * snapshot, and the NEXT write to that page (sync, another edit) that
- * actually chunks it restores correct content — this sweep's own
- * predicate is idempotent and doesn't compound the drift. Closing this
- * fully (true atomicity) is tracked as a follow-up, not blocking this
- * safety net.
+ * Capture the live canonical page, complete unsealed chunk set and indexing
+ * context under one short page guard, then chunk outside the transaction.
+ * Installation compares that originating snapshot under the same guard before
+ * changing any row. A newer canonical edit, completed projection or changed
+ * chunking context supersedes this attempt without counting it as healed.
  *
  * Per-page failure isolation (review catch): one malformed/oversized
  * chunkless page must not abort the sweep and, with it, the entire
@@ -1440,17 +1422,17 @@ async function healChunklessPages(
   let pagesHealed = 0;
   let budgetExceeded = false;
 
-  const buildInputs = (compiledTruth: string, timeline: string): ChunkInput[] => {
+  const buildInputs = (compiledTruth: string, timeline: string, maxTokens = resolveMaxChunkTokens()): ChunkInput[] => {
     const inputs: ChunkInput[] = [];
     // #4530: respect the active embedding model's per-input token limit.
-    const chunkOpts = { maxTokens: resolveMaxChunkTokens() };
+    const chunkOpts = { maxTokens };
     if (compiledTruth.trim()) {
-      for (const c of chunkText(compiledTruth, chunkOpts)) {
+      for (const c of chunkText(sanitizeRemoteBody(compiledTruth), chunkOpts)) {
         inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
       }
     }
     if (timeline.trim()) {
-      for (const c of chunkText(timeline, chunkOpts)) {
+      for (const c of chunkText(sanitizeRemoteBody(timeline), chunkOpts)) {
         inputs.push({ chunk_index: inputs.length, chunk_text: c.text, chunk_source: 'timeline' });
       }
     }
@@ -1492,20 +1474,13 @@ async function healChunklessPages(
           continue;
         }
 
-        // Re-fetch the LIVE page + re-check chunks immediately before
-        // writing (see race note above): chunk CURRENT content, and skip
-        // rather than clobber if a concurrent writer already chunked this
-        // page since we listed it.
-        const [livePage, stillChunkless] = await Promise.all([
-          observed(activePacer, () => engine.readPageSnapshot(page.slug, { sourceId: page.source_id })),
-          observed(activePacer, () => engine.getChunks(page.slug, { sourceId: page.source_id })),
-        ]);
-        if (!livePage || stillChunkless.length > 0) continue;
-        const inputs = buildInputs(livePage.page.compiled_truth, livePage.page.timeline);
+        const prepared = await observed(activePacer, () => readProjectionSnapshot(engine, page.slug, page.source_id, { allowUnsealed: true }));
+        if (!prepared || prepared.chunks.length > 0) continue;
+        const inputs = buildInputs(prepared.snapshot.page.compiled_truth, prepared.snapshot.page.timeline, prepared.maxChunkTokens);
         if (inputs.length === 0) continue;
 
         await observed(activePacer, () =>
-          installPageProjection(engine, livePage, inputs, { seal: true }),
+          installPageProjection(engine, prepared, inputs, { seal: true }),
         );
         pagesHealed++;
         try {
@@ -1514,6 +1489,7 @@ async function healChunklessPages(
           if (!(e instanceof AbortError)) throw e;
         }
       } catch (e) {
+        if (e instanceof PageRevisionConflictError) continue;
         if (isAborted(signal)) break;
         recordFailure(result, 1, page.slug, e);
         serr(`\n  [embed] chunkless-page heal failed for ${page.slug}: ${e instanceof Error ? e.message : e}`);

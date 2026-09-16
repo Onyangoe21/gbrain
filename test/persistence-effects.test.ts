@@ -17,7 +17,7 @@ import { publishGitEffect } from '../src/core/persistence/effect-git.ts';
 import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
 import { parseFactsFence, upsertFactRow } from '../src/core/facts-fence.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
-import { installPageProjection } from '../src/core/page-state/projections.ts';
+import { installPageProjection, readProjectionSnapshot } from '../src/core/page-state/projections.ts';
 
 let engine: PGLiteEngine;
 const roots: string[] = [];
@@ -163,8 +163,9 @@ test('late embedding cannot replace vectors after a canonical revision changes',
   await publishMutation(engine, row, { observedRevision: f.snapshot.revision, apply: async tx => {
     await tx.putPage('page', page('Current'), { sourceId: f.sourceId }); return {};
   } }, hostId);
-  const snapshot = (await engine.readPageSnapshot('page', { sourceId: f.sourceId }))!;
-  await installPageProjection(engine, snapshot, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current' }], { seal: true });
+  const prepared = (await readProjectionSnapshot(engine, 'page', f.sourceId, { allowUnsealed: true }))!;
+  const snapshot = prepared.snapshot;
+  await installPageProjection(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current' }], { seal: true });
   await onlyEffects(row.id);
   let calls = 0;
   await runPersistenceEffects(engine, { engine: 'pglite' }, { hostId, limit: 1, embedding: { signature: 'test:1536', model: 'test', embed: async () => {

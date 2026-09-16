@@ -1,5 +1,5 @@
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { installPageProjection } from '../src/core/page-state/projections.ts';
+import { installPageProjection, readProjectionSnapshot } from '../src/core/page-state/projections.ts';
 /**
  * SUP-3874 — heal already-stored chunks that exceed the embedding input cap.
  */
@@ -196,10 +196,10 @@ describe('healOversizedPageChunks with guarded database projections', () => {
 
   async function seed(slug: string, body: string) {
     await engine.putPage(slug, { type: 'note', title: 'Example', compiled_truth: body });
-    const snapshot = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
-    await installPageProjection(engine, snapshot,
+    const prepared = (await readProjectionSnapshot(engine, slug, 'default', { allowUnsealed: true }))!;
+    await installPageProjection(engine, prepared,
       [{ chunk_index: 0, chunk_text: body, chunk_source: 'compiled_truth' }], { seal: true });
-    return snapshot;
+    return prepared.snapshot;
   }
 
   test('small chunks retain their stored identity and canonical revision', async () => {

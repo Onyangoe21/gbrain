@@ -31,6 +31,8 @@ import { runEmbedCore } from '../src/commands/embed.ts';
 import { EMBED_SKIP_KEY, buildEmbedSkipMarker } from '../src/core/embed-skip.ts';
 import { QUARANTINE_KEY, buildQuarantineMarker } from '../src/core/quarantine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { recordFactWithdrawal } from '../src/core/facts/withdrawal.ts';
+import { installPageEmbeddings, readProjectionSnapshot, type ProjectionSnapshot } from '../src/core/page-state/projections.ts';
 
 const DIMS = 1536;
 let engine: PGLiteEngine;
@@ -172,6 +174,45 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
     expect(preChunked[0]?.embedded_at).not.toBeNull();
   });
 
+  test('healing sanitizes active, withdrawn and private fences before chunking either body column', async () => {
+    const slug = 'stub/fenced-history';
+    const fence = (column: string) => `<!--- gbrain:facts:begin -->
+| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | activeworld${column} remains searchable | fact | 1.0 | world | medium | 2026-01-01 | | test | |
+| 2 | withdrawnsentinel${column} retained history | fact | 1.0 | world | medium | 2026-01-01 | | test | |
+| 3 | privatesentinel${column} hidden detail | fact | 1.0 | private | medium | 2026-01-01 | | test | |
+<!--- gbrain:facts:end -->`;
+    await engine.putPage(slug, { type: 'note', title: 'Fenced history',
+      compiled_truth: `Safe body prose.\n${fence('body')}`, timeline: `Safe timeline prose.\n${fence('timeline')}` });
+    for (const column of ['body', 'timeline']) {
+      const fact = await engine.insertFact({ fact: `withdrawnsentinel${column} retained history`, source: 'test', visibility: 'world' }, { source_id: 'default' });
+      expect((await recordFactWithdrawal(engine, fact.id, 'default', true)).withdrawn).toBe(true);
+    }
+    expect(await engine.getChunks(slug, { includeUnsealed: true })).toEqual([]);
+    const historical = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
+    expect(historical.page.compiled_truth).toContain('~~withdrawnsentinelbody retained history~~');
+    expect(historical.page.timeline).toContain('~~withdrawnsentineltimeline retained history~~');
+
+    const result = await runEmbedCore(engine, { stale: true, quiet: true });
+
+    expect(result.chunkless_pages_healed).toBe(1);
+    const chunks = await engine.getChunks(slug);
+    for (const [field, column] of [['compiled_truth', 'body'], ['timeline', 'timeline']]) {
+      const text = chunks.filter(c => c.chunk_source === field).map(c => c.chunk_text).join('\n');
+      expect(text).toContain(`activeworld${column}`);
+      expect(text).not.toContain(`withdrawnsentinel${column}`);
+      expect(text).not.toContain(`privatesentinel${column}`);
+      expect(await engine.searchKeyword(`withdrawnsentinel${column}`)).toEqual([]);
+    }
+    expect(chunks.every(c => c.embedded_at !== null)).toBe(true);
+    const after = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!;
+    expect(after.revision).toBe(historical.revision);
+    expect(after.page.compiled_truth).toBe(historical.page.compiled_truth);
+    expect(after.page.timeline).toBe(historical.page.timeline);
+    expect(after.page.text_projection_revision).toBe(after.revision);
+  });
+
   test('quarantined and embed_skip pages stay chunkless — the safety net does not touch them', async () => {
     await engine.putPage('junk/quarantined', {
       type: 'note',
@@ -266,6 +307,42 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
     expect(chunks[0].chunk_text).toBe('concurrently-written chunk');
   });
 
+  test('late chunkless healing preserves a projection completed after its guarded capture', async () => {
+    const slug = 'stub/late-heal';
+    await engine.putPage(slug, { type: 'note', title: 'Late heal', compiled_truth: 'First sentence. Second sentence.' });
+    let injected = false;
+    let current: Awaited<ReturnType<BrainEngine['getChunks']>> = [];
+    const raced = new Proxy(engine, {
+      get(target, key) {
+        if (key === 'transaction') return async <T>(run: (tx: BrainEngine) => Promise<T>) => {
+          const result = await target.transaction(run);
+          if (!injected && (result as ProjectionSnapshot | null)?.snapshot?.page.slug === slug) {
+            injected = true;
+            await installFixtureChunks(engine, slug, ['First sentence.', 'Second sentence.'].map((text, index) => ({
+              chunk_index: index, chunk_text: text, chunk_source: 'compiled_truth',
+            })));
+            const newer = (await readProjectionSnapshot(engine, slug, 'default'))!;
+            const vector = new Float32Array(DIMS); vector[0] = 0.75;
+            expect(await installPageEmbeddings(engine, newer, newer.chunks.map(c => ({
+              chunk_index: c.chunk_index, chunk_source: c.chunk_source, chunk_text: c.chunk_text, embedding: vector,
+            })))).toBe(true);
+            current = await engine.getChunks(slug, { includeEmbedding: true });
+          }
+          return result;
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const result = await runEmbedCore(raced, { stale: true, quiet: true });
+
+    expect(injected).toBe(true);
+    expect(result.chunkless_pages_healed).toBe(0);
+    expect(result.failures).toBe(0);
+    expect(await engine.getChunks(slug, { includeEmbedding: true })).toEqual(current);
+  });
+
   test('one broken chunkless page does not abort the whole --stale run (per-page failure isolation)', async () => {
     // Review catch: healChunklessPages must try/catch per page. Before the
     // fix, an exception from getPage/getChunks/upsertChunks for ONE
@@ -284,11 +361,17 @@ describe('embed --stale chunkless-page safety net (end-to-end)', () => {
 
     const brokenEngine = new Proxy(engine, {
       get(target, prop, receiver) {
-        if (prop === 'readPageSnapshot') {
-          return async (slug: string, opts?: unknown) => {
-            if (slug === 'stub/broken') throw new Error('simulated page snapshot failure');
-            return (engine.readPageSnapshot as (s: string, o?: unknown) => unknown)(slug, opts);
-          };
+        if (prop === 'transaction') {
+          return <T>(run: (tx: BrainEngine) => Promise<T>) => engine.transaction(tx => run(new Proxy(tx, {
+            get(inner, key) {
+              if (key === 'readPageSnapshot') return async (slug: string, opts?: Parameters<BrainEngine['readPageSnapshot']>[1]) => {
+                if (slug === 'stub/broken') throw new Error('simulated page snapshot failure');
+                return inner.readPageSnapshot(slug, opts);
+              };
+              const value = Reflect.get(inner, key, inner);
+              return typeof value === 'function' ? value.bind(inner) : value;
+            },
+          })));
         }
         const value = Reflect.get(target, prop, receiver);
         return typeof value === 'function' ? value.bind(target) : value;

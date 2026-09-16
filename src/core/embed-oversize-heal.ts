@@ -179,16 +179,16 @@ export async function healOversizedPageChunks(
 ): Promise<{ changed: boolean; splitCount: number; chunks: Chunk[] }> {
   const sourceId = opts.sourceId ?? 'default';
   const getOpts = { sourceId };
-  const prepared = await readProjectionSnapshot(engine, slug, sourceId);
+  const prepared = await readProjectionSnapshot(engine, slug, sourceId, { maxChunkTokens: opts.maxTokens });
   if (!prepared) return { changed: false, splitCount: 0, chunks: [] };
   const existing = prepared.chunks;
-  const healed = healOversizedChunks(existing, opts.maxTokens ?? resolveMaxChunkTokens());
+  const healed = healOversizedChunks(existing, prepared.maxChunkTokens);
   if (!healed.changed) {
     return { changed: false, splitCount: 0, chunks: existing };
   }
   // The final compare and replacement share the same page guard.
   try {
-    await installPageProjection(engine, prepared.snapshot, healed.chunks, { seal: true, preserveEmbeddings: true });
+    await installPageProjection(engine, prepared, healed.chunks, { seal: true, preserveEmbeddings: true });
   } catch (error) {
     if (!(error instanceof PageRevisionConflictError)) throw error;
     return { changed: false, splitCount: 0, chunks: await engine.getChunks(slug, getOpts) };
