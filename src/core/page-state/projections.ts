@@ -48,9 +48,10 @@ async function indexingContext(engine: BrainEngine, snapshot: PageSnapshot, maxC
     searchEmbeddingColumn: config.find(row => row.key === 'search_embedding_column')?.value ?? null,
     embeddingColumnsJson: config.find(row => row.key === 'embedding_columns')?.value ?? null,
   });
-  const [projection] = await engine.executeRaw<{ chunker_version: number | null }>('SELECT chunker_version FROM pages WHERE id=$1', [snapshot.page.id]);
+  const [projection] = await engine.executeRaw<{ chunker_version: number | null; corpus_generation: string | null }>(
+    'SELECT chunker_version,corpus_generation FROM pages WHERE id=$1', [snapshot.page.id]);
   return { key: digest({ config, mode: snapshot.page.contextual_retrieval_mode, model, column,
-    maxChunkTokens, storedChunkerVersion: projection?.chunker_version ?? null,
+    maxChunkTokens, storedChunkerVersion: projection?.chunker_version ?? null, corpusGeneration: projection?.corpus_generation ?? null,
     chunkerVersion: MARKDOWN_CHUNKER_VERSION, ftsLanguage: getFtsLanguage() }), model, maxChunkTokens, column };
 }
 

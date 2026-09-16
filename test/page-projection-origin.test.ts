@@ -187,7 +187,7 @@ test('a column switch after context validation cannot redirect vectors into the 
                   const result = await inner.executeRaw(sql, params);
                   // The validated config rows and descriptor have already been
                   // read; simulate a config writer before the first vector write.
-                  if (!switched && sql === 'SELECT chunker_version FROM pages WHERE id=$1') {
+                  if (!switched && sql === 'SELECT chunker_version,corpus_generation FROM pages WHERE id=$1') {
                     switched = true;
                     await inner.setConfig('search_embedding_column', 'embedding_origin_next');
                   }

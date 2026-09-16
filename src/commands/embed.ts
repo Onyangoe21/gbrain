@@ -1099,21 +1099,15 @@ async function embedPage(
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
-  if (!await installPageEmbeddings(engine, prepared, updated,
-    failed === 0 && toEmbed.length === chunks.length ? currentEmbeddingSignature() ?? undefined : undefined)) return;
-  // v0.41.31: stamp provenance so a later model/dims swap is detectable as
-  // stale. embedPage is the per-slug path used by `gbrain embed <slug>` AND
-  // by `gbrain sync`'s post-import embed step (runEmbedCore({slugs})).
-  // Guard: only stamp when EVERY chunk was (re)embedded this pass. If some
-  // chunks were preserved from a prior embed (unknown/old provenance), the
-  // page is mixed — don't claim it's current. `embed --all` fully re-embeds
-  // such a page and then stamps it. #3037: a partial failure leaves failed
-  // chunks NULL, so don't stamp then either.
-  if (failed === 0 && toEmbed.length === chunks.length) {
-    // #3507: a fully re-embedded per_chunk_synopsis page landed at the
-    // title tier — keep the stamped mode honest.
-    await restampIfDemotedToTitleTier(engine, prepared.snapshot.page, slug, page.source_id);
-  }
+  const fullyEmbedded = failed === 0 && toEmbed.length === chunks.length;
+  // Vectors and their completion stamps share the page guard. A later
+  // contextual rebuild must not be relabeled by this attempt's restamp.
+  if (!await engine.transaction(async tx => {
+    if (!await installPageEmbeddings(tx, prepared, updated,
+      fullyEmbedded ? currentEmbeddingSignature() ?? undefined : undefined)) return false;
+    if (fullyEmbedded) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, page.source_id);
+    return true;
+  })) return;
   result.embedded += toEmbed.length - failed;
   if (failed > 0) {
     recordFailure(result, failed, slug, firstError);
@@ -1285,22 +1279,13 @@ async function embedAll(
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
-      if (!await observed(pacer, () => installPageEmbeddings(engine, prepared, updated, failed === 0 ? signature : undefined))) return;
-      // v0.41.31: stamp embedding provenance so a later model swap is
-      // detectable as stale. #3037: not on partial failure — failed chunks
-      // stay NULL under unknown provenance. D9: no stamp without a gateway
-      // (signature undefined) — a wrong stamp is worse than none.
-      if (failed === 0) {
-
-        // #3507: --all fully re-embeds; a per_chunk_synopsis page landed at
-        // the title tier — keep the stamped mode honest. #3037: gated on
-        // failed === 0 — a partially-failed page was NOT fully re-embedded,
-        // so restamping would make contextual_retrieval_mode lie again
-        // (the exact #3461 bug).
-        await observed(pacer, () =>
-          restampIfDemotedToTitleTier(engine, page, page.slug, pageSourceId),
-        );
-      }
+      // Partial failures retain their old context; a full completion stamps
+      // its vectors and title-tier convention in the same guarded transaction.
+      if (!await observed(pacer, () => engine.transaction(async tx => {
+        if (!await installPageEmbeddings(tx, prepared, updated, failed === 0 ? signature : undefined)) return false;
+        if (failed === 0) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, page.slug, pageSourceId);
+        return true;
+      }))) return;
       result.embedded += toEmbed.length - failed;
       if (failed > 0) {
         recordFailure(result, failed, page.slug, firstError);
@@ -1947,26 +1932,17 @@ async function embedAllStale(
             embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
             token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
           }));
-          if (!await observed(pacer, () => installPageEmbeddings(engine, prepared, merged))) return;
-          // Stamp provenance from DB state, not this batch (#4825): the keyset
-          // drain has no page alignment, so a page straddling a batch boundary
-          // is never wholly in one batch — the batch that lands its last chunk
-          // stamps it. Preserved chunks of other provenance keep the page
-          // unstamped; #3037: failed chunks stay NULL, so skip the round trip.
-          if (stamp && failed === 0) {
-            await observed(pacer, () => stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp));
-          }
-          // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
-          // title tier — keep the stamped mode honest. Partially-stale pages
-          // stay stamped as-is (mixed provenance; reindex sweeps fix them).
-          // #3037: `failed === 0` is part of "fully re-embedded" — if the
-          // per-chunk isolation left some chunks NULL, restamping would make
-          // contextual_retrieval_mode lie again (the exact #3461 bug).
-          if (failed === 0 && stale.length === existing.length) {
-            await observed(pacer, () =>
-              restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
-            );
-          }
+          // The last batch stamps from complete DB provenance (#4825).
+          // Keep both stamps with vector installation so later contextual
+          // work cannot commit between installation and title-tier demotion.
+          if (!await observed(pacer, () => engine.transaction(async tx => {
+            if (!await installPageEmbeddings(tx, prepared, merged)) return false;
+            if (stamp && failed === 0) await stampIfPageProvenanceComplete(tx, slug, keySourceId, stamp);
+            if (failed === 0 && stale.length === existing.length) {
+              await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, keySourceId);
+            }
+            return true;
+          }))) return;
           result.embedded += stale.length - failed;
           if (failed > 0) {
             recordFailure(result, failed, slug, firstError);

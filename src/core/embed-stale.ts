@@ -314,11 +314,12 @@ export async function embedStalePages(
         embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
-      if (!await installPageEmbeddings(engine, prepared, merged,
-        opts.embeddingSignature && stale.length === existing.length ? opts.embeddingSignature : undefined)) continue;
-      if (stale.length === existing.length) {
-        await restampIfDemotedToTitleTier(engine, pageRow, slug, sourceId);
-      }
+      if (!await engine.transaction(async tx => {
+        if (!await installPageEmbeddings(tx, prepared, merged,
+          opts.embeddingSignature && stale.length === existing.length ? opts.embeddingSignature : undefined)) return false;
+        if (stale.length === existing.length) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, sourceId);
+        return true;
+      })) continue;
       result.embedded += stale.length;
       result.pagesProcessed += 1;
     } catch (e) {
@@ -486,23 +487,14 @@ export async function embedStaleForSource(
           embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
           token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
         }));
-        if (!await observed(pacer, () => installPageEmbeddings(engine, prepared, merged))) return;
-        // Stamp provenance from DB state, not this batch (#4825): the keyset
-        // drain has no page alignment, so a page straddling a batch boundary
-        // is never wholly in one batch — the batch that lands its last chunk
-        // stamps it. Preserved chunks of other provenance keep it unstamped.
-        if (stamp) {
-          await observed(pacer, () =>
-            stampIfPageProvenanceComplete(engine, slug, keySourceId, stamp),
-          );
-        }
-        // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
-        // title tier — keep the stamped mode honest (mixed pages stay as-is).
-        if (stale.length === existing.length) {
-          await observed(pacer, () =>
-            restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
-          );
-        }
+        // The keyset's last batch stamps complete DB provenance (#4825),
+        // with context demotion in the same transaction as its vector writes.
+        if (!await observed(pacer, () => engine.transaction(async tx => {
+          if (!await installPageEmbeddings(tx, prepared, merged)) return false;
+          if (stamp) await stampIfPageProvenanceComplete(tx, slug, keySourceId, stamp);
+          if (stale.length === existing.length) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, keySourceId);
+          return true;
+        }))) return;
         result.embedded += stale.length;
         result.pagesProcessed += 1;
       } catch (e: unknown) {
