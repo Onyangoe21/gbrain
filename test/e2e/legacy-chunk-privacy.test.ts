@@ -227,9 +227,10 @@ for (const kind of ['pglite', 'postgres'] as const) {
           const block = buildEmptyRetrievalBlock(meta.retrieval) ?? '';
           expect(block).toContain('safe_index_pending');
           expect(block).not.toContain('clean miss');
-          // Trusted local reads still see the legacy page and carry no stamp.
+          // Trusted local reads also withhold unsealed projections; the rebuild
+          // diagnostic is emitted only for remote callers.
           meta = {};
-          expect((await call(context(false), name, { query: QUERY, expand: false, limit: 5 }) as SearchResult[]).length).toBeGreaterThan(0);
+          expect(await call(context(false), name, { query: QUERY, expand: false, limit: 5 })).toEqual([]);
           expect(degradedStages()).not.toContain('safe_index_pending');
           // A scope holding only sealed pages is a genuine miss: the probe is source-scoped.
           meta = {};
