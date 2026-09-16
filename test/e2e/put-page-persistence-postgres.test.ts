@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hasDatabase } from './helpers.ts';
 import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
 import { withEnv } from '../helpers/with-env.ts';
 import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
@@ -27,6 +28,8 @@ const content = (body: string) => `---\ntitle: Example\ntype: note\n---\n\n${bod
 function test(name: string, run: () => Promise<void>) {
   bunTest(name, async () => {
     const fixtureDir = mkdtempSync(join(tmpdir(), 'gbrain-put-pg-'));
+    // Pin the fresh schema before initialization; embedding cases seed 1536-d vectors.
+    configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
     const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL!);
     engine = pg.engine;
     config.embedding_disabled = true;
