@@ -2380,8 +2380,10 @@ review-deferred, not fix-now). Grouped by component.
   complete lane timings plus provenance. Local unit/E2E use the same scheduler.
   The duplicate entity-card performance invocation was removed from unit shards.
   The ten-way unit matrix remains: the 12-way increase and test reclassification
-  below are still deferred. Measured post-change workflow results must accompany
-  the shipping report; the 4–5 minute target is not an observed result yet.
+  below are still deferred. Three matched warm-cache pairs measured median
+  required checks of 16m23s → 5m21s (67.3% shorter); one cold pair measured
+  12m57s → 5m42s (56.0% shorter). The 4–5 minute projection remains unmet.
+  **Completed:** v0.50.4.0 (2026-09-16).
 
 
 - [ ] **P1 — Test-infra pass Ships 2+3: remaining serial burn-down and E2E lane

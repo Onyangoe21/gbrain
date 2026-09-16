@@ -71,9 +71,12 @@ migration, ~3.1s each on a CI shard). Properties:
   change the hash. Keep the dependency list in `computeSnapshotSchemaHash`
   and the CI cache keys aligned when adding another schema helper.
 - **Concurrency-safe.** Each profile has its own lock with a PID/token owner
-  and host/process-namespace identity. Only a confirmed dead local owner can
-  be reclaimed. Live, foreign, or ownerless locks time
-  out without building; callers visibly fall back to cold initialization.
+  and host/process-namespace identity. Only a confirmed dead local owner using
+  the current retirement protocol can be reclaimed. Both normal release and
+  crash recovery retain a nonempty owner tombstone so a delayed observer cannot
+  remove the next builder's lock. Keep those records while builders may run.
+  Live, foreign, ownerless, or older-protocol locks time out without building;
+  callers visibly fall back to cold initialization.
   Temporary tar/version files are atomically renamed, with the version last.
 
 - **Never authoritative.** The loader (`tryLoadSnapshot` in
@@ -301,7 +304,7 @@ with both corpus sections unseeded. `scripts/update-coverage-baseline.ts
 (per-file detail limited to the baseline's `watchlist`); `--promote` flips
 `provisional: false` at graduation.
 
-**CI wiring.** The 14 PR lanes upload `coverage-*` artifacts; the advisory
+**CI wiring.** The 17 PR lanes upload `coverage-*` artifacts; the advisory
 `coverage-report` job downloads + merges (`COVERAGE_CORPUS=prCorpus`), renders
 `scripts/render-coverage-summary.ts` to the step summary (including the
 behavioral-vs-structural counts from `scripts/structural-suites.tsv`), and
