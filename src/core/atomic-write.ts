@@ -21,6 +21,8 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  fstatSync,
+  lstatSync,
   openSync,
   readFileSync,
   renameSync,
@@ -28,11 +30,15 @@ import {
   unlinkSync,
   writeSync,
 } from 'fs';
-import { randomBytes } from 'crypto';
-import { dirname } from 'path';
+import { randomBytes, randomUUID } from 'crypto';
+import { dirname, resolve } from 'path';
 import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
 
 export interface AtomicWriteOpts {
+  /** Preallocated by a durable recovery journal before any filesystem sink. */
+  stagingPath?: string;
+  /** Synchronous boundary after the staging file is flushed and closed. */
+  afterStagingFlush?: () => void;
   /** Required by journaled publication: real directory durability errors propagate. */
   durable?: boolean;
   /**
@@ -44,9 +50,25 @@ export interface AtomicWriteOpts {
   verify?: (onDisk: string) => void;
 }
 
+export function atomicStagingPath(filePath: string): string {
+  return `${resolve(filePath)}.tmp.${randomUUID()}`;
+}
+
+export function validateAtomicStagingPath(filePath: string, stagingPath: string): void {
+  const target = resolve(filePath);
+  const staged = resolve(stagingPath);
+  if (dirname(target) !== dirname(staged) || !staged.startsWith(`${target}.tmp.`)
+    || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(staged.slice(target.length + 5))) {
+    throw new Error('atomic-write: invalid journaled staging path');
+  }
+}
+
 export function atomicWriteFileSync(filePath: string, content: string | Uint8Array, opts?: AtomicWriteOpts): void {
   assertManagedFilesystemWrite(filePath);
-  const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+  if (opts?.stagingPath) validateAtomicStagingPath(filePath, opts.stagingPath);
+  const tmpPath = opts?.stagingPath ?? `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+  const buf = typeof content === 'string' ? Buffer.from(content, 'utf-8') : Buffer.from(content);
+  let created: ReturnType<typeof fstatSync> | undefined;
 
   // Preserve the target's mode across the rename (a fresh tmp file gets the
   // process umask, which can silently drop e.g. group-write bits).
@@ -60,11 +82,11 @@ export function atomicWriteFileSync(filePath: string, content: string | Uint8Arr
   try {
     const fd = openSync(tmpPath, 'wx', mode ?? 0o644);
     try {
+      created = fstatSync(fd);
       // Loop until every byte lands: writeSync may legally return a short
       // count under disk pressure/quotas, and a silent short write that
       // truncates AFTER valid frontmatter would pass a frontmatter-only
       // verifier and atomically install truncated content.
-      const buf = typeof content === 'string' ? Buffer.from(content, 'utf-8') : Buffer.from(content);
       let off = 0;
       while (off < buf.length) {
         const n = writeSync(fd, buf, off, buf.length - off);
@@ -76,6 +98,7 @@ export function atomicWriteFileSync(filePath: string, content: string | Uint8Arr
     } finally {
       closeSync(fd);
     }
+    opts?.afterStagingFlush?.();
     // open(2)'s mode argument is masked by the process umask (0664 & ~022 →
     // 0644), so an explicit chmod is required to actually PRESERVE the
     // target's mode across the rename — the pre-wave in-place write kept the
@@ -97,7 +120,14 @@ export function atomicWriteFileSync(filePath: string, content: string | Uint8Arr
     }
   } catch (err) {
     try {
-      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+      // A failed exclusive create owns nothing. A callback or another process
+      // may also have replaced/changed our stage; never remove those bytes.
+      const current = created ? lstatSync(tmpPath) : undefined;
+      if (created && current?.isFile() && current.dev === created.dev && current.ino === created.ino
+        && current.birthtimeMs === created.birthtimeMs && current.size <= buf.length) {
+        const attempted = readFileSync(tmpPath);
+        if (attempted.equals(buf.subarray(0, attempted.length))) unlinkSync(tmpPath);
+      }
     } catch {
       /* best-effort cleanup */
     }

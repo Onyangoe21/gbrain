@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
+import { assertRecoveryStagingAbsent } from './staging.ts';
 import { OperationError } from '../ops/contract.ts';
 import { digest, jsonBytes, requireUuid } from './digest.ts';
 import { authorizeWrite } from './authority.ts';
@@ -140,6 +141,7 @@ export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseM
       WHERE r.state='queued' AND (r.worktree_id IS NULL OR (w.owner_host_id=$1::uuid AND w.state='active'))
       AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($2::text[]))
       AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
+      AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
       AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier
         WHERE COALESCE(earlier.worktree_id::text,'db:'||earlier.source_incarnation::text)
               =COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)
@@ -221,8 +223,9 @@ export async function clearResolvedRecovery(engine: BrainEngine, id: string): Pr
     await lockCounters(tx, keys);
     const [locked] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [id]);
     if (!locked?.recovery || !isTerminal(locked)) return;
+    assertRecoveryStagingAbsent(locked.recovery);
     for (const key of keys) await tx.executeRaw('UPDATE persistence_counters SET recovery_bytes=recovery_bytes-$2 WHERE key=$1', [key, Number(locked.recovery_bytes)]);
-    await tx.executeRaw('UPDATE persistence_requests SET recovery=NULL,recovery_bytes=0 WHERE id=$1::uuid', [id]);
+    await tx.executeRaw('UPDATE persistence_requests SET recovery=NULL,recovery_bytes=0,blocked_reason=NULL WHERE id=$1::uuid', [id]);
   });
 }
 export async function markRecovering(engine: SqlEngine, row: WriteRequest, reason: string, failure?: {code:string;message:string}): Promise<void> {

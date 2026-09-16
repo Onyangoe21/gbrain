@@ -1813,6 +1813,8 @@ CREATE TABLE IF NOT EXISTS persistence_requests (
   );
 CREATE INDEX IF NOT EXISTS persistence_requests_pending ON persistence_requests(worktree_id,sequence)
     WHERE state IN ('queued','running','recovering');
+CREATE INDEX IF NOT EXISTS persistence_requests_recovery
+  ON persistence_requests(worktree_id,sequence) WHERE recovery IS NOT NULL;
 CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC);
 CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,

@@ -3,7 +3,7 @@ import { realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { OperationContext } from '../ops/contract.ts';
 import { OperationError } from '../ops/contract.ts';
-import { enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam, validatePageSlug } from '../ops/context.ts';
+import { enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam, requireWritablePage, validatePageSlug } from '../ops/context.ts';
 import { defaultSlug, detectBinaryNullByte, explicitCaptureType, mergeCaptureFrontmatter, normalizeForHash } from '../capture-content.ts';
 import { computeContentHash } from '../ingestion/types.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
@@ -13,6 +13,7 @@ import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocal
 import { claimWorktree, getWorktreeBinding } from './ownership.ts';
 import { parseMutationPrecondition } from './preconditions.ts';
 import type { Principal } from './model.ts';
+import { normalizeSubagentPageInput } from './page-input.ts';
 
 export async function requestPrincipalForContext(ctx: OperationContext): Promise<Principal> {
   if (ctx.auth?.principal) return { ...ctx.auth.principal };
@@ -60,6 +61,7 @@ export async function submitPageMutation(ctx: OperationContext,
   const intent = ['takes_add','takes_update','takes_supersede','takes_resolve'].includes(input.operation)
     ? await (await import('./takes-prepare.ts')).normalizeTakesIntent(ctx,p) : { ...p };
   delete intent.request_id;
+  if (input.operation === 'put_page') await normalizeSubagentPageInput(ctx, intent);
   if (input.operation === 'capture') {
     if (typeof p.content !== 'string' || !normalizeForHash(p.content) || detectBinaryNullByte(Buffer.from(p.content)) !== -1) {
       throw new OperationError('invalid_params', 'Capture requires nonempty text without binary NUL bytes.');
@@ -82,6 +84,9 @@ export async function submitPageMutation(ctx: OperationContext,
   validatePageSlug(slug);
   enforceClientSlugFence(ctx, slug, input.operation);
   enforceSubagentSlugFence(ctx, slug, input.operation);
+  // Preserve same-source diagnostics for new timeline writes without making
+  // terminal replay depend on a page that may have since been purged.
+  if (input.operation === 'add_timeline_entry') await requireWritablePage({ ...ctx, sourceId }, slug, input.operation, 'page');
   intent.slug = slug;
   if (ctx.remote !== false) Object.assign(intent, { source_kind: `mcp:${input.operation}`, source_uri: null, ingested_via: `mcp:${input.operation}` });
   const authority = await submissionAuthority(ctx, input.operation, sourceId, source.incarnation, slug);

@@ -66,6 +66,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import { getFtsLanguage, applyFtsLanguagePolicy } from './fts-language.ts';
+import { splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
 import { SAFE_FENCE_CHUNKER_VERSION, bodyWriteChunkVersion, chunkWriteInvalidation, currentTextProjectionFilter, requiresSafeChunks, safeChunksFilter } from './search/safe-chunks.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
@@ -987,8 +988,15 @@ export class PostgresEngine implements BrainEngine {
   ): Promise<{ migrated: number }> {
     const sql = this.sql;
     // UPDATE preserves every other column (embedding, valid_*, kind,
-    // status, notability, confidence, source_session, ...). Idempotent
-    // by virtue of the WHERE clause matching nothing on re-run.
+    // status, notability, confidence, source_session, ...) except
+    // row_num, which is offset past canonical's current MAX(row_num)
+    // (#4558): canonical already owns fence rows 1..N, so carrying the
+    // phantom's row_num across collides on the partial UNIQUE
+    // idx_facts_fence_key. Same seed rule fence-write.ts uses for that
+    // index. MAX counts expired rows too (the index only excludes NULL);
+    // NULL + M stays NULL (legacy-guard semantics intact). extract_facts
+    // hasRowNumDrift re-harmonises the numbering against the disk fence.
+    // Idempotent by virtue of the WHERE clause matching nothing on re-run.
     //
     // We scope to `expired_at IS NULL` so the migration touches only
     // active facts. Forgotten / superseded rows that already carry an
@@ -998,7 +1006,13 @@ export class PostgresEngine implements BrainEngine {
     const result = await sql`
       UPDATE facts
       SET entity_slug = ${canonicalSlug},
-          source_markdown_slug = ${canonicalSlug}
+          source_markdown_slug = ${canonicalSlug},
+          row_num = facts.row_num + COALESCE((
+            SELECT MAX(f2.row_num) FROM facts f2
+            WHERE f2.source_id = ${sourceId}
+              AND f2.source_markdown_slug = ${canonicalSlug}
+              AND f2.row_num IS NOT NULL
+          ), 0)
       WHERE source_id = ${sourceId}
         AND source_markdown_slug = ${phantomSlug}
         AND expired_at IS NULL
@@ -2611,14 +2625,9 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async invalidateStaleSignatureEmbeddings(opts: { signature: string; sourceId?: string; includeNullSignature?: boolean }): Promise<number> {
-    // NULL embeddings whose page signature is set AND differs from current.
-    // GRANDFATHER: NULL signature untouched — UNLESS includeNullSignature
-    // (#3391): provider migrations must not leave pre-stamp pages in the old
-    // embedding space. Feeds the NULL-embedding cursor so listStaleChunks
-    // stays unchanged. RETURNING → row count. S2: keyed on the registry-
-    // ACTIVE column (loud resolver failure — destructive writes never guess).
     const colId = await this.activeEmbeddingColId();
-    const params: unknown[] = [opts.signature];
+    const { model, dims } = splitEmbeddingSignature(opts.signature);
+    const params: unknown[] = [opts.signature, model, dims];
     let srcClause = '';
     if (opts.sourceId !== undefined) {
       params.push(opts.sourceId);
@@ -2634,6 +2643,7 @@ export class PostgresEngine implements BrainEngine {
          FROM pages p
         WHERE cc.page_id = p.id
           AND cc.${colId} IS NOT NULL
+          AND NOT ${currentSpaceChunkPredicate(colId, 2, 3)}
           AND ${sigClause}${srcClause}
         RETURNING cc.page_id`,
       params as Parameters<typeof this.sql.unsafe>[1],
@@ -5415,7 +5425,7 @@ export class PostgresEngine implements BrainEngine {
 
   async getCalleesOf(
     qualifiedName: string,
-    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean },
   ): Promise<import('./types.ts').CodeEdgeResult[]> {
     return codeEdgesImpl.getCalleesOf(this.codeEdgesDeps, qualifiedName, opts);
   }

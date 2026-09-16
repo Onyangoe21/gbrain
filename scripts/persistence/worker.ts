@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { admitWrite, claimNextWrite, getWriteRequest, getWriteRequestById } from '../../src/core/persistence/journal.ts';
+import { admitWrite, claimNextWrite, getWriteRequest, getWriteRequestById, receiptFor } from '../../src/core/persistence/journal.ts';
 import { publishMutation, recoverPublication } from '../../src/core/persistence/coordinator.ts';
 import { PersistenceConsumer } from '../../src/core/persistence/consumer.ts';
 import { admission, assertCommittedSnapshot, assertConservation, distribution, fixtures, initializeFixtures,
@@ -15,6 +15,17 @@ const [mode, configPath, argument, extra] = process.argv.slice(2);
 const config: HarnessConfig = JSON.parse(readFileSync(configPath, 'utf8'));
 const emit = (event: Record<string, unknown>) => process.stdout.write(`${JSON.stringify(event)}\n`);
 const hold = () => { setInterval(() => {}, 1000); return new Promise<never>(() => {}); };
+function synchronousCrashBoundary(event: Record<string, unknown>): never {
+  const bytes = Buffer.from(`${JSON.stringify(event)}\n`);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = writeSync(1, bytes, offset, bytes.length - offset);
+    assert(written > 0); offset += written;
+  }
+  // No Promise/microtask return: the atomic utility cannot advance to rename.
+  const blocked = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) Atomics.wait(blocked, 0, 0);
+}
 
 async function main() {
 if (mode === 'initialize') {
@@ -36,8 +47,17 @@ if (mode === 'initialize') {
   const stop = async () => { emit({ event: 'boundary', boundary: argument, rowId: row.id, requestId: row.request_id }); await hold(); };
   if (argument === 'admitted') await stop();
   const claimed = await claimNextWrite(engine, config.hostId); assert(claimed);
-  await publishMutation(engine, claimed, prepared(claimed, sources, null, true), config.hostId,
-    { boundary: async boundary => { if (boundary === argument) await stop(); } });
+  const committed = await publishMutation(engine, claimed, prepared(claimed, sources, null, true), config.hostId,
+    { boundary: async boundary => { if (boundary === argument) await stop(); },
+      stagingFlushed: () => {
+        if (argument === 'staging_flushed') synchronousCrashBoundary({ event: 'boundary', boundary: argument, rowId: row.id, requestId: row.request_id });
+      } });
+  if (argument === 'after_response') {
+    assert.equal(committed.state, 'committed');
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch() { return Response.json(receiptFor(committed)); } });
+    emit({ event: 'response_ready', boundary: argument, requestId: row.request_id, url: server.url.toString() });
+    await hold(); // The parent reads and validates the actual HTTP body before SIGKILL.
+  }
   throw new Error(`Boundary ${argument} was not reached`);
 } else if (mode === 'recover') {
   const engine = await openEngine(config); const sources = await fixtures(engine, config);
@@ -47,10 +67,28 @@ if (mode === 'initialize') {
     const initialState = row.state; const path = join(sources[0].root, 'crash.md');
     const initialFile = readFileSync(path, 'utf8');
     await assertConservation(engine);
-    if (argument === 'after_commit') { await assertCommittedSnapshot(engine, row); assert.equal(initialFile, 'replacement'); }
+    const committedBoundary = argument === 'after_commit' || argument === 'after_response';
+    const staged = row.recovery?.staging?.publication;
+    if (argument === 'staging_flushed') {
+      assert(staged, 'flushed file must be named in the durable recovery record');
+      assert.equal(readFileSync(staged.path, 'utf8'), 'replacement');
+      assert.equal(initialFile, 'original', 'synchronous flush boundary must precede rename');
+      const reserved = Number(row.recovery_bytes);
+      // A third-party edit after the actual SIGKILL must never be mistaken
+      // for owned staging, even when it has exactly the attempted byte size.
+      writeFileSync(staged.path, 'unexpected!');
+      row = await recoverPublication(engine, row.id, config.hostId);
+      assert.equal(row.state, 'recovering'); assert.equal(row.blocked_reason, 'unexpected_staging_bytes');
+      assert.equal(readFileSync(staged.path, 'utf8'), 'unexpected!');
+      assert.equal(Number(row.recovery_bytes), reserved); assert(reserved > 0);
+      assert.equal(readFileSync(path, 'utf8'), 'original'); await assertConservation(engine);
+      writeFileSync(staged.path, 'replacement'); // Explicit fixture repair; production never guesses these bytes.
+    }
+    if (committedBoundary) { await assertCommittedSnapshot(engine, row); assert.equal(initialFile, 'replacement'); }
     else assert.equal(await engine.readPageSnapshot('crash', { sourceId: sources[0].id }), null, 'uncommitted canonical changes must roll back');
     if (row.recovery) row = await recoverPublication(engine, row.id, config.hostId);
-    if (argument !== 'after_commit') {
+    if (staged) assert.equal(existsSync(staged.path), false, 'recovery must remove the recorded stage before releasing quota');
+    if (!committedBoundary) {
       assert.equal(row.state, 'queued'); assert.equal(readFileSync(path, 'utf8'), 'original');
       const retry = await claimNextWrite(engine, config.hostId); assert(retry); assert.equal(retry.id, row.id);
       row = await publishMutation(engine, retry, prepared(retry, sources, null, true), config.hostId);
@@ -59,8 +97,11 @@ if (mode === 'initialize') {
     const replay = await admitWrite(engine, admission(config, sources[0], 'crash', 'replacement', 0, { requestId: extra }));
     assert.equal(replay.id, row.id); assert.deepEqual(replay.outcome, row.outcome);
     assert.equal((await getWriteRequestById(engine, row.id))!.recovery, null); await assertConservation(engine);
+    assert.deepEqual(readdirSync(sources[0].root).filter(name => name.includes('.tmp.')), [], 'no unaccounted temporary siblings remain');
     emit({ event: 'done', result: { boundary: argument, initial_state: initialState, initial_file: initialFile,
-      retained_request: true, terminal_state: row.state, replay_preserved: true, counters_conserved: true } });
+      retained_request: true, terminal_state: row.state, replay_preserved: true, counters_conserved: true,
+      staging_cleanup_verified: true, ...(argument === 'staging_flushed' ? {
+        flushed_before_rename_verified: true, unexpected_staging_preserved: true } : {}) } });
   } finally { await engine.disconnect(); }
 } else if (mode === 'owner') {
   const engine = await openEngine(config); const sources = await fixtures(engine, config);

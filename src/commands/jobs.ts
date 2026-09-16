@@ -2196,7 +2196,8 @@ export async function registerBuiltinHandlers(
     const autoEmbed = job.data.auto_embed_backfill !== false;
     let embedJobId: number | null = null;
     let embedSkipReason: string | null = null;
-    if (autoEmbed && sourceId && result.status !== 'up_to_date' && result.status !== 'dry_run') {
+    const { syncProducedEmbeddableContent } = await import('../core/sync-embed-backfill.ts');
+    if (autoEmbed && sourceId && result.status !== 'up_to_date' && result.status !== 'dry_run' && syncProducedEmbeddableContent(result)) {
       try {
         const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
         if (await isFederatedV2Enabled(engine)) {
@@ -2224,6 +2225,9 @@ export async function registerBuiltinHandlers(
       embedSkipReason = 'no_source_id';
     } else if (!autoEmbed) {
       embedSkipReason = 'auto_embed_disabled';
+    } else if (result.status !== 'up_to_date' && result.status !== 'dry_run') {
+      // #4786 x #2139: a sweep-only `synced` run wrote nothing to embed — a backfill here would only arm the cooldown.
+      embedSkipReason = 'no_new_content';
     }
 
     return { ...result, embed_job_id: embedJobId, embed_skip_reason: embedSkipReason };
@@ -2460,7 +2464,6 @@ export async function registerBuiltinHandlers(
       const r = await extractStaleFromDB(engine, {
         dryRun: !!job.data.dryRun,
         jsonMode: false,
-        includeFrontmatter: false,
         sourceIdFilter,
         catchUp: false,
       });
@@ -2786,9 +2789,21 @@ export async function registerBuiltinHandlers(
       yieldBetweenPhases: async () => { await new Promise<void>((r) => setImmediate(r)); },
     });
 
-    // Stamp last_global_at only on a non-failed run so a failed pass stays stale
-    // and re-dispatches next tick (self-healing retry).
-    if (report.status === 'ok' || report.status === 'clean' || report.status === 'partial') {
+    if ((report.status === 'ok' || report.status === 'clean' || report.status === 'partial')
+      && !report.phases.some(phase => {
+        if (phase.status === 'fail') return true;
+        if (phase.phase !== 'synthesize' && phase.phase !== 'patterns') return false;
+        if (phase.details.reason === 'insufficient_cycle_budget') return true;
+        if (phase.phase === 'patterns') {
+          return typeof phase.details.child_outcome === 'string' && phase.details.child_outcome !== 'completed';
+        }
+        const synthesis = phase.details.synthesis as { non_completed_jobs?: number } | undefined;
+        const triage = phase.details.triage as { deferred?: number } | undefined;
+        return (synthesis?.non_completed_jobs ?? 0) > 0
+          || (triage?.deferred ?? 0) > 0
+          || (Array.isArray(phase.details.budget_deferred_transcripts) && phase.details.budget_deferred_transcripts.length > 0);
+      })
+      && report.reason !== 'aborted' && report.reason !== 'lock_stolen') {
       try {
         await engine.setConfig(LAST_GLOBAL_AT_KEY, new Date().toISOString());
       } catch (e) {

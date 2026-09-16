@@ -30,6 +30,7 @@ import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import { normalizeOptionalParams, validateParams } from '../../../mcp/validate-params.ts';
 import { validateSourceId } from '../../utils.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
+import { putPageRejection } from './put-page-result.ts';
 
 /**
  * v0.15 brain-tool allow-list. Review carefully when extending. Op names
@@ -320,7 +321,10 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
         const params = normalizeOptionalParams(op, raw);
         const validationError = validateParams(op, params);
         if (validationError) throw new Error(`${toolName}: ${validationError}`);
-        return op.handler(opCtx, params);
+        const output = await op.handler(opCtx, params);
+        const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
+        if (rejection) throw new Error(rejection);
+        return output;
       },
     };
   });

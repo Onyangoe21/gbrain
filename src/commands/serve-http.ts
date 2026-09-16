@@ -28,7 +28,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import { mountConfidentialOAuth, mountOAuthConsent } from './serve-http-oauth.ts';
+import { mountConfidentialOAuth, mountOAuthConsent, withBearerScopeHint } from './serve-http-oauth.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, opAllowedForBoundClient } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
@@ -213,6 +213,57 @@ type HttpServerLifecycle = EventSubscriber & {
 };
 type SignalSource = EventSubscriber;
 type CleanupRegistrar = typeof registerCleanup;
+/** How long `server.close()` may hold shutdown before the lifecycle gives up on it. */
+const CLOSE_TIMEOUT_MS = 5_000;
+
+/** Live-connection bookkeeping for `waitForHttpServerLifecycle`'s teardown. */
+export interface SocketTracker {
+  /** Sockets currently tracked (live or not yet observed as gone). */
+  size(): number;
+  /** Sever every tracked connection so `server.close()` cannot block on them. */
+  destroyAll(): void;
+}
+
+/**
+ * Track accepted connections so shutdown can sever them.
+ *
+ * `close()` stops the listener and then waits for every open connection to
+ * drain. One attached admin-SSE EventSource — or any keep-alive socket —
+ * holds it open forever, so shutdown has to sever them itself. Bun 1.3.x
+ * ships `closeAllConnections()`/`closeIdleConnections()` as no-op stubs, so
+ * tracking is the only portable teardown.
+ */
+export function trackServerSockets(server: Pick<HttpServerLifecycle, 'on'>): SocketTracker {
+  // Hold sockets WEAKLY. Bun's node:http never emits 'close' (nor 'end'/'error')
+  // on server-side sockets and keeps reporting them open after the peer is
+  // gone, so no event or state flag can evict a dead connection — a strong Set
+  // grew by one socket per request forever (each health probe is a fresh TCP
+  // connection). A dead socket does become unreachable once the runtime drops
+  // it, so a WeakRef lets it go; a live one stays reachable from the server
+  // and keeps being tracked. Node does emit 'close' — honor it so the
+  // bookkeeping stays exact there, and prune collected refs as we go so the
+  // ref set itself stays bounded by live connections.
+  const refs = new Set<WeakRef<TrackedSocket>>();
+  const live = (): TrackedSocket[] => {
+    const out: TrackedSocket[] = [];
+    for (const ref of refs) {
+      const socket = ref.deref();
+      if (socket === undefined) refs.delete(ref);
+      else out.push(socket);
+    }
+    return out;
+  };
+  server.on('connection', (socket: TrackedSocket) => {
+    live();
+    const ref = new WeakRef(socket);
+    refs.add(ref);
+    socket.once('close', () => refs.delete(ref));
+  });
+  return {
+    size: () => live().length,
+    destroyAll: () => { for (const socket of live()) socket.destroy(); },
+  };
+}
 
 /**
  * Keep the HTTP server strongly referenced and make the daemon lifetime
@@ -225,21 +276,17 @@ export function waitForHttpServerLifecycle(
   options: {
     signals?: SignalSource;
     register?: CleanupRegistrar;
+    /** Upper bound on how long `close()` may keep shutdown waiting. */
+    closeTimeoutMs?: number;
+    log?: (msg: string) => void;
   } = {},
 ): Promise<void> {
   const signals = options.signals ?? process;
   const register = options.register ?? registerCleanup;
+  const closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
+  const log = options.log ?? ((msg: string) => console.error(msg));
 
-  // `close()` stops the listener and then waits for every open connection to
-  // drain. One attached admin-SSE EventSource — or any keep-alive socket —
-  // holds it open forever, so shutdown has to sever them itself. Bun 1.3.x
-  // ships `closeAllConnections()`/`closeIdleConnections()` as no-op stubs, so
-  // tracking is the only portable teardown.
-  const sockets = new Set<TrackedSocket>();
-  server.on('connection', (socket: TrackedSocket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
+  const sockets = trackServerSockets(server);
 
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -252,13 +299,33 @@ export function waitForHttpServerLifecycle(
           closeResolve();
           return;
         }
+        // Backstop for what the tracker cannot reach: sockets are held weakly,
+        // so an idle keep-alive wrapper the runtime already collected leaves a
+        // native handle that close() still waits on. Bound the wait instead
+        // of hanging the daemon; process exit releases the handle.
+        // The process still exits: the serve lane's own finishHttpServe
+        // (serve.ts) disconnects the engine and calls process.exit once the
+        // lifecycle resolves, so a leaked handle cannot outlive teardown.
+        let timedOut = false;
+        const deadline = setTimeout(() => {
+          timedOut = true;
+          log(`GBrain HTTP server: close() still waiting after ${closeTimeoutMs}ms — shutting down anyway`);
+          closeResolve();
+        }, closeTimeoutMs);
+        deadline.unref?.();
         server.close((error?: Error) => {
+          clearTimeout(deadline);
+          if (timedOut) {
+            // Settled already — a late failure must be seen, not swallowed.
+            if (error) log(`GBrain HTTP server: close() failed after the deadline: ${error.message}`);
+            return;
+          }
           if (error) closeReject(error);
           else closeResolve();
         });
         // After close() so the listener stops accepting first, then in-flight
         // connections are severed rather than waited on.
-        for (const socket of sockets) socket.destroy();
+        sockets.destroyAll();
       });
       return closePromise;
     };
@@ -278,7 +345,9 @@ export function waitForHttpServerLifecycle(
     const onClose = () => finish();
     const onError = (error: Error) => finish(error);
     const onSigint = () => {
-      void closeServer().catch(onError);
+      // A close() that reports done — or that the deadline gave up on — ends
+      // the lifecycle even when the server never emits 'close'.
+      void closeServer().then(() => finish(), onError);
     };
 
     server.once('close', onClose);
@@ -1148,11 +1217,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   const authRouterOptions: any = {
     provider: oauthProvider,
     issuerUrl,
-    // v0.28: scopesSupported sourced from ALLOWED_SCOPES_LIST so MCP clients
-    // (Claude Desktop, ChatGPT, Perplexity) can discover sources_admin and
-    // users_admin via /.well-known/oauth-authorization-server. The legacy
-    // ['read','write','admin'] list left those new scopes invisible.
-    scopesSupported: [...ALLOWED_SCOPES_LIST],
+    scopesSupported: ALLOWED_SCOPES_LIST.filter(scope => scope !== 'agent'),
     resourceName: 'GBrain MCP Server',
     // Advertise /mcp as the protected resource (see mcpResourceUrl above).
     resourceServerUrl: mcpResourceUrl,
@@ -2240,7 +2305,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post('/mcp', withBearerScopeHint(
+    requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), ['read'],
+  ), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 

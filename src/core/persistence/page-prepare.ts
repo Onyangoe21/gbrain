@@ -10,7 +10,7 @@ import { parseMarkdown, serializePageToMarkdown, resolveSourceLocalFilePath } fr
 import { OperationError } from '../ops/contract.ts';
 import { assertPageRevision, type PageSnapshot } from '../page-state/types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
-import { recordedPathFromFileUri } from '../write-through.ts';
+import { recordedPathFromFileUri, scannerSourcePath } from '../write-through.ts';
 import { engineMutationPrecondition, parseMutationPrecondition } from './preconditions.ts';
 import { authorizeWrite } from './authority.ts';
 import { digest, sha256 } from './digest.ts';
@@ -198,11 +198,15 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
   const advisories = noop || targetDeleted ? pageNoopAdvisories(row) : !ordinaryPage ? remoteLinkHint(row) : await preparePageAdvisories(engine,row,ready.parsedPage);
   const links = !noop && !targetDeleted && ordinaryPage && (row.authority.autoLinkTrusted ?? !row.authority.remote) && await isAutoLinkEnabled(engine)
     ? await prepareAutomaticLinks(engine,row.slug,ready.parsedPage,row.source_id) : undefined;
-  return { observedRevision, noop, additionalPageKeys:links?.pageKeys,
-    file: await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered), apply: async tx => {
+  const file = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered);
+  const sourcePath = file ? scannerSourcePath(file.root, file.path) : undefined;
+  return { observedRevision, noop, additionalPageKeys:links?.pageKeys, file, apply: async tx => {
     let autoLinks: Awaited<ReturnType<NonNullable<typeof links>['apply']>> | undefined;
     if (!noop) {
       await ready.apply(tx);
+      // Mandatory metadata shares publication rollback; exact no-ops never heal it.
+      if (sourcePath && !snapshot?.page.source_path) await tx.executeRaw(`UPDATE pages SET source_path = $1
+        WHERE source_id=$2 AND slug=$3 AND source_path IS NULL`, [sourcePath, row.source_id, row.slug]);
       if (provenance) await tx.executeRaw(`UPDATE pages SET source_kind=$3,ingested_via=$4,ingested_at=$5::timestamptz
         WHERE source_id=$1 AND slug=$2`, [row.source_id, row.slug, provenance.source_kind, provenance.ingested_via, provenance.ingested_at]);
       if (row.operation === 'restore_page') await tx.restorePage(row.slug, source);

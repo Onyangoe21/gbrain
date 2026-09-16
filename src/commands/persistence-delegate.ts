@@ -5,14 +5,20 @@ import { OperationError } from '../core/ops/contract.ts';
 import { finishCliTeardown, setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
 import { PersistenceIpcTransportError } from '../core/persistence/ipc.ts';
+import { RemoteMcpError } from '../core/mcp-client.ts';
 
 export async function reportPersistenceCliError(error: unknown, json = false,
   out: (payload: string) => Promise<void> = writeStdoutFinal): Promise<boolean> {
-  if (!(error instanceof OperationError || error instanceof PersistenceIpcTransportError)) return false;
+  if (!(error instanceof OperationError || error instanceof PersistenceIpcTransportError
+    || error instanceof RemoteMcpError && (error.detail?.request_id || error.detail?.write_request))) return false;
   const detail = error.toJSON();
   if (json) await out(JSON.stringify(detail, null, 2) + '\n');
-  console.error(error instanceof OperationError ? `Error [${error.code}]: ${error.message}` : error.message);
+  console.error(error instanceof OperationError || error instanceof RemoteMcpError
+    ? `Error [${detail.error}]: ${detail.message}` : error.message);
   if (detail.suggestion) console.error(`Fix: ${detail.suggestion}`);
+  if (!json && error instanceof RemoteMcpError) {
+    console.error(`Request: ${error.detail?.request_id ?? error.detail?.write_request?.request_id}`);
+  }
   setCliExitVerdict(1);
   return true;
 }

@@ -1,3 +1,21 @@
+const openedDatastores = new WeakMap<object, string | undefined>();
+const reopenListeners = new WeakMap<object, Set<(sameDatastore: boolean) => void>>();
+
+/** Resident owners resume only after a successful open, never when close merely times out. */
+export function registerPgliteReopen(engine: object, listener: (sameDatastore: boolean) => void): () => void {
+  let listeners = reopenListeners.get(engine);
+  if (!listeners) { listeners = new Set(); reopenListeners.set(engine, listeners); }
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+export function notifyPgliteOpened(engine: object, databasePath: string | undefined): void {
+  const sameDatastore = !!databasePath && openedDatastores.get(engine) === databasePath;
+  openedDatastores.set(engine, databasePath);
+  // A listener may unregister itself and register its replacement while resuming.
+  for (const listener of [...reopenListeners.get(engine) ?? []]) listener(sameDatastore);
+}
+
 /** Track datastore work so close never overlaps an admitted statement/transaction. */
 export function trackPgliteDatabase<T extends object>(database: T): {
   database: T;

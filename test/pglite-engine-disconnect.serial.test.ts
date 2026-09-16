@@ -9,6 +9,7 @@ import { acquireLock, releaseLock, PgliteBusyError, type LockHandle } from '../s
 import { PgliteClosingError } from '../src/core/pglite-lifecycle.ts';
 import { pgliteCloseTimeoutMs } from '../src/core/background-work.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { assertPersistenceAccepting, disposePersistenceConsumer, startPersistenceConsumer } from '../src/core/persistence/service.ts';
 
 const roots: string[] = [], engines: PGLiteEngine[] = [];
 function deferred<T = void>() { let resolve!: (value: T | PromiseLike<T>) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
@@ -23,7 +24,7 @@ async function waitUntil(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 afterEach(async () => {
-  for (const engine of engines.splice(0)) { try { await engine.disconnect(); } catch { /* poisoned fixtures confirm actual close in their own finally */ } }
+  for (const engine of engines.splice(0)) { await disposePersistenceConsumer(engine); try { await engine.disconnect(); } catch { /* poisoned fixtures confirm actual close in their own finally */ } }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -88,6 +89,7 @@ describe('PGLite datastore lifecycle', () => {
     await withEnv({ GBRAIN_PGLITE_CLOSE_TIMEOUT_MS: '1000' }, async () => {
       const { engine, dataDir } = make();
       await engine.connect({ database_path: dataDir });
+      startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir });
       const lock = (engine as unknown as { _lock: LockHandle })._lock;
       const close = engine.db.close, gate = deferred();
       engine.db.close = async () => { await gate.promise; await close(); };
@@ -96,20 +98,26 @@ describe('PGLite datastore lifecycle', () => {
         await expect(engine.disconnect()).rejects.toBeInstanceOf(PgliteClosingError);
         expect(performance.now() - started).toBeLessThan(4000);
         expect(lock.acquired).toBe(true);
+        expect(() => assertPersistenceAccepting(engine)).toThrow('closing');
+        expect(() => startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir })).toThrow('closing');
         await expect(engine.reconnect()).rejects.toBeInstanceOf(PgliteClosingError);
         await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
       } finally { gate.resolve(); await waitUntil(() => !lock.acquired); }
       await engine.connect({ database_path: dataDir });
+      expect(() => assertPersistenceAccepting(engine)).not.toThrow();
     });
   }, 15000);
   test('a failed close poisons reconnect and never releases ownership', async () => {
     const { engine, dataDir } = make();
     await engine.connect({ database_path: dataDir });
+    startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir });
     const lock = (engine as unknown as { _lock: LockHandle })._lock, close = engine.db.close;
     engine.db.close = async () => { throw new Error('injected close failure'); };
     try {
       await expect(engine.disconnect()).rejects.toThrow('injected close failure');
       expect(lock.acquired).toBe(true);
+      expect(() => assertPersistenceAccepting(engine)).toThrow('closing');
+      expect(() => startPersistenceConsumer(engine, { engine: 'pglite', database_path: dataDir })).toThrow('closing');
       await expect(engine.connect({ database_path: dataDir })).rejects.toBeInstanceOf(PgliteClosingError);
       await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
     } finally {

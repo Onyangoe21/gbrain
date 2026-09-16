@@ -4,6 +4,7 @@ import type { JournalLimits } from './model.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 
 export const WRITER_NEXT_ACTIONS: Record<string, string> = {
+  unexpected_staging_bytes: 'Keep the worktree blocked and retain its staging files and recovery capacity. Compare the recorded staging size and hash, then reconcile unexpected bytes explicitly before retrying; never discard unverified staging files.',
   unexpected_file_bytes: 'Keep the worktree blocked. Compare current bytes with the recorded before/after fingerprints and resolve the local edit explicitly; never overwrite unexpected bytes.',
   commit_outcome_uncertain: 'Recover on the designated owner and inspect the durable receipt before retrying publication.',
   publication_failed: 'Allow conditional file restoration to finish; inspect the retained terminal failure before submitting a corrected write.',

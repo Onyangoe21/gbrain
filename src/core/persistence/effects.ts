@@ -23,6 +23,8 @@ import { guardEffectSource, recoverEffectPublication, reserveEffectRecovery } fr
 import { publishGitEffect } from './effect-git.ts';
 import { dispatchFactsBackstopEffect } from './effect-facts.ts';
 import type { EffectRecovery, PersistenceEffect } from './effect-model.ts';
+import { recoveryStagingFile } from './staging.ts';
+import { selectEffectRecoveries } from './effect-recovery-scan.ts';
 
 export interface EffectWorkerOptions {
   hostId: string;
@@ -77,7 +79,8 @@ async function mirrorPage(engine: BrainEngine, effect: PersistenceEffect, bindin
   const record: EffectRecovery = { version: 1, kind: 'withdrawal-mirror', path: file.path, root: file.root,
     beforeHash: file.expectedBeforeHash ?? null, afterHash: sha256(after), after: after.toString('base64'),
     mode: statSync(file.path).mode & 0o7777, ownerEpoch: String(binding!.owner_epoch), pageId: snapshot.page.id,
-    sourceIncarnation: snapshot.sourceIncarnation, slug: snapshot.page.slug, revision: snapshot.revision };
+    sourceIncarnation: snapshot.sourceIncarnation, slug: snapshot.page.slug, revision: snapshot.revision,
+    staging: { publication: recoveryStagingFile(file.path, after) } };
   await reserveEffectRecovery(engine, effect, record, Buffer.byteLength(JSON.stringify(record)) * 2 + 4096, opts.hostId);
   await recoverEffectPublication(engine, effect, opts.hostId, opts);
 }
@@ -110,7 +113,7 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
   const snapshot = await selectedPage(engine, effect);
   if (!snapshot || snapshot.page.deleted_at) { await finishPage(engine, effect, snapshot); return; }
   if (!effect.data.source_scan && (snapshot.revision !== effect.revision || snapshot.page.id !== effect.data.page_id)) {
-    await completeEffect(engine, effect, { embedding: 'superseded' }); return;
+    await completeEffect(engine, effect, { embedding: 'superseded', reason: 'revision_changed' }); return;
   }
   assertEmbeddingEnabled(config);
   if (!opts.embedding) validateEmbeddingCreds();
@@ -133,7 +136,10 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
       if (installed) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, snapshot.page.slug, effect.source_id);
       return installed;
     });
-    if (!installed && effect.data.source_scan) throw new OperationError('revision_conflict', 'The page changed while embedding.');
+    if (!installed) {
+      if (effect.data.source_scan) throw new OperationError('revision_conflict', 'The page changed while embedding.');
+      await completeEffect(engine, effect, { embedding: 'superseded', reason: 'revision_changed' }); return;
+    }
   }
   await finishPage(engine, effect, snapshot);
 }
@@ -153,8 +159,7 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
 /** Bounded, idempotent work. Recovery obtains kernel exclusion before a DB claim. */
 export async function runPersistenceEffects(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions): Promise<void> {
   const limit = Math.max(1, Math.min(opts.limit ?? 2, 20));
-  const recoveries = await engine.executeRaw<PersistenceEffect>(`SELECT e.* FROM persistence_effects e JOIN persistence_worktrees w ON w.id=e.worktree_id
-    WHERE e.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND e.next_attempt_at<=now() ORDER BY e.id LIMIT $2`, [opts.hostId, limit]);
+  const recoveries = await selectEffectRecoveries(engine, opts.hostId, limit);
   let attempted = 0;
   for (const recovery of recoveries) {
     if (opts.signal?.aborted) return;

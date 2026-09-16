@@ -21,8 +21,21 @@ The default gate executes, per engine:
 | Workload | Required result |
 | --- | --- |
 | 1,000 seeded schedules (seed 5105) | 100 executions of each of the ten cases below; every schedule checks exact journal counter conservation and no leftover claimable work |
-| Six actual SIGKILL boundaries | Acknowledged requests survive reopening; unfinished file effects recover; committed DB/file/receipt state stays committed; original request replay returns the same outcome |
+| Eight actual SIGKILL boundaries | Acknowledged requests survive reopening; unfinished file effects recover; committed DB/file/receipt state stays committed; original request replay returns the same outcome |
 | 10,000 logical writes | Four independent producer processes, four principals and four source roots; every request commits once; every canonical snapshot and file matches the receipt; zero pending requests or unresolved recovery records |
+
+The eight executed crash boundaries are `admitted`, `prepared`,
+`before_publication`, `staging_flushed`, `after_publication`, `before_commit`,
+`after_commit`, and `after_response`. The flushed boundary writes its event
+synchronously and blocks the child before rename. The response boundary serves
+a real fixture HTTP receipt; the parent fully reads and verifies it before
+SIGKILL. Recovery verifies that no recorded or unaccounted temporary sibling
+remains. Partial or unexpected staging bytes preserve quota and require explicit
+recovery; a committed receipt is never reversed to resolve them.
+
+Run just these process crashes with `--schedules=0 --operations=0`; its manifest
+correctly reports `full_gate: false`. Input hashes include the atomic writer,
+staging helper, recovery models, journal, coordinator and effect sinks.
 
 The ten schedule families are concurrent identical/changed-intent replay;
 competing creates and replacements using one revision; cancellation versus publication; rollback/lost response
@@ -35,7 +48,8 @@ hooks control transaction and filesystem boundaries. This is a bounded
 schedule sample, not exhaustive model checking.
 
 The crash cases kill a process after admission, durable prepare, immediately
-before and after file publication, before commit and after commit. The
+before publication, after staging flush/close, after rename, before commit,
+after commit, and after a delivered response. The
 PGLite case exercises the datastore owner's death. The Postgres case kills
 the client/owner process while the database server remains running. These
 are process-crash RPO=0 checks; they do not simulate power loss, storage

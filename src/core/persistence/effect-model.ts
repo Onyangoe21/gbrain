@@ -15,6 +15,7 @@ export interface EffectRecovery {
   sourceIncarnation: string;
   slug: string;
   revision: string;
+  staging?: import('./staging.ts').RecoveryStaging;
 }
 export interface PersistenceEffect {
   id: string | number;

@@ -1,5 +1,5 @@
 import { registerManagedFilesystemEngine } from './persistence/filesystem-guard.ts';
-import { trackPgliteDatabase, PgliteClosingError } from './pglite-lifecycle.ts';
+import { trackPgliteDatabase, PgliteClosingError, notifyPgliteOpened } from './pglite-lifecycle.ts';
 import { mutatePageTag } from './page-state/tags.ts';
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
 import { assertPageRevision } from './page-state/types.ts';
@@ -79,6 +79,7 @@ import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
 // connect() catch. No cycle: pglite-repair.ts imports nothing from this file.
 import { attemptWalRepairAndRetry, closeRepairEpisodeIfOpen, type WalRepairReceipt } from './pglite-repair.ts';
 import { getFtsLanguage } from './fts-language.ts';
+import { splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
@@ -762,6 +763,7 @@ export class PGLiteEngine implements BrainEngine {
         }
         throw error;
       }
+      notifyPgliteOpened(this, config.database_path);
     });
     this._connectPromise = opening;
     try { await opening; }
@@ -2015,13 +2017,21 @@ export class PGLiteEngine implements BrainEngine {
     sourceId: string,
   ): Promise<{ migrated: number }> {
     // Parity with PostgresEngine.migrateFactsToCanonical. UPDATE preserves
-    // every column except entity_slug + source_markdown_slug. Active rows
+    // every column except entity_slug + source_markdown_slug + row_num,
+    // which is offset past canonical's current MAX(row_num) (#4558; NULL
+    // stays NULL, expired rows count — see the Postgres twin). Active rows
     // only (expired_at IS NULL) so we don't disturb the supersession audit
     // trail.
     const { rows } = await this.db.query(
       `UPDATE facts
          SET entity_slug = $1,
-             source_markdown_slug = $1
+             source_markdown_slug = $1,
+             row_num = facts.row_num + COALESCE((
+               SELECT MAX(f2.row_num) FROM facts f2
+               WHERE f2.source_id = $2
+                 AND f2.source_markdown_slug = $1
+                 AND f2.row_num IS NOT NULL
+             ), 0)
        WHERE source_id = $2
          AND source_markdown_slug = $3
          AND expired_at IS NULL
@@ -3402,15 +3412,9 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async invalidateStaleSignatureEmbeddings(opts: { signature: string; sourceId?: string; includeNullSignature?: boolean }): Promise<number> {
-    // NULL out embeddings whose page signature is set AND differs from the
-    // current model signature. GRANDFATHER: NULL signature untouched —
-    // UNLESS includeNullSignature (#3391): provider migrations must not
-    // leave pre-stamp pages in the old embedding space. Feeds the existing
-    // NULL-embedding cursor so listStaleChunks stays unchanged. S2: keyed on
-    // the registry-ACTIVE column (loud resolver failure — destructive writes
-    // never guess).
     const colId = await this.activeEmbeddingColId();
-    const params: unknown[] = [opts.signature];
+    const { model, dims } = splitEmbeddingSignature(opts.signature);
+    const params: unknown[] = [opts.signature, model, dims];
     let srcClause = '';
     if (opts.sourceId !== undefined) {
       params.push(opts.sourceId);
@@ -3426,6 +3430,7 @@ export class PGLiteEngine implements BrainEngine {
          FROM pages p
         WHERE cc.page_id = p.id
           AND cc.${colId} IS NOT NULL
+          AND NOT ${currentSpaceChunkPredicate(colId, 2, 3)}
           AND ${sigClause}${srcClause}
         RETURNING cc.page_id`,
       params,
@@ -5951,7 +5956,7 @@ export class PGLiteEngine implements BrainEngine {
 
   async getCalleesOf(
     qualifiedName: string,
-    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean },
   ): Promise<import('./types.ts').CodeEdgeResult[]> {
     return codeEdgesImpl.getCalleesOf(this.codeEdgesDeps, qualifiedName, opts);
   }

@@ -14,6 +14,8 @@ export interface ValidationOptions {
   crashes?: boolean; databaseUrl?: string; manifest?: string;
 }
 interface Event { event: string; [key: string]: any; }
+export const CRASH_BOUNDARIES = ['admitted', 'prepared', 'before_publication', 'staging_flushed',
+  'after_publication', 'before_commit', 'after_commit', 'after_response'] as const;
 export function childEnvironment(home: string): Record<string, string> {
   // Preserve the runtime executable/search paths, never an operator's brain or provider configuration.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined &&
@@ -80,7 +82,10 @@ export async function runValidation(options: ValidationOptions) {
     async function phase(name: string): Promise<{ config: HarnessConfig; path: string }> {
       const root = join(scratch, name); mkdirSync(root);
       manifest.phase_inputs[name] = Object.fromEntries(['scripts/persistence/harness.ts', 'scripts/persistence/schedules.ts',
-        'scripts/persistence/worker.ts', 'scripts/persistence/failure-diagnostics.ts', 'src/core/persistence/coordinator.ts', 'src/core/persistence/consumer.ts',
+        'scripts/persistence/worker.ts', 'scripts/persistence/validate.ts', 'scripts/persistence/failure-diagnostics.ts',
+        'src/core/atomic-write.ts', 'src/core/persistence/staging.ts', 'src/core/persistence/model.ts',
+        'src/core/persistence/effect-recovery.ts', 'src/core/persistence/effect-model.ts', 'src/core/persistence/effects.ts',
+        'src/core/persistence/coordinator.ts', 'src/core/persistence/consumer.ts',
         'src/core/persistence/journal.ts', 'src/core/persistence/activation.ts', 'src/core/persistence/filesystem-guard.ts',
         'src/core/persistence/identity.ts', 'src/core/persistence/ownership.ts', 'src/core/pglite-engine.ts', 'src/core/postgres-engine.ts'].map(file =>
         [file, createHash('sha256').update(readFileSync(resolve(import.meta.dir, '../..', file))).digest('hex')]));
@@ -96,11 +101,21 @@ export async function runValidation(options: ValidationOptions) {
       const path = join(root, 'config.json'); writeFileSync(path, JSON.stringify(config), { mode: 0o600 }); return { config, path };
     }
     function start(path: string, role: string, ...args: string[]) { const child = spawnWorker(path, home, role, args); children.push(child); return child; }
-    if (options.crashes !== false) for (const boundary of ['admitted', 'prepared', 'before_publication', 'after_publication', 'before_commit', 'after_commit']) {
+    if (options.crashes !== false) for (const boundary of CRASH_BOUNDARIES) {
       const { path } = await phase(`crash-${boundary}`); const requestId = randomUUID();
-      const child = start(path, 'crash', boundary, requestId); const reached = await child.event('boundary');
-      assert.equal(reached.requestId, requestId); await child.kill();
-      const recovered = await start(path, 'recover', boundary, requestId).done(); manifest.crash_cases.push(recovered.result);
+      const child = start(path, 'crash', boundary, requestId);
+      const reached = await child.event(boundary === 'after_response' ? 'response_ready' : 'boundary');
+      assert.equal(reached.boundary, boundary); assert.equal(reached.requestId, requestId);
+      if (boundary === 'after_response') {
+        const response = await fetch(reached.url, { signal: AbortSignal.timeout(5_000) });
+        assert(response.ok); const receipt = await response.json();
+        assert.equal(receipt.request_id, requestId); assert.equal(receipt.state, 'committed');
+        assert.equal(receipt.persistence.mode, 'filesystem');
+      }
+      await child.kill();
+      const recovered = await start(path, 'recover', boundary, requestId).done();
+      assert.equal(recovered.result.boundary, boundary);
+      manifest.crash_cases.push({ ...recovered.result, ...(boundary === 'after_response' ? { response_read_before_kill: true } : {}) });
       process.stderr.write(`[persistence] ${options.engine}: SIGKILL/${boundary} durable recovery verified\n`);
     }
     if (counts.schedules) {
@@ -131,7 +146,14 @@ export async function runValidation(options: ValidationOptions) {
         peak_owner_rss_bytes: Math.max(...ownerResults.map(owner => owner.peak_rss_bytes)) };
     }
     manifest.status = 'passed';
-    manifest.full_gate = counts.schedules >= 1000 && counts.operations >= 10_000 && manifest.crash_cases.length === 6;
+    const executedBoundaries = manifest.crash_cases.map((entry: { boundary: string }) => entry.boundary);
+    if (options.crashes !== false) assert.deepEqual(executedBoundaries, [...CRASH_BOUNDARIES]);
+    manifest.full_gate = counts.schedules >= 1000 && counts.operations >= 10_000
+      && executedBoundaries.length === CRASH_BOUNDARIES.length && CRASH_BOUNDARIES.every((boundary, index) => executedBoundaries[index] === boundary)
+      && manifest.crash_cases.every((entry: { staging_cleanup_verified?: boolean }) => entry.staging_cleanup_verified === true)
+      && manifest.crash_cases.find((entry: { boundary: string }) => entry.boundary === 'staging_flushed')?.flushed_before_rename_verified === true
+      && manifest.crash_cases.find((entry: { boundary: string }) => entry.boundary === 'staging_flushed')?.unexpected_staging_preserved === true
+      && manifest.crash_cases.find((entry: { boundary: string }) => entry.boundary === 'after_response')?.response_read_before_kill === true;
     return manifest;
   } catch (error) {
     originalFailure = true; manifest.status = 'failed'; manifest.full_gate = false; manifest.failure = String(error);

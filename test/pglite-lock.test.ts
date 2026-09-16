@@ -40,6 +40,7 @@ describe('PGLite datastore kernel ownership', () => {
     const inode = statSync(kernel).ino;
     const metadata = JSON.parse(readFileSync(lock.lockPath!, 'utf8'));
     expect(metadata.pid).toBe(process.pid);
+    expect(metadata.argv).toEqual(process.argv.slice(1));
     expect(metadata.owner_token).toBe(lock.ownerToken);
     expect(metadata.protocol).toBe('kernel-v1');
     expect(inspectLockHolder(dataDir).held).toBe(true);
@@ -63,6 +64,20 @@ describe('PGLite datastore kernel ownership', () => {
     child.kill(9); await child.exited;
     const successor = await take(dataDir);
     expect(successor.reaped).toBe(false); // kernel proof, independent of metadata
+  });
+  test('a dead or reused diagnostic PID cannot override the live kernel owner', async () => {
+    const root = temporary(), dataDir = join(root, 'store');
+    const child = await holder(root);
+    const metadataPath = join(dataDir, '.gbrain-lock/lock');
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+    for (const pid of [99999999, process.pid]) {
+      writeFileSync(metadataPath, JSON.stringify({ ...metadata, pid, refreshed_at: 1,
+        command: 'unrelated-program', argv: ['/unrelated/program'], subcommand: 'other' }));
+      await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
+      expect(JSON.parse(readFileSync(metadataPath, 'utf8')).owner_token).toBe(metadata.owner_token);
+    }
+    child.kill(9); await child.exited;
+    expect((await take(dataDir)).acquired).toBe(true);
   });
   test('datastore replacement cannot replace the ownership inode', async () => {
     const root = temporary(), dataDir = join(root, 'store');
@@ -106,6 +121,17 @@ describe('PGLite datastore kernel ownership', () => {
     await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(PgliteBusyError);
     expect(existsSync(dir)).toBe(true);
   });
+  test.each(['/Users/Example User/project/src/cli.ts', 'C:\\Users\\Example User\\project\\src\\CLI.TS'])(
+    'structured legacy argv preserves serve diagnostics for %s without authorizing takeover', async script => {
+      const dataDir = join(temporary(), 'store'), dir = join(dataDir, '.gbrain-lock');
+      mkdirSync(dir, { recursive: true });
+      const metadata = { pid: process.pid, command: `${script} serve --http`,
+        argv: [script, 'serve', '--http'], subcommand: 'serve', acquired_at: 1, refreshed_at: 1 };
+      writeFileSync(join(dir, 'lock'), JSON.stringify(metadata));
+      expect(inspectLockHolder(dataDir)).toEqual({ held: true, pid: process.pid, serve: true, subcommand: 'serve' });
+      await expect(acquireLock(dataDir, { timeoutMs: 30 })).rejects.toBeInstanceOf(LiveServeLockError);
+      expect(JSON.parse(readFileSync(join(dir, 'lock'), 'utf8'))).toEqual(metadata);
+    });
   test('legacy death migration requires same namespace proof and quarantines repair once', async () => {
     const dataDir = join(temporary(), 'store'), dir = join(dataDir, '.gbrain-lock');
     mkdirSync(dir, { recursive: true });

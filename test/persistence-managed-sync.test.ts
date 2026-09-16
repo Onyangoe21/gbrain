@@ -15,6 +15,7 @@ import { prepareManagedSyncMutation, type SyncIntent } from '../src/core/persist
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -106,6 +107,69 @@ test('attached working-tree changes require opt-in and delete retains exact phys
     rmSync(join(f.root,'notes/a.md')); commit(f.root,'remove content');
     expect((await performManagedSync(engine,{sourceId:f.id,noPull:true})).deleted).toBe(1);
     expect(await engine.getPage('notes/a',{sourceId:f.id})).toBeNull();
+  }
+}),120_000);
+
+test('repeated slices reuse one manifest and still reject an intervening page identity change', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, {
+      'a.md': 'First source observation for a durable sliced import.\n',
+      'b.md': 'Second source observation for a durable sliced import.\n',
+      'c.md': 'Third source observation for a durable sliced import.\n',
+    });
+    const executeRaw = engine.executeRaw;
+    let manifestReads = 0;
+    engine.executeRaw = async function (this: BrainEngine, sql: string, params?: unknown[]) {
+      if (params?.[0] === f.id && sql.includes('SELECT id,slug,source_path,knowledge_revision FROM pages')) manifestReads++;
+      return executeRaw.call(this, sql, params);
+    } as BrainEngine['executeRaw'];
+    try {
+      const options = { sourceId: f.id, noPull: true };
+      const slice = { maxPages: 1, maxMs: 1000 };
+      expect(await performManagedSync(engine, options, slice)).toMatchObject({ status: 'partial', reason: 'writer_yield', filesImported: 1 });
+      const [manifest] = await engine.executeRaw<{ fingerprint: string; completed_keys: unknown }>(
+        `SELECT m.fingerprint,m.completed_keys FROM op_checkpoints c JOIN op_checkpoints m
+          ON m.op='managed-sync-manifest' AND m.fingerprint=c.completed_keys->0->>'runId'
+          WHERE c.op='managed-sync' AND c.completed_keys->0->>'sourceId'=$1`, [f.id]);
+      expect(manifest).toBeDefined();
+      expect(await performManagedSync(engine, options, slice)).toMatchObject({ status: 'partial', reason: 'writer_yield', filesImported: 2 });
+      expect(manifestReads).toBe(1);
+      await engine.transaction(tx => withCoordinatedWrite(tx, [f.id], () => tx.putPage('c', {
+        type: 'note', title: 'c', compiled_truth: 'A newer accepted page between sync slices.', timeline: '', frontmatter: {}, content_hash: 'newer',
+      }, { sourceId: f.id })));
+      await expect(performManagedSync(engine, options, slice)).rejects.toMatchObject({ code: 'revision_conflict' });
+      expect(manifestReads).toBe(1);
+      expect(await engine.executeRaw('SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2',
+        ['managed-sync-manifest', manifest.fingerprint])).toEqual([{ completed_keys: manifest.completed_keys }]);
+      expect((await engine.getPage('c', { sourceId: f.id }))?.compiled_truth).toBe('A newer accepted page between sync slices.');
+      expect(await engine.executeRaw('SELECT slug,state FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [f.id]))
+        .toEqual([{ slug: 'a', state: 'committed' }, { slug: 'b', state: 'committed' }]);
+      expect((await engine.executeRaw<{ last_commit: string | null }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBeNull();
+    } finally { await disposePersistenceConsumer(engine); engine.executeRaw = executeRaw; }
+  }
+}),120_000);
+
+test('managed discovery unions persisted hidden-path waivers with explicit patterns', async () => withEnv({GBRAIN_HOME:home},async()=>{
+  for(const engine of engines){
+    const previous = await engine.getConfig('sync.include_hidden');
+    try {
+      await engine.setConfig('sync.include_hidden', '');
+      const f = await fixture(engine, { 'visible.md': 'Visible ordinary source observation.\n',
+        '.persisted/configured.md': 'Explicitly configured hidden source observation.\n',
+        '.explicit/cli.md': 'Explicit per-call hidden source observation.\n',
+        '.hidden/blocked.md': 'Hidden source observation with no waiver.\n' });
+      expect((await discoverManagedSync(engine, { sourceId: f.id, noPull: true })).entries.map(e => e.sourcePath)).toEqual(['visible.md']);
+      await engine.setConfig('sync.include_hidden', ' .persisted/ ,\n .persisted/** ');
+      expect((await discoverManagedSync(engine, { sourceId: f.id, noPull: true })).entries.map(e => e.sourcePath))
+        .toEqual(['.persisted/configured.md', 'visible.md']);
+      const result = await performManagedSync(engine, { sourceId: f.id, noPull: true, includeHidden: ['.explicit/**'] });
+      expect(result.added).toBe(3);
+      const paths = await engine.executeRaw<{source_path:string}>('SELECT source_path FROM pages WHERE source_id=$1 ORDER BY source_path', [f.id]);
+      expect(paths.map(p => p.source_path)).toEqual(['.explicit/cli.md', '.persisted/configured.md', 'visible.md']);
+    } finally {
+      if(previous == null) await engine.executeRaw("DELETE FROM config WHERE key='sync.include_hidden'");
+      else await engine.setConfig('sync.include_hidden', previous);
+    }
   }
 }),120_000);
 

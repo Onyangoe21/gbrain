@@ -3,13 +3,13 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { BrainEngine } from '../core/engine.ts';
 import { getCliOptions } from '../core/cli-options.ts';
-import { isThinClient, loadConfig } from '../core/config.ts';
+import { isThinClient, loadConfig, type GBrainConfig } from '../core/config.ts';
 import { OperationError } from '../core/ops/contract.ts';
 import { parseMutationPrecondition } from '../core/persistence/preconditions.ts';
 import { isWriteReceipt } from '../core/persistence/types.ts';
 import { maybeDelegateLocalOperation } from '../core/persistence/local-client.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
-import { callRemoteTool, RemoteMcpError, unpackToolResult } from '../core/mcp-client.ts';
+import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { setCliExitVerdict, writeStdoutFinal } from '../core/cli-force-exit.ts';
 import { reportPersistenceCliError } from './persistence-delegate.ts';
 
@@ -76,15 +76,16 @@ export function parseTakesMutation(args: string[]): { operation: `takes_${TakesM
   return { operation: `takes_${sub}`, params, sourceId, json };
 }
 
-export async function runTakesMutation(engine: BrainEngine | (() => Promise<BrainEngine>), args: string[]): Promise<void> {
+export async function runTakesMutation(engine: BrainEngine | (() => Promise<BrainEngine>), args: string[], configOverride?: GBrainConfig): Promise<void> {
   let requestId: string | undefined;
   try {
     const parsed = parseTakesMutation(args);
     const { operation, params } = parsed;
     requestId = params.request_id as string;
-    const config = loadConfig(), cli = getCliOptions();
+    const config = configOverride ?? loadConfig(), cli = getCliOptions();
     let result: Record<string, unknown>;
     if (isThinClient(config)) {
+      if (args.some(arg => arg === '--outcome' || arg.startsWith('--outcome='))) console.error('[deprecated] --outcome is the v0.28 alias for --quality. Prefer --quality correct|incorrect|partial in new scripts.');
       if (cli.brain || parsed.sourceId || params.local_dir !== undefined) throw invalid('--brain, --source-id, and --dir require a local brain host; the remote credential selects its source.');
       result = unpackToolResult(await callRemoteTool(config!, operation, params, { timeoutMs: cli.timeoutMs ?? 30_000 }));
     } else {
@@ -116,11 +117,6 @@ export async function runTakesMutation(engine: BrainEngine | (() => Promise<Brai
       else console.log(`Resolved take #${row} on ${params.slug}: quality=${params.quality}.`);
     }
   } catch (error) {
-    if (error instanceof RemoteMcpError) {
-      const remote = new OperationError(error.detail?.code ?? 'unavailable', error.message);
-      remote.writeRequest = error.detail?.write_request; remote.writeError = error.detail?.write_error;
-      error = remote;
-    }
     if (!await reportPersistenceCliError(error, args.includes('--json'))) {
       console.error(error instanceof Error ? error.message : String(error)); setCliExitVerdict(1);
     }

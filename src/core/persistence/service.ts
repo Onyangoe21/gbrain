@@ -7,8 +7,9 @@ import { prepareSemanticPageMutation } from './semantic-pages.ts';
 import { getWriteRequestById, receiptFor } from './journal.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { isWriteErrorCode, type WriteReceipt } from './types.ts';
+import { registerPgliteReopen } from '../pglite-lifecycle.ts';
 
-interface Service { consumer: PersistenceConsumer; stopping: boolean; }
+interface Service { consumer: PersistenceConsumer; stopping: boolean; unregisterStop?: () => void; unregisterReopen?: () => void; }
 const services = new WeakMap<BrainEngine, Service>();
 const preparers = new Map<string, PrepareMutation>();
 export function registerMutationPreparer(operation: string, prepare: PrepareMutation): void { preparers.set(operation, prepare); }
@@ -26,9 +27,17 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     if (['takes_add','takes_update','takes_supersede','takes_resolve'].includes(row.operation)) return (await import('./takes-prepare.ts')).prepareTakesMutation(e,row,cfg);
     return (['add_tag','remove_tag','add_timeline_entry'].includes(row.operation) ? prepareSemanticPageMutation : preparePageMutation)(e, row, cfg);
   });
-  services.set(engine, { consumer, stopping: false });
+  const service: Service = { consumer, stopping: false };
+  services.set(engine, service);
   const lifecycle = engine as BrainEngine & { registerBeforeDisconnect?: (run: () => Promise<void>) => unknown };
-  lifecycle.registerBeforeDisconnect?.(() => stopPersistenceConsumer(engine));
+  const unregister = lifecycle.registerBeforeDisconnect?.(() => stopPersistenceConsumer(engine));
+  if (typeof unregister === 'function') service.unregisterStop = unregister;
+  if (engine.kind === 'pglite') service.unregisterReopen = registerPgliteReopen(engine, sameDatastore => {
+    if (services.get(engine) !== service || !service.stopping) return;
+    discardStoppedService(engine, service);
+    // An explicit switch to another datastore must not inherit the old brain's config.
+    if (sameDatastore) startPersistenceConsumer(engine, config);
+  });
   consumer.start();
   return consumer;
 }
@@ -40,8 +49,12 @@ export async function stopPersistenceConsumer(engine: BrainEngine): Promise<void
 }
 /** Reset fixtures and drained lifecycle owners may discard a stopped service. */
 export async function disposePersistenceConsumer(engine: BrainEngine): Promise<void> {
+  const service = services.get(engine);
   await stopPersistenceConsumer(engine);
-  services.delete(engine);
+  if (service && services.get(engine) === service) discardStoppedService(engine, service);
+}
+function discardStoppedService(engine: BrainEngine, service: Service): void {
+  service.unregisterStop?.(); service.unregisterReopen?.(); services.delete(engine);
 }
 export function foregroundWriteCompletions(engine: BrainEngine, worktreeId: string): number {
   return services.get(engine)?.consumer.foregroundCompletions(worktreeId) ?? 0;

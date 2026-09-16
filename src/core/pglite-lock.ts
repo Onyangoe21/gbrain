@@ -2,6 +2,8 @@
 import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, renameSync, realpathSync, readlinkSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { readProcessCommand, type ProcessCommandProbeDeps } from './autopilot-lock.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parseGlobalFlags } from './cli-options.ts';
 import { tryAcquireNativeLock, type NativeLockHandle } from './persistence/native-lock.ts';
@@ -39,6 +41,7 @@ interface LockMetadata {
   acquired_at?: number;
   refreshed_at?: number;
   command?: string;
+  argv?: string[];
   subcommand?: string;
   owner_token?: string;
   protocol?: string;
@@ -87,6 +90,73 @@ export function isProcessAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return true;
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+}
+
+/** Compatibility process diagnostics; never an ownership or takeover authority. */
+function readProcessArgs(pid: number, deps?: ProcessCommandProbeDeps): string | null {
+  if ((deps?.platform ?? process.platform) === 'win32') return readProcessCommand(pid, deps);
+  const exec = deps?.execFile ?? execFileSync;
+  try {
+    const out = exec('ps', ['-p', String(pid), '-o', 'args='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1000,
+    }).trim();
+    if (out.length > 0) return out;
+  } catch { /* fall through to /proc */ }
+  try {
+    const raw = (deps?.readCmdlineFile ?? readFileSync)(`/proc/${pid}/cmdline`);
+    const args = raw.toString().replace(/\0/g, ' ').trim();
+    if (args.length > 0) return args;
+  } catch { /* unreadable — unknowable */ }
+  return null;
+}
+
+/**
+ * Report a possible mismatch between a recorded legacy command and its PID.
+ * Keep structured argv, namespace checks and native Windows CIM diagnostics.
+ * Neither acquireLock nor read-only holder routing uses this heuristic: command
+ * changes and PID reuse cannot release a kernel owner or migrate a live legacy
+ * holder. Stop older processes before upgrading the datastore's lock protocol.
+ */
+export function isPidReusedByOtherProgram(
+  pid: number,
+  recordedArgv: unknown,
+  recordedPidNs: unknown,
+  recordedBootId: unknown,
+  deps?: ProcessCommandProbeDeps,
+): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  // Same-process re-acquire: WE are the recorded holder, so the PID is by
+  // definition not recycled. (Also keeps non-gbrain test harnesses that hold a
+  // lock with their own PID from reaping themselves.)
+  if (pid === process.pid) return false;
+  if (!Array.isArray(recordedArgv) || recordedArgv.length === 0
+    || !recordedArgv.every(arg => typeof arg === 'string')
+    || recordedArgv[0].trim().length === 0) return false;
+  if ((deps?.platform ?? process.platform) === 'linux') {
+    // Linux: cmdline evidence is only meaningful within one PID namespace on
+    // one host, so EVERY marker must be readable AND matching — pid_ns rules
+    // out other containers, boot_id rules out other hosts (pid_ns inode
+    // numbers can collide across machines sharing a data dir). An unreadable
+    // local marker, a legacy lock without markers, or any mismatch all make
+    // the diagnostic inconclusive.
+    const ourNs = readPidNs();
+    const ourBoot = readBootId();
+    if (ourNs === null || ourBoot === null) return false;
+    if (recordedPidNs !== ourNs) return false;
+    if (recordedBootId !== ourBoot) return false;
+  }
+  const cmdline = readProcessArgs(pid, deps);
+  if (cmdline === null) return false; // unknowable — cannot prove reuse
+  const isWin32 = (deps?.platform ?? process.platform) === 'win32';
+  const normalize = (s: string) => isWin32 ? s.toLowerCase().replace(/\\/g, '/') : s;
+  const normalizedCommand = normalize(cmdline);
+  if (normalizedCommand.includes('gbrain')) return false;
+  const scriptPath = recordedArgv[0];
+  if (normalizedCommand.includes(normalize(scriptPath))) return false;
+  const scriptName = scriptPath.split(/[\\/]/).pop();
+  return !!scriptName && !normalizedCommand.includes(normalize(scriptName));
 }
 
 export interface LockHolderInfo {
@@ -190,7 +260,7 @@ export async function acquireLock(dataDir: string | undefined, opts: { timeoutMs
         writeFileSync(markerPath, JSON.stringify({ protocol }), { mode: 0o600 });
         const now = Date.now(), ownerToken = randomUUID(), lockPath = join(lockDir, LOCK_FILE);
         writeMetadata(lockPath, { pid: process.pid, acquired_at: now, refreshed_at: now,
-          command: process.argv.slice(1).join(' '), subcommand: parseGlobalFlags(process.argv.slice(2)).rest[0],
+          command: process.argv.slice(1).join(' '), argv: process.argv.slice(1), subcommand: parseGlobalFlags(process.argv.slice(2)).rest[0],
           owner_token: ownerToken, protocol, pid_ns: readPidNs(), boot_id: readBootId() });
         const result = { lockDir, acquired: true, lockPath, ownerToken, reaped, nativeLock,
           heartbeat: startHeartbeat(lockPath, ownerToken) };

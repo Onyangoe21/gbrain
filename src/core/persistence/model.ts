@@ -33,6 +33,8 @@ export interface RecoveryRecord {
   ownerEpoch: string;
   attempt: string;
   after?: string | null;
+  /** Absent on recovery records created by older binaries. */
+  staging?: import('./staging.ts').RecoveryStaging;
 }
 export interface WriteRequest {
   id: string;

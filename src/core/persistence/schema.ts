@@ -1,4 +1,7 @@
 import { MANAGED_WRITER_GUARD_SQL } from './writer-guard-schema.ts';
+/** Permanent terminal receipts stay outside owner recovery scans after cleanup. */
+export const PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_recovery
+  ON persistence_requests(worktree_id,sequence) WHERE recovery IS NOT NULL`;
 /** Durable infrastructure: never reconstruct or discard these rows during page reindexing. */
 export const PERSISTENCE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS persistence_brain (
@@ -84,6 +87,7 @@ export const PERSISTENCE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS persistence_requests_pending ON persistence_requests(worktree_id,sequence)
     WHERE state IN ('queued','running','recovering')`,
+  PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL,
   `CREATE INDEX IF NOT EXISTS persistence_requests_principal ON persistence_requests(principal_kind,principal_id,sequence DESC)`,
   `CREATE TABLE IF NOT EXISTS persistence_effects (
     id bigserial PRIMARY KEY,

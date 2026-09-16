@@ -7,7 +7,7 @@ import { currentJobSignal } from '../minions/submission-authority.ts';
 import { digest } from './digest.ts';
 import { getWriteRequest, admitWrite } from './journal.ts';
 import { assertPersistenceAccepting, foregroundWriteCompletions, startPersistenceConsumer, waitForWrite } from './service.ts';
-import { discoverManagedSync, readSyncContent, syncRawHash, type SyncDiscovery } from './sync-discovery.ts';
+import { discoverManagedSync, resolveManagedSyncContext, readSyncContent, syncRawHash, type SyncDiscovery } from './sync-discovery.ts';
 import { managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, type SyncAuthority } from './sync-authority.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 
@@ -75,9 +75,9 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string): Pr
 export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
-  const discovery = await discoverManagedSync(engine, opts);
-  const authority = await managedSyncAuthority(engine, discovery.sourceId, discovery.incarnation, discovery.root);
-  const key = digest({ source: discovery.incarnation, principal: authority.writer.principal, authority,
+  const context = await resolveManagedSyncContext(engine, opts);
+  const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, context.root);
+  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority,
     options: { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
       exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null } });
   let cursor = await readCursor(engine, key);
@@ -95,14 +95,15 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
     cursor = await readCursor(engine, key);
   }
   if (!cursor) {
+    const discovery = await discoverManagedSync(engine, opts, context);
     const fresh: Cursor = { ...discovery, authority, runId: randomUUID(), index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } };
     if (opts.dryRun) return result(fresh, 'dry_run');
     if (!fresh.entries.length && fresh.from === fresh.target) return result(fresh, 'up_to_date');
     cursor = await saveCursor(engine, key, null, fresh);
   }
-  if (cursor.incarnation !== discovery.incarnation || cursor.binding.worktree_id !== discovery.binding.worktree_id ||
-      String(cursor.binding.topology_generation) !== String(discovery.binding.topology_generation) ||
-      String(cursor.binding.owner_epoch) !== String(discovery.binding.owner_epoch) || cursor.root !== discovery.root) {
+  if (cursor.incarnation !== context.incarnation || cursor.binding.worktree_id !== context.binding.worktree_id ||
+      String(cursor.binding.topology_generation) !== String(context.binding.topology_generation) ||
+      String(cursor.binding.owner_epoch) !== String(context.binding.owner_epoch) || cursor.root !== context.root) {
     throw new OperationError('source_changed', 'The unfinished sync cursor belongs to an older source binding.');
   }
   if (opts.dryRun) return result(cursor, 'dry_run');
@@ -155,7 +156,8 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
       if (!cursor?.done) throw new OperationError('storage_error', 'Committed sync checkpoint lost its cursor.');
       return result(cursor, cursor.from === null ? 'first_sync' : 'synced');
     }
-    const next = structuredClone(cursor); next.index++; delete next.pending;
+    // The frozen manifest is shared; only the cursor header changes per page.
+    const next: Cursor = { ...cursor, index: cursor.index + 1, counts: { ...cursor.counts } }; delete next.pending;
     if (done.outcome?.noop !== true) {
       if (pending.intent.kind === 'managed_sync_delete') next.counts.deleted++;
       else if (pending.pageId === null) next.counts.added++; else next.counts.modified++;

@@ -25,6 +25,7 @@ import {
 import type { GBrainConfig } from '../src/core/config.ts';
 import { discoverOAuth, mintClientCredentialsToken } from '../src/core/remote-mcp-probe.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 
 let server: ReturnType<typeof Bun.serve>;
 let port: number;
@@ -149,6 +150,44 @@ function makeConfig(): GBrainConfig {
 }
 
 describe('durable mutation identity across OAuth refresh', () => {
+  test.each([[false, 'queued'], [true, 'queued'], [false, 'conflict'], [true, 'conflict']] as const)('received write receipt survives abort during cleanup (refresh=%s, state=%s)', async (refresh, state) => {
+    const controller = new AbortController();
+    const receipt = { request_id: 'd7599b95-65c2-4d54-aa4e-cb5745af90cf', state, retry_after_ms: state === 'queued' ? 1000 : null };
+    const code = state === 'queued' ? 'unavailable' : 'invalid_params';
+    const writeError = state === 'queued' ? 'write_pending' : 'revision_conflict';
+    if (refresh) statusFor = (stage, attempt) => stage === 'tools/call' && attempt === 1 ? 401 : undefined;
+    mcpResponseFor = () => ({ isError: true, content: [{ type: 'text', text: JSON.stringify({
+      error: code, message: 'Accepted.', suggestion: 'Inspect the same request_id.', protocol_version: 1,
+      write_error: writeError, write_request: receipt,
+    }) }] });
+    const close = Client.prototype.close;
+    Client.prototype.close = async function () {
+      if (toolExecutions > 0) controller.abort(new DOMException('deadline', 'TimeoutError'));
+      return close.call(this);
+    };
+    try {
+      await expect(callRemoteTool(makeConfig(), 'remember', { fact: 'fixture', provenance: 'test', request_id: receipt.request_id }, { signal: controller.signal }))
+        .rejects.toMatchObject({ reason: 'tool_error', detail: {
+          code, protocol_version: 1, write_error: writeError, write_request: receipt,
+        } });
+      expect(toolExecutions).toBe(1);
+    } finally { Client.prototype.close = close; }
+  });
+
+  test('lost acknowledgment retains the generated UUID without claiming acceptance', async () => {
+    hangingStage = 'tools/call';
+    hangAfterHeaders = true;
+    const params: Record<string, unknown> = { fact: 'fixture', provenance: 'test' };
+    let error: unknown;
+    try { await callRemoteTool(makeConfig(), 'remember', params, { timeoutMs: 200 }); }
+    catch (caught) { error = caught; }
+    expect(toolArguments).toHaveLength(1);
+    expect(error).toMatchObject({ reason: 'network', detail: {
+      kind: 'timeout', request_id: params.request_id, submission_status: 'unknown',
+    } });
+    expect((error as RemoteMcpError).detail).not.toHaveProperty('write_request');
+  });
+
   test('retains generated and explicit IDs through refresh and caller retries', async () => {
     statusFor = (stage, attempt) => stage === 'tools/call' && attempt === 1 ? 401 : undefined;
     const params: Record<string, unknown> = { slug: 'notes/refresh-fixture', content: 'fixture' };

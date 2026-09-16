@@ -13,6 +13,7 @@ import { withFilesystemPublication } from './filesystem-guard.ts';
 import { persistenceFileHash, publishPersistenceFile } from './coordinator.ts';
 import type { EffectRecovery, PersistenceEffect } from './effect-model.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
+import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, upgradeRecoveryStaging } from './staging.ts';
 
 export async function guardEffectSource(tx: BrainEngine, effect: PersistenceEffect, hostId: string): Promise<WorktreeBinding | null> {
   if (effect.worktree_id) {
@@ -59,6 +60,7 @@ export async function reserveEffectRecovery(engine: BrainEngine, effect: Persist
 }
 
 async function clearRecovery(tx: BrainEngine, effect: PersistenceEffect): Promise<void> {
+  if (effect.recovery) assertRecoveryStagingAbsent(effect.recovery);
   if (effect.recovery_bytes) for (const key of ['brain', `worktree:${effect.worktree_id}`]) {
     await tx.executeRaw('UPDATE persistence_counters SET recovery_bytes=recovery_bytes-$2 WHERE key=$1', [key, Number(effect.recovery_bytes)]);
   }
@@ -70,7 +72,9 @@ export async function recoverEffectPublication(engine: BrainEngine, effect: Pers
   hooks: { boundary?: (name: 'before_mirror_file' | 'after_mirror_file' | 'before_mirror_commit') => Promise<void> } = {}): Promise<void> {
   const releaseCapacity = tryAcquirePublicationCapacity(engine);
   if (!releaseCapacity) throw new OperationError('writer_pool_capacity', 'Mirror recovery is waiting for publication capacity.');
-  try { await engine.transaction(async tx => {
+  try {
+    if (effect.recovery && !effect.recovery.staging) await upgradeRecoveryStaging(engine, 'persistence_effects', effect.id, effect.worktree_id!, 'forward');
+    await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true),set_config('statement_timeout','5s',true)");
     const binding = await guardEffectSource(tx, effect, hostId);
     await lockCounters(tx, ['brain', `worktree:${effect.worktree_id}`]);
@@ -82,6 +86,7 @@ export async function recoverEffectPublication(engine: BrainEngine, effect: Pers
       || !isWriteTargetContained(record.path, record.root) || !isWriteTargetContained(record.root, binding.local_path)
       || resolve(record.root) !== resolve(join(binding.local_path, binding.relative_path))
       || sha256(Buffer.from(record.after, 'base64')) !== record.afterHash) throw new OperationError('recovery_required', 'Mirror recovery no longer belongs to this canonical binding.');
+    await withFilesystemPublication([record.root], async () => cleanupRecoveryStaging(record));
     const actual = persistenceFileHash(record.path);
     if (actual !== record.beforeHash && actual !== record.afterHash) {
       throw new OperationError('unexpected_file_bytes', 'Physical mirror recovery found unexpected bytes; the root remains blocked.');
@@ -99,7 +104,7 @@ export async function recoverEffectPublication(engine: BrainEngine, effect: Pers
     if (actual === record.beforeHash && actual !== record.afterHash) {
       await hooks.boundary?.('before_mirror_file');
       await withFilesystemPublication([record.root], async () => {
-        publishPersistenceFile({ path: record.path, root: record.root, content: Buffer.from(record.after, 'base64') });
+        publishPersistenceFile({ path: record.path, root: record.root, content: Buffer.from(record.after, 'base64') }, record.staging?.publication?.path);
         if (record.mode !== null && existsSync(record.path)) chmodSync(record.path, record.mode);
       });
       await hooks.boundary?.('after_mirror_file');

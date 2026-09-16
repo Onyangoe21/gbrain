@@ -13,7 +13,6 @@ import { readPolicyOpts } from './context.ts';
 import {
   enforceSubagentSlugFence,
   enforceClientSlugFence,
-  requireWritablePage,
 } from './context.ts';
 
 // --- Timeline ---
@@ -55,11 +54,6 @@ const add_timeline_entry: Operation = {
     if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
       throw new Error(`Invalid calendar date "${date}"`);
     }
-    // v0.31.8 (D7): thread ctx.sourceId.
-    // #4109: source-boundary diagnostics before the write-through/insert —
-    // a page readable only from another granted source must come back as
-    // permission_denied, not the engine's exact-source "not found".
-    await requireWritablePage(ctx, p.slug as string, 'add_timeline_entry', 'page');
     return submitPageMutation(ctx, { operation: 'add_timeline_entry', params: p });
   },
   cliHints: { name: 'timeline-add', positional: ['slug', 'date', 'summary'] },
