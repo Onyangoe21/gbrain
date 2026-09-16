@@ -1,6 +1,6 @@
 import { pageMutationSource, submitPageMutation } from '../persistence/page-mutations.ts';
 import { PAGE_MUTATION_PARAMS, CAPTURE_EVENT_PARAMS } from '../persistence/params.ts';
-import { assertPurgeParams } from '../persistence/preconditions.ts';
+import { assertPurgeParams } from '../persistence/purge-params.ts';
 /**
  * Page CRUD operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). Op consts stay module-private; `pagesOperations` below lists

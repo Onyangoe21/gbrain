@@ -11,7 +11,7 @@ export const CAPTURE_EVENT_PARAMS: Record<string, ParamDef> = {
 import { WRITE_REQUEST_STATES } from './types.ts';
 
 /** Leaf definitions: safe to import while the frozen verb registry is evaluating.
- * Runtime validators belong in preconditions.ts; importing OperationError here
+ * Runtime validators belong in separate modules; importing OperationError here
  * creates a params -> contract -> verbs -> params initialization cycle.
  */
 export const WRITE_REQUEST_PARAM: ParamDef = {

@@ -6,7 +6,7 @@ import { keylessBrainEnv } from './helpers/provider-env.ts';
 
 const moduleUrl = (entry: string) => new URL(`../src/core/${entry}`, import.meta.url).href;
 
-for (const entry of ['persistence/params.ts', 'ops/contract.ts', 'ops/facts.ts', 'verbs.ts']) {
+for (const entry of ['persistence/params.ts', 'persistence/purge-params.ts', 'ops/contract.ts', 'ops/facts.ts', 'verbs.ts']) {
   test(`cold ${entry} import preserves mutation schemas and purge errors`, () => {
     const home = mkdtempSync(join(tmpdir(), 'gbrain-persistence-import-'));
     try {
@@ -14,7 +14,7 @@ for (const entry of ['persistence/params.ts', 'ops/contract.ts', 'ops/facts.ts',
       const script = `
         await import(${JSON.stringify(moduleUrl(entry))});
         const { PAGE_MUTATION_PARAMS } = await import(${JSON.stringify(moduleUrl('persistence/params.ts'))});
-        const { assertPurgeParams } = await import(${JSON.stringify(moduleUrl('persistence/preconditions.ts'))});
+        const { assertPurgeParams } = await import(${JSON.stringify(moduleUrl('persistence/purge-params.ts'))});
         const { OperationError } = await import(${JSON.stringify(moduleUrl('ops/contract.ts'))});
         const { verbOperations } = await import(${JSON.stringify(moduleUrl('verbs.ts'))});
         assertPurgeParams({ purge: true }, false);
