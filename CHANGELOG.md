@@ -30,6 +30,30 @@ All notable changes to GBrain will be documented in this file.
 `gbrain upgrade`, then restart `gbrain serve --http` and run `gbrain doctor`. If it lists self-registered OAuth clients with a privileged scope you did not intend, run `gbrain auth rescope-client <client_id> --scopes read,write` or `gbrain auth revoke-client <client_id>`. Connectors that request `admin` at self-registration will now fail to register — pre-register them with `gbrain auth register-client <name> --scopes …` or let them self-register with `read write` and rescope later. If you kept `GBRAIN_GUARDRAILS_MODULE`, `GBRAIN_HOME`, a `GBRAIN_ALLOW_*` flag or another protected variable in a project's `.env`, move it to `~/.gbrain/.env` (or your service's EnvironmentFile / shell profile) — gbrain names the variable it ignored and where to put it. A hand-started worker that runs shell jobs should use `gbrain jobs work --allow-shell-jobs`. If `GBRAIN_GUARDRAILS_MODULE` is a package name or a relative path, change it to the module's absolute path (or a `~/` path) — gbrain exits 1 until you do. If you set `GBRAIN_DATABASE_URL` in a project's `.env` on purpose, export it from your shell or put it in `~/.gbrain/.env` instead. If you build the binary yourself, rebuild it with `bun run build` (**Say to your agent:** *"rebuild the gbrain binary"*) so it carries the new compile flag.
 
 **Say to your agent:** *"archive my session transcripts"* / *"import my conversations"* — *"a secret leaked into a brain page — rotate it and purge the page"* (your agent rotates the credential, then runs `gbrain delete <slug> --purge` on the host) — *"run a brain health check"* (your agent runs `gbrain doctor` and follows any `oauth_client_scope_health` advice) — *"start my brain's MCP server with self-service client registration"* (your agent runs `gbrain serve --http --enable-dcr`; you approve each new connection in the admin UI).
+## [0.50.4.0] - 2026-09-16
+
+### For contributors
+
+**Required CI checks finish about two-thirds sooner in matched warm-cache runs.** Selected E2E tests and isolated serial tests each use four workers, while ten unit workers share a duration-weighted scheduler. BrainBench CLI children reuse a snapshot built for their default embedding profile.
+
+Three matched warm-cache pairs and one cold-cache pair on Bun 1.3.13 measured the time from workflow dispatch through both required aggregate checks, including job queues. Dispatch timing is a proxy for push-to-green and excludes webhook delivery.
+
+| Measurement | Before | After | Change |
+|---|---:|---:|---:|
+| Warm required checks, median | 16m23s | 5m21s | 67.3% shorter |
+| Cold required checks, one pair | 12m57s | 5m42s | 56.0% shorter |
+| Warm runner minutes, median | 66.57 | 70.17 | 5.4% more |
+| Cold runner minutes, one pair | 63.77 | 71.65 | 12.4% more |
+
+The measured improvement exceeds the 50% acceptance criterion. The projected 4–5 minute target remains unmet by 21 seconds at the warm median; the slowest unit worker itself did not get faster.
+
+### Itemized changes
+
+- Selected E2E files are selected and filtered once, then frozen into validated partitions with separate Postgres services. An explicit empty selection runs no tests; missing input fails.
+- Serial workers retain one process per file and memory-aware pools. Machine-exclusive files run once, after shard 1's pool drains. Seventeen coverage lanes verify identity, commit, completion, and actual LCOV counts; incomplete evidence is visibly degraded.
+- Unit, serial, and E2E timing refreshes retain source metadata, reject failed or truncated inputs, and keep timing artifacts for 14 days. Testing documentation explains when and how to refresh weights.
+- Legacy unit and default CLI snapshots have separate artifacts and locks. Normal lock release and crash recovery preserve owner records so delayed cleanup cannot steal another builder's lock. Explicit cold-mode and schema/embedding validation remain supported.
+- Matched runs retain all 262 serial and 222 selected E2E files. Cold and snapshot BrainBench runs produce identical scores across 804 turns. Required check names, eval thresholds, and nightly coverage remain unchanged; successful test results are never cached.
 
 ## [0.50.2.0] - 2026-09-15
 
