@@ -32,7 +32,7 @@ export function snapshotProfile(profile: SnapshotProfile, fixtureDir = 'test/fix
 }
 
 type LockIdentity = { platform: NodeJS.Platform; hostname: string; pidNamespace: string | null };
-type LockOwner = { pid: number; token: string } & Partial<LockIdentity>;
+type LockOwner = { pid: number; token: string; protocol?: number } & Partial<LockIdentity>;
 
 export function snapshotLockIdentity(): LockIdentity {
   let pidNamespace: string | null = null;
@@ -51,6 +51,9 @@ function readOwner(lock: string): LockOwner | null {
 
 function isConfirmedDead(owner: LockOwner): boolean {
   const here = snapshotLockIdentity();
+  // Older builders removed their lock on normal release. A delayed observer
+  // cannot safely reclaim those records after another owner acquires the path.
+  if (owner.protocol !== 1) return false;
   // Host and container share the checkout, but their PIDs need not refer to
   // the same processes. Missing/foreign identities are unknown, never dead.
   if (!here.hostname || (here.platform === 'linux' && !here.pidNamespace) ||
@@ -62,11 +65,15 @@ function isConfirmedDead(owner: LockOwner): boolean {
 /** An observed owner may be stale: concurrent reapers must never move its replacement. */
 export function reclaimDeadSnapshotOwner(lock: string, owner: LockOwner | null = readOwner(lock)): boolean {
   if (!owner || !isConfirmedDead(owner)) return false;
-  // Every observer of this owner targets the SAME tombstone. It remains
+  return retireSnapshotOwner(lock, owner);
+}
+
+function retireSnapshotOwner(lock: string, owner: LockOwner): boolean {
+  // Normal release and every reaper target the SAME tombstone. It remains
   // nonempty forever, so atomic directory rename cannot overwrite it. A late
-  // observer therefore cannot move a new live lock after another reaper wins.
+  // observer cannot move a new live lock after either release or recovery.
   // No separate reaper mutex exists to become stranded by cancellation. These
-  // tiny crash records are gitignored; do not delete them while builders run.
+  // tiny ownership records are gitignored; do not delete them while builders run.
   const tokenHash = crypto.createHash('sha256').update(owner.token).digest('hex');
   const tombstone = `${lock}.dead-${tokenHash}`;
   try {
@@ -120,7 +127,7 @@ export async function buildPgliteSnapshot(profile: SnapshotProfile, opts: {
   mkdirSync(opts.fixtureDir ?? 'test/fixtures', { recursive: true });
   if (fresh()) { log(`[build-pglite-snapshot] ${profile} up to date`); return 'fresh'; }
 
-  const owner: LockOwner = { ...snapshotLockIdentity(), pid: process.pid, token: crypto.randomUUID() };
+  const owner: LockOwner = { ...snapshotLockIdentity(), pid: process.pid, token: crypto.randomUUID(), protocol: 1 };
   const configuredTimeout = opts.lockTimeoutMs ?? Number(process.env.GBRAIN_SNAPSHOT_LOCK_TIMEOUT_MS ?? 120_000);
   const timeout = Number.isFinite(configuredTimeout) && configuredTimeout >= 0 ? configuredTimeout : 120_000;
   const deadline = Date.now() + timeout;
@@ -158,7 +165,7 @@ export async function buildPgliteSnapshot(profile: SnapshotProfile, opts: {
   } finally {
     rmSync(tarTemp, { force: true });
     rmSync(versionTemp, { force: true });
-    if (readOwner(paths.lock)?.token === owner.token) rmSync(paths.lock, { recursive: true, force: true });
+    if (readOwner(paths.lock)?.token === owner.token) retireSnapshotOwner(paths.lock, owner);
   }
 }
 

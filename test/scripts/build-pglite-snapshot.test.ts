@@ -11,7 +11,7 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'snapshot-builder-test-')); 
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 const bytes = (value: string) => new TextEncoder().encode(value);
 const quiet = () => {};
-const owner = (pid: number, token: string) => ({ ...snapshotLockIdentity(), pid, token });
+const owner = (pid: number, token: string) => ({ ...snapshotLockIdentity(), pid, token, protocol: 1 });
 async function departedPid() {
   const child = Bun.spawn([process.execPath, '-e', ''], { stdout: 'ignore', stderr: 'ignore' });
   await child.exited;
@@ -116,8 +116,8 @@ describe('snapshot lock ownership and atomic publication', () => {
     expect(await buildPgliteSnapshot('legacy', { fixtureDir: dir, log: quiet, buildData: async () => bytes('recovered') })).toBe('built');
     expect(existsSync(paths.lock)).toBe(false);
     const tombstones = readdirSync(dir).filter(name => /\.dead-[0-9a-f]{64}$/.test(name));
-    expect(tombstones).toHaveLength(1);
-    expect(readFileSync(join(dir, tombstones[0]!, 'owner.json'), 'utf8')).toBe(record);
+    expect(tombstones).toHaveLength(2);
+    expect(tombstones.map(name => readFileSync(join(dir, name, 'owner.json'), 'utf8'))).toContain(record);
     const other = snapshotProfile('default', dir);
     mkdirSync(other.lock);
     await expect(buildPgliteSnapshot('default', { fixtureDir: dir, lockTimeoutMs: 0, log: quiet })).rejects.toThrow('lock timeout');
@@ -142,6 +142,45 @@ describe('snapshot lock ownership and atomic publication', () => {
     expect(readdirSync(dir).filter(name => name.includes('.dead-'))).toHaveLength(1);
   });
 
+  test.each([false, true])('an observer delayed past normal release cannot reclaim the next owner (build failed: %s)', async (failed) => {
+    const paths = snapshotProfile('default', dir);
+    const observedPath = join(dir, 'observed.json');
+    const releasePath = join(dir, 'release');
+    const code = `
+      import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { buildPgliteSnapshot, snapshotProfile } from './scripts/build-pglite-snapshot.ts';
+      const dir = process.argv[1];
+      try {
+        await buildPgliteSnapshot('default', { fixtureDir: dir, log: () => {}, buildData: async () => {
+          writeFileSync(join(dir, 'observed.json'), readFileSync(join(snapshotProfile('default', dir).lock, 'owner.json')));
+          while (!existsSync(join(dir, 'release'))) await Bun.sleep(5);
+          if (process.argv[2] === 'true') throw new Error('expected build failure');
+          return new TextEncoder().encode('complete artifact');
+        }});
+      } catch { process.exit(1); }
+    `;
+    const child = Bun.spawn([process.execPath, '-e', code, dir, String(failed)], {
+      cwd: resolve(import.meta.dir, '../..'), stdout: 'ignore', stderr: 'ignore',
+    });
+    try {
+      const deadline = Date.now() + 5000;
+      while (!existsSync(observedPath) && Date.now() < deadline) await Bun.sleep(5);
+      const observed = JSON.parse(readFileSync(observedPath, 'utf8'));
+      writeFileSync(releasePath, 'continue');
+      expect(await child.exited).toBe(failed ? 1 : 0);
+      expect(existsSync(paths.lock)).toBe(false);
+      mkdirSync(paths.lock);
+      const replacement = JSON.stringify(owner(process.pid, 'live-after-normal-release'));
+      writeFileSync(join(paths.lock, 'owner.json'), replacement);
+      expect(reclaimDeadSnapshotOwner(paths.lock, observed)).toBe(false);
+      expect(readFileSync(join(paths.lock, 'owner.json'), 'utf8')).toBe(replacement);
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+  });
+
   test('foreign and missing process identities cannot be reclaimed even when their PID is absent locally', async () => {
     const pid = await departedPid();
     const local = owner(pid, 'foreign-owner');
@@ -150,6 +189,7 @@ describe('snapshot lock ownership and atomic publication', () => {
       { ...local, hostname: `${local.hostname}-other-host` },
       { ...local, pidNamespace: `${local.pidNamespace}-other-namespace` },
       { ...local, pid: process.pid, pidNamespace: `${local.pidNamespace}-live-foreign-namespace` },
+      { ...local, protocol: undefined },
       { pid, token: 'legacy-record-without-identity' },
     ];
     for (let index = 0; index < identities.length; index++) {
