@@ -141,19 +141,19 @@ exit "$failed"
 }
 
 describe('run-unit-shard.sh bounded processes', () => {
-  for (const count of [180, 181, 361]) {
-    it(`executes the exact ordered ${count}-file inventory in groups of at most 180`, () => {
+  for (const count of [1, 2, 3]) {
+    it(`executes the exact ordered ${count}-file inventory with one Bun process per file`, () => {
       const result = runGroupedFixture(count);
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
-      expect(result.calls.map(c => c.args.length - 3)).toEqual(count === 180 ? [180] : count === 181 ? [180, 1] : [180, 180, 1]);
+      expect(result.calls.map(c => c.args.length - 3)).toEqual(count === 1 ? [1] : count === 2 ? [1, 1] : [1, 1, 1]);
       expect(result.calls.flatMap(c => c.args.slice(3))).toEqual(result.files);
       expect(result.output).toContain(`files=${count} pass=${count} fail=0 skip=0 rc=0`);
     });
   }
 
   it('preserves selected order, timeout/concurrency flags and safe routing on every process', () => {
-    const result = runGroupedFixture(361, 'pass', '1/2');
+    const result = runGroupedFixture(3, 'pass', '1/2');
     expect(result.status).toBe(0);
     expect(result.calls.flatMap(c => c.args.slice(3))).toEqual(result.files.filter((_, i) => i % 2 === 0));
     for (const call of result.calls) {
@@ -163,27 +163,27 @@ describe('run-unit-shard.sh bounded processes', () => {
   });
 
   it('continues after a middle-group test failure and retains the failure in its aggregate', () => {
-    const result = runGroupedFixture(361, 'fail-middle');
+    const result = runGroupedFixture(3, 'fail-middle');
     expect(result.status).toBe(1);
     expect(result.calls.flatMap(c => c.args.slice(3))).toEqual(result.files);
-    expect(result.output).toContain('groups=3 complete_groups=3 files=361 pass=360 fail=1 skip=0 rc=1');
+    expect(result.output).toContain('groups=3 complete_groups=3 files=3 pass=2 fail=1 skip=0 rc=1');
   });
 
   for (const mode of ['crash-middle', 'missing-summary', 'wrong-count', 'missing-header']) {
     it(`fails closed for ${mode}, attempts later files, and never invents missing results`, () => {
-      const result = runGroupedFixture(361, mode);
+      const result = runGroupedFixture(3, mode);
       expect(result.status).toBe(1);
       expect(result.calls.flatMap(c => c.args.slice(3))).toEqual(result.files);
-      expect(result.output).toContain('groups=3 complete_groups=2 files=361 pass=181 fail=0 skip=0 rc=1');
+      expect(result.output).toContain('groups=3 complete_groups=2 files=3 pass=2 fail=0 skip=0 rc=1');
       expect(result.output).toContain('group 2/3 incomplete');
       if (mode === 'crash-middle') expect(result.output).toContain('bun_rc=137');
     });
   }
 
   it('uses final group summaries and the parent aggregate without double-counting child Bun output', () => {
-    const result = runGroupedFixture(181, 'nested-summary');
+    const result = runGroupedFixture(2, 'nested-summary');
     expect(result.status).toBe(0);
-    expect(result.output).toContain('groups=2 complete_groups=2 files=181 pass=181 fail=0 skip=0 rc=0');
+    expect(result.output).toContain('groups=2 complete_groups=2 files=2 pass=2 fail=0 skip=0 rc=0');
     const parent = readFileSync(join(REPO_ROOT, 'scripts/run-unit-parallel.sh'), 'utf8');
     const countFunction = parent.slice(parent.indexOf('bun_summary_count() {'), parent.indexOf('# shard_total_files:'));
     const root = mkdtempSync(join(tmpdir(), 'gbrain-unit-counts-test-'));
@@ -191,12 +191,12 @@ describe('run-unit-shard.sh bounded processes', () => {
       const log = join(root, 'shard.log');
       writeFileSync(log, result.output);
       const out = execFileSync('bash', ['-c', `strip_ansi() { sed 's/\x1b\\[[0-9;]*[a-zA-Z]//g' "$1"; }\n${countFunction}\nbun_summary_count pass "$1"`, 'count-test', log], { encoding: 'utf8' });
-      expect(out.trim()).toBe('181');
+      expect(out.trim()).toBe('2');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('keeps grouped crashes and absent final aggregates out of the parent exit-hang warn-pass lane', () => {
-    const result = runGroupedFixture(361, 'missing-summary');
+    const result = runGroupedFixture(3, 'missing-summary');
     const parent = readFileSync(join(REPO_ROOT, 'scripts/run-unit-parallel.sh'), 'utf8');
     const gate = parent.slice(parent.indexOf('    grouped_incomplete=0'), parent.indexOf('    if [ "$grouped_incomplete" = "0" ]'));
     expect(gate).not.toBe('');

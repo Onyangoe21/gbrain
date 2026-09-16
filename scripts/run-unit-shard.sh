@@ -9,7 +9,7 @@
 # the runner container, each pinned to its own postgres shard for the
 # downstream E2E phase.
 #
-# Sequential bun processes within a shard (at most 180 files per process);
+# One Bun process per file within a shard;
 # parallel across shards (4 of these run concurrently).
 
 set -euo pipefail
@@ -93,9 +93,9 @@ fi
 TEST_TIMEOUT_MS=$((60000 * MULT))
 
 echo "[unit-shard ${RUNNER_SHARD:-(unsharded)}] running ${#files[@]} files (timeout=${TEST_TIMEOUT_MS}ms)"
-# Bound accumulated per-process runtime state without increasing shard workers.
-# Keep ordinary failures local to a group so every selected file is attempted.
-GROUP_SIZE=180
+# Do not retain runtime/module state across file boundaries. Keep the existing
+# worker count and attempt every selected file after ordinary failures.
+GROUP_SIZE=1
 GROUPS_TOTAL=$(( (${#files[@]} + GROUP_SIZE - 1) / GROUP_SIZE ))
 GROUP_LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gbrain-unit-groups.XXXXXX")
 trap 'rm -rf "$GROUP_LOG_DIR"' EXIT
