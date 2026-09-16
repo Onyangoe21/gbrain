@@ -4,6 +4,11 @@ Each accepted mutation has a durable request UUID scoped to one brain and one
 authenticated principal. A response distinguishes acceptance from commitment.
 Keep the UUID and original arguments until the request reaches a terminal state.
 
+**Say to your agent:** *"Update this page without overwriting a newer revision;
+use `get_page` and `put_page`, then check the durable receipt."* Or: *"Inspect my
+writer owners with `gbrain sources writer status --probe --json` before changing
+the setup."*
+
 ## Read, edit, and retry
 
 Read an existing page with `get_page` and `include_content: true`. Preserve its
