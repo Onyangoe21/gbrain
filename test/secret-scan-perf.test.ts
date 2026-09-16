@@ -7,17 +7,18 @@
  * JSON line: ~4 s; 160k chars of repeated `redis://:`: ~5.6 s; 5000 Bearer
  * tokens on one line: ~2.6 s vs 41 ms one-per-line; 200 KB of `-eyJ`: ~25 s;
  * 210 KB of `-apikey`: ~42 s; 2000 PEM headers without END ahead of a 1 MB
- * tail: ~3.8 s; redacting a 1 MB transcript with ~5k unique values: ~3 s).
- * The thresholds sit 3-50x above the fixed timings and 10-1000x below the
- * broken ones, so they bind on a regression without flaking on a loaded CI
- * box.
+ * tail: ~3.8 s; 20000 PEM headers on ONE line ahead of an 8 MB newline-free
+ * tail: ~8 s (~30 s at 23 MB); redacting a 1 MB transcript with ~5k unique
+ * values: ~3 s). The thresholds sit 2-50x above the fixed timings and
+ * 10-1000x below the broken ones, so they bind on a regression without
+ * flaking on a loaded CI box.
  *
  * Every credential-shaped value is synthetic and runtime-joined from >= 2
  * fragments; constant names keep scanner keywords away from the `=`.
  */
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'crypto';
-import { redactFindings, scanText } from '../src/core/secret-scan.ts';
+import { BEARER_ECHO_MAX_UNIQUE, redactFindings, scanText } from '../src/core/secret-scan.ts';
 
 function elapsedMs(fn: () => void): number {
   const t0 = performance.now();
@@ -249,6 +250,59 @@ describe('PEM_BLOCK_RE is linear in headers and text', () => {
     expect(findings.map((f) => f.line)).toEqual(Array.from({ length: 2000 }, (_, k) => 10_001 + 3 * k));
     expect(ms).toBeLessThan(300);
   });
+
+  test('20000 header mentions on ONE line ahead of an 8 MB newline-free tail: 20000 findings on line 1, < 1500ms (was ~8 s)', () => {
+    // The running cursor used to call `text.indexOf('\n', cursor)` once per
+    // hit; with no `\n` anywhere after the cursor each call rescanned to the
+    // end of the text and returned -1 — O(hits × text) through a different
+    // door (~30 s with a 23 MB tail, inside SCAN_MAX_FILE_BYTES). The
+    // next-newline position is carried as state now and a -1 is sticky, so
+    // the newline search is O(text) total. What remains of the timing is the
+    // bounded PEM body probe (20000 headers × PEM_BODY_MAX_CHARS) plus the
+    // per-line patterns over the 8 MB line — the accepted constants.
+    const header = ['-----BEGIN', ' RSA PRIVATE KEY', '-----'].join('');
+    const text = Array.from({ length: 20_000 }, () => header + ' ').join('') + 'x'.repeat(8 << 20);
+    let findings: ReturnType<typeof scanText> = [];
+    const ms = elapsedMs(() => { findings = scanText(text); });
+    expect(findings.length).toBe(20_000);
+    expect(findings.every((f) => f.pattern === 'private_key_pem' && f.line === 1)).toBe(true);
+    expect(ms).toBeLessThan(1500);
+  });
+
+  test('the carried newline position stays exact when hits and newlines interleave on and between lines', () => {
+    const header = ['-----BEGIN', ' RSA PRIVATE KEY', '-----'].join('');
+    const text = `a\n${header}\nb\nc\n${header} ${header}\n\n${header}`;
+    expect(scanText(text).map((f) => f.line)).toEqual([2, 5, 5, 7]);
+  });
+});
+
+describe('the bearer echo pass is one bounded regex over the text', () => {
+  // At most BEARER_ECHO_MAX_UNIQUE alternatives, one String.replace: the cost
+  // is O(text × alternatives) with the alternative count capped, never one
+  // replaceAll per unique value (5000 unique Bearer tokens on one line stays
+  // under the 200 ms pin below with only the first 64 in the alternation).
+  const vals = Array.from({ length: BEARER_ECHO_MAX_UNIQUE }, (_, k) => `${OPAQUE}${k.toString(36).padStart(4, 'z')}`);
+
+  test('64 unique bearer claims ahead of an 8 MB tail with no echo: redact < 400ms', () => {
+    const text = vals.map((v) => `Bearer ${v}`).join(' ') + '\n' + 'x'.repeat(8 << 20);
+    let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
+    const ms = elapsedMs(() => { result = redactFindings(text); });
+    expect(result.redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE);
+    expect(result.text.includes(OPAQUE)).toBe(false);
+    expect(ms).toBeLessThan(400);
+  });
+
+  test('the adversarial tail — 4 MB of bearer-class chars sharing the values\' prefix, so every 7th position is a candidate start for all 64 alternatives: < 1500ms', () => {
+    // Bounds the alternation's constant factor: each candidate position walks
+    // the shared prefix once per alternative before failing. Linear in the
+    // text, bounded by the cap; the ~370 ms measured is the accepted cost.
+    const text = vals.map((v) => `Bearer ${v}`).join(' ') + '\n' + 'opaqueT'.repeat((4 << 20) / 7);
+    let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
+    const ms = elapsedMs(() => { result = redactFindings(text); });
+    expect(result.redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE);
+    expect(result.text.includes(OPAQUE)).toBe(false);
+    expect(ms).toBeLessThan(1500);
+  });
 });
 
 describe('redactFindings is linear in unique values (span-splice, not replaceAll per value)', () => {
@@ -273,7 +327,7 @@ describe('redactFindings is linear in unique values (span-splice, not replaceAll
     expect(ms).toBeLessThan(400);
   });
 
-  test('5000 UNIQUE Bearer tokens on one line: redact < 200ms (was ~360 ms)', () => {
+  test('5000 UNIQUE Bearer tokens on one line: redact < 200ms (was ~360 ms; the echo pass adds only its 64-alternative regex)', () => {
     const line = Array.from({ length: 5000 }, (_, k) => `Bearer ${OPAQUE}${k.toString(36).padStart(4, 'z')}`).join(' ');
     let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
     const ms = elapsedMs(() => { result = redactFindings(line); });

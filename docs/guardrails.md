@@ -114,9 +114,17 @@ the "Environment variables and cwd `.env` files" section of `SECURITY.md`.
 
 **Loading is fail-closed.** If `GBRAIN_GUARDRAILS_MODULE` is set but the module
 fails to import or registers zero providers, the CLI exits 1 instead of
-silently running without the firewall you configured. (The *classify* path
-stays fail-open — a registered provider that throws never breaks an ingest.)
-Unset, the variable costs nothing and gbrain stays inert.
+silently running without the firewall you configured. The same holds at the
+cwd boundary: when a `.env` in the current directory assigns
+`GBRAIN_GUARDRAILS_MODULE` and a non-empty value was dropped, gbrain does
+**not** re-run without it — it refuses to run (exit 1,
+`guardrails: GBRAIN_GUARDRAILS_MODULE is assigned by a .env file in the
+current directory; refusing to run without the operator's firewall …`),
+because Bun merges that file before gbrain starts and the value you exported
+cannot be told apart from the file's. Remove the assignment from the project's
+`.env` or run from another directory; a benign repository never sets this key.
+(The *classify* path stays fail-open — a registered provider that throws never
+breaks an ingest.) Unset, the variable costs nothing and gbrain stays inert.
 
 ### Provider responsibilities
 

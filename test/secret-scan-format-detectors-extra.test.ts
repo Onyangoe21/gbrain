@@ -87,6 +87,14 @@ describe('bearer catch-all — floor and left boundary', () => {
     expect(redactFindings(line).text).toBe('Authorization: BEARER <REDACTED:bearer>');
   });
 
+  test('a token claimed behind an all-caps BEARER header is echo-redacted where it recurs bare', () => {
+    // The echo pass keys on the claimed VALUE, not the keyword spelling, so a
+    // token anchored by any accepted spelling is scrubbed at its bare echoes.
+    const { text, redactions } = redactFindings(`Authorization: BEARER ${OPAQUE}\nretrying with ${OPAQUE}`);
+    expect(redactions.length).toBe(1);
+    expect(text).toBe('Authorization: BEARER <REDACTED:bearer>\nretrying with <REDACTED:bearer>');
+  });
+
   test('BEARER <vendor key> still keeps the vendor attribution', () => {
     const anthropicShape = ['sk-ant-', 'api03-Zz9Yy8Xx7Ww6Vv5Uu4Tt3'].join('');
     expect(scanText(`BEARER ${anthropicShape}`).map((f) => f.pattern)).toEqual(['anthropic']);

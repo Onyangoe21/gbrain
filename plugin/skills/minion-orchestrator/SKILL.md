@@ -118,8 +118,11 @@ tasks where no LLM reasoning loop is needed.
 ### Preconditions (read before submitting your first shell job)
 
 - **The worker must be started with `gbrain jobs work --allow-shell-jobs`** (equivalently `GBRAIN_ALLOW_SHELL_JOBS=1` exported on the worker; a `.env` in the worker's directory cannot set it).
-  Without it, the shell handler refuses to register and submissions sit in
-  `waiting` silently. Gate lives in `src/core/minions/handlers/shell.ts`.
+  The shell handler is always registered but guarded: an unflagged worker that
+  claims a shell job dead-letters it immediately (`UnrecoverableError`, straight
+  to `dead`, no retries) with the flag named in `error_text`. A job that sits in
+  `waiting` means NO worker is running at all — check
+  `gbrain jobs supervisor status`. Gate lives in `src/core/minions/handlers/shell.ts`.
 - **Security:** flipping `GBRAIN_ALLOW_SHELL_JOBS=1` authorizes arbitrary
   command execution on the worker. On a shared queue, this is a remote code
   execution surface. Treat as privileged infrastructure authorization.

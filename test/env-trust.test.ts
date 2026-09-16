@@ -10,12 +10,14 @@
  * whatever its value.
  *
  * The dir is injected instead of process.chdir'd so these tests stay safe in
- * the parallel shard runner (pattern: test/config-env-hijack.test.ts).
+ * the parallel shard runner (pattern: test/config-env-hijack.test.ts). Scratch
+ * dirs are removed in `afterAll` — `process.on('exit')` never fires under
+ * `bun test`, which leaked one tmp dir per fixture per run.
  */
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import {
   CWD_DOTENV_FILES,
   CWD_DOTENV_PROTECTED_KEYS,
@@ -39,7 +41,7 @@ function tmpProject(envFiles: Record<string, string>): string {
   }
   return dir;
 }
-process.on('exit', () => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
+afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
 
 describe('cwdDotenvAssignsKey', () => {
   test('true when any auto-loaded .env variant assigns the key, regardless of value', () => {
@@ -91,9 +93,28 @@ describe('CWD_DOTENV_PROTECTED_KEYS', () => {
       expect(CWD_DOTENV_PROTECTED_KEYS).toContain(k);
     }
     // Deliberately NOT protected (documented service deployments co-locate them).
-    for (const k of ['GBRAIN_ADMIN_BOOTSTRAP_TOKEN', 'GBRAIN_HTTP_CORS_ORIGIN', 'GBRAIN_HTTP_TRUST_PROXY', 'GBRAIN_DATABASE_URL']) {
+    for (const k of ['GBRAIN_ADMIN_BOOTSTRAP_TOKEN', 'GBRAIN_HTTP_CORS_ORIGIN', 'GBRAIN_HTTP_TRUST_PROXY']) {
       expect(CWD_DOTENV_PROTECTED_KEYS).not.toContain(k);
     }
+  });
+
+  // Review cycle 3: a cwd .env that assigns GBRAIN_DATABASE_URL retargets every
+  // hook, query and write at a planted database (the sibling
+  // GBRAIN_DIRECT_DATABASE_URL was already protected for the same reason), and a
+  // planted OAuth relay is handed the operator's tokens. The #427 VALUE guard in
+  // config.ts is untouched — it still never auto-ignores GBRAIN_DATABASE_URL —
+  // the KEY-PRESENCE quarantine is what drops a cwd-.env-assigned one.
+  test('GBRAIN_DATABASE_URL and GBRAIN_OAUTH_RELAY_URL are protected (review cycle 3)', () => {
+    for (const k of ['GBRAIN_DATABASE_URL', 'GBRAIN_OAUTH_RELAY_URL']) {
+      expect(CWD_DOTENV_PROTECTED_KEYS).toContain(k);
+      expect(isCwdDotenvProtectedKey(k)).toBe(true);
+    }
+    const dir = tmpProject({ '.env': 'GBRAIN_DATABASE_URL=postgres://planted.example.test/brain\n' });
+    const env: Record<string, string | undefined> = { GBRAIN_DATABASE_URL: 'postgres://planted.example.test/brain' };
+    const warnings: string[] = [];
+    expect(quarantineCwdDotenv(env, dir, { warn: (m) => warnings.push(m) })).toEqual(['GBRAIN_DATABASE_URL']);
+    expect('GBRAIN_DATABASE_URL' in env).toBe(false);
+    expect(warnings[0]).toContain('Ignoring GBRAIN_DATABASE_URL because a .env file in the current directory assigns it');
   });
 
   test('endpoint-redirect GBRAIN_* keys and the sanitized re-run marker are protected (review cycle 2)', () => {
@@ -267,7 +288,7 @@ describe('non-GBRAIN hijack families (A2)', () => {
       expect(isCwdDotenvProtectedKey(k)).toBe(true);
     }
     // Ordinary project variables keep loading from a cwd .env.
-    for (const k of ['GITHUB_TOKEN', 'GBRAIN_SOURCE', 'DATABASE_URL', 'PATH', 'HOME', 'LDFLAGS', 'NODE_ENV', 'OPENAI_API_KEY', 'GITLAB_CI', 'BUNDLE_PATH']) {
+    for (const k of ['GITHUB_TOKEN', 'GBRAIN_SOURCE', 'DATABASE_URL', 'PATH', 'LDFLAGS', 'NODE_ENV', 'OPENAI_API_KEY', 'GITLAB_CI', 'BUNDLE_PATH', 'TMPFILE', 'HOMEBREW_PREFIX']) {
       expect(isCwdDotenvProtectedKey(k)).toBe(false);
     }
     // Review cycle 2 (red team): XDG config roots git reads as GLOBAL config, TLS trust roots,
@@ -279,6 +300,13 @@ describe('non-GBRAIN hijack families (A2)', () => {
       'OPENROUTER_BASE_URL', 'LITELLM_BASE_URL', 'OLLAMA_BASE_URL', 'LMSTUDIO_BASE_URL',
       'LLAMA_SERVER_BASE_URL', 'LLAMA_SERVER_RERANKER_BASE_URL',
     ]) {
+      expect(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).toContain(k);
+      expect(isCwdDotenvProtectedKey(k)).toBe(true);
+    }
+    // Review cycle 3: OpenSSL code loading for every OpenSSL-linked child, the temp
+    // root the sanitized re-run's neutral dir is created under, and HOME (inert while
+    // exported, live when a cron/systemd unit leaves it unset).
+    for (const k of ['OPENSSL_CONF', 'OPENSSL_ENGINES', 'OPENSSL_MODULES', 'TMPDIR', 'TMP', 'TEMP', 'HOME', 'USERPROFILE']) {
       expect(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).toContain(k);
       expect(isCwdDotenvProtectedKey(k)).toBe(true);
     }

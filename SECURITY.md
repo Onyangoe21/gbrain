@@ -69,6 +69,11 @@ process environment before any gbrain code runs, for `bun run` and for
 compiled binaries alike, and it expands `${VAR}` references inside those
 files. A `.env` committed into a cloned repository is therefore **untrusted
 input** — it was written by whoever authored the repo, not by you.
+Compiled `gbrain` binaries are built with `--no-compile-autoload-bunfig`, so a
+`bunfig.toml` in the working directory is inert — it cannot preload code into
+the binary before gbrain starts (a CI guard keeps every build invocation
+flagged). The development runtime `bun src/cli.ts` stays bun-native; a
+contributor's own working directory is trusted.
 
 **The trust boundary.** Security-relevant variables are honored from your
 shell environment, from a service `EnvironmentFile`, and from
@@ -93,8 +98,11 @@ gbrain spawns — git, the claude CLI, workers — inherits the clean view. The
 internal variable `GBRAIN_CWD_ENV_QUARANTINED` marks the re-run — it is not a
 setting, and gbrain honours it only when it provably started in the empty
 directory the marker names. A signal-killed re-run maps to exit 128+signal;
-Ctrl-C reaches the re-run directly from your terminal, and SIGTERM/SIGHUP sent
-to the wrapper are forwarded. gbrain processes that gbrain itself starts from
+with a terminal attached, Ctrl-C reaches the re-run directly from your
+terminal and the wrapper does not forward it; with no terminal (a supervisor,
+cron, a pipe) a SIGINT that reaches the wrapper alone is forwarded once so the
+re-run is not orphaned; SIGTERM/SIGHUP sent to the wrapper are always
+forwarded. gbrain processes that gbrain itself starts from
 that directory (a supervised worker, a background push) repeat the step once
 for their own subtree. This costs nothing when the working directory has no
 `.env`, or when nothing protected is assigned there.
@@ -106,7 +114,10 @@ for their own subtree. This costs nothing when the working directory has no
   code-loading `GBRAIN_GUARDRAILS_MODULE`, `GBRAIN_PLUGIN_PATH`; exec-target
   `GBRAIN_CLAUDE_CLI_BIN`, `GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG`,
   `GBRAIN_JOB_CHILD_CLI`, `GBRAIN_BIN_OVERRIDE`; root/registry redirect
-  `GBRAIN_HOME`, `GBRAIN_MOUNTS_PATH`; posture-widening
+  `GBRAIN_HOME`, `GBRAIN_MOUNTS_PATH`; the brain connection string
+  `GBRAIN_DATABASE_URL` (a cwd `.env` would retarget every hook, query and
+  write at a database it names — the `DATABASE_URL` value guard covers only
+  the bare name) and the OAuth relay `GBRAIN_OAUTH_RELAY_URL`; posture-widening
   `GBRAIN_ALLOW_SHELL_JOBS`, `GBRAIN_ALLOW_PRIVATE_REMOTES`,
   `GBRAIN_ALLOW_UNVERIFIED_REMOTE`, `GBRAIN_GIT_ALLOW_FILE_TRANSPORT`,
   `GBRAIN_ALLOW_MASS_RECONCILE`, `GBRAIN_ALLOW_DEFAULT_WRITE`,
@@ -120,7 +131,14 @@ for their own subtree. This costs nothing when the working directory has no
   `NODE_TLS_REJECT_UNAUTHORIZED`), the `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/
   `XDG_CACHE_HOME` and `GNUPGHOME` roots that git and other tools read as
   global configuration, the `SSL_CERT_FILE`/`SSL_CERT_DIR`/`CURL_CA_BUNDLE`/
-  `REQUESTS_CA_BUNDLE` trust stores, `EDITOR`/`VISUAL`/`PAGER`, ssh askpass
+  `REQUESTS_CA_BUNDLE` trust stores, the OpenSSL provider/engine loaders
+  (`OPENSSL_CONF`, `OPENSSL_ENGINES`, `OPENSSL_MODULES` — a planted
+  configuration loads a shared object into every OpenSSL-linked child such as
+  git over https), the temp roots (`TMPDIR`, `TMP`, `TEMP`) that the sanitized
+  re-run's neutral directory and every temp write resolve through, `HOME` and
+  `USERPROFILE` (inert while exported, but where `HOME` is unset a planted
+  value would relocate `~/.gitconfig`, `~/.ssh` and `~/.gbrain` into the
+  checkout), `EDITOR`/`VISUAL`/`PAGER`, ssh askpass
   programs, interpreter preload for Python/Perl/Ruby helpers, HTTP(S)/ALL proxy
   variables in both spellings, and every AI-provider endpoint or credential
   variable gbrain's gateway reads from the environment (`CLAUDE_CONFIG_DIR`,
@@ -134,7 +152,15 @@ for their own subtree. This costs nothing when the working directory has no
 
 `GBRAIN_GUARDRAILS_MODULE` additionally accepts only an absolute path or a
 `~/` path: cwd-relative specs and bare package names are refused (a package
-name would resolve from the current directory's `node_modules`).
+name would resolve from the current directory's `node_modules`). It is also
+the one key that fails closed at the cwd boundary: when a cwd `.env` assigns
+it and a non-empty value was dropped, gbrain does not re-run without it — it
+refuses to start (exit 1, `guardrails: GBRAIN_GUARDRAILS_MODULE is assigned by
+a .env file in the current directory; refusing to run without the operator's
+firewall …`), because Bun merges the file before gbrain starts and a value you
+exported cannot be told apart from the file's. A benign repository never
+assigns this gbrain-specific key; your own setting belongs in your shell or in
+`~/.gbrain/.env`.
 
 **Semantics worth knowing.**
 
@@ -150,8 +176,11 @@ name would resolve from the current directory's `node_modules`).
   untouched unless the cwd `.env` assigns that same name.
 - *Everything else still loads.* Routing and tuning `GBRAIN_*` variables and
   every variable not listed above still load from a cwd `.env` as before.
-  `DATABASE_URL` keeps its own, value-matching guard (see `docs/ENGINES.md`);
-  `GBRAIN_DATABASE_URL` is always honored.
+  `DATABASE_URL` keeps its own, value-matching guard (see `docs/ENGINES.md`).
+  `GBRAIN_DATABASE_URL` exported from your shell is always honored, but a
+  `GBRAIN_DATABASE_URL` *assigned by a cwd `.env`* is dropped like any other
+  protected key — a project directory never gets to choose which brain you
+  write to. Move it to your shell or `~/.gbrain/.env`.
 - *Your own config directory.* Running gbrain from inside `~/.gbrain` (or
   `$GBRAIN_HOME/.gbrain`) makes its `.env` the "cwd `.env`". That file is
   yours, so it is honored without a warning — unless a cwd `.env` assigns

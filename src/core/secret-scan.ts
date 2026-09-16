@@ -16,9 +16,10 @@
  *
  * Every surface prints the one canonical token `<REDACTED:pattern>` [ENG-9]:
  * finding previews render through `redactSecretsInText`, the corpus writer
- * (`redactFindings`) splices the same token over each claimed span — neither
- * ever contains the secret value, and this module never returns raw matched
- * values.
+ * (`redactFindings`) splices the same token over each claimed span and then
+ * scrubs bare echoes of the bearer values it claimed (bounded, see there) —
+ * neither ever contains the secret value, and this module never returns raw
+ * matched values.
  *
  * The generic high-entropy assignment heuristic is OFF by default (opt-in
  * via `ScanOpts.highEntropy`) — named-prefix patterns are precise; the
@@ -473,16 +474,24 @@ interface RawHit extends LineSpan {
  * matched block so buildPreview / redactSecretsInText replace the entire span
  * with `<REDACTED:private_key_pem>`.
  *
- * The 1-based header line is counted INCREMENTALLY: a running cursor walks
- * the text between consecutive hits (global exec yields them in ascending
- * index order), so the pass is O(text) overall. Recomputing it per hit with
- * `text.slice(0, m.index).split('\n')` was O(hits × text).
+ * The 1-based header line is counted INCREMENTALLY: the position of the NEXT
+ * `\n` is carried as state across hits (global exec yields them in ascending
+ * index order). Each `indexOf` resumes where the previous one stopped and a
+ * -1 (no newline left in the text) is sticky, so the newline search touches
+ * every character at most once and the pass is O(text) however the newlines
+ * are distributed. Two earlier forms were O(hits × text): recomputing
+ * `text.slice(0, m.index).split('\n')` per hit, and a cursor that re-ran
+ * `text.indexOf('\n', cursor)` per hit — when no `\n` follows the cursor that
+ * call rescans to the end of the text and returns -1 once PER HIT (20000
+ * header mentions on one line ahead of an 8 MB newline-free tail took ~8 s;
+ * ~30 s with a 23 MB tail, inside SCAN_MAX_FILE_BYTES). Pinned in
+ * test/secret-scan-perf.test.ts.
  */
 function scanPemBlocks(text: string): RawHit[] {
   const hits: RawHit[] = [];
   PEM_BLOCK_RE.lastIndex = 0;
-  let cursor = 0;
   let line = 1;
+  let nextNl = text.indexOf('\n');
   let m: RegExpExecArray | null;
   while ((m = PEM_BLOCK_RE.exec(text)) !== null) {
     const value = m[0];
@@ -490,10 +499,10 @@ function scanPemBlocks(text: string): RawHit[] {
       PEM_BLOCK_RE.lastIndex++; // zero-width safety
       continue;
     }
-    for (let nl = text.indexOf('\n', cursor); nl !== -1 && nl < m.index; nl = text.indexOf('\n', nl + 1)) {
+    while (nextNl !== -1 && nextNl < m.index) {
       line++;
+      nextNl = text.indexOf('\n', nextNl + 1);
     }
-    cursor = m.index;
     const span: LineSpan = { pattern: 'private_key_pem', value, start: 0 };
     hits.push({ ...span, line, abs: m.index, lineText: value, spans: { all: [span] } });
   }
@@ -736,15 +745,34 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
  *
  * SEMANTIC DELTA (deliberate): `replaceAll` also scrubbed a claimed value at
  * positions the scanner did NOT claim — the same bytes embedded inside a
- * longer identifier, or a bare re-occurrence that no pattern anchors (an
- * opaque bearer token repeated without its `Bearer ` keyword). The splice
- * redacts exactly the claimed spans, so `redactFindings(text).text` now
- * agrees byte-for-byte with what `scanText(text)` reports: the corpus write
- * and the push gate see the same findings. A value that recurs on two lines
- * is two claimed spans and both are redacted; a value that is a substring of
- * another claimed value is moot, because claimed spans never overlap (the
- * per-line bitmap dedupe keeps them disjoint) — the longest-first ordering
- * the replaceAll form needed no longer exists.
+ * longer identifier, or a bare re-occurrence that no pattern anchors. The
+ * splice redacts exactly the claimed spans, so for every pattern but one
+ * `redactFindings(text).text` agrees byte-for-byte with what `scanText(text)`
+ * reports: the corpus write and the push gate see the same findings. A value
+ * that recurs on two lines is two claimed spans and both are redacted; a
+ * value that is a substring of another claimed value is moot, because
+ * claimed spans never overlap (the per-line bitmap dedupe keeps them
+ * disjoint) — the longest-first ordering the replaceAll form needed no
+ * longer exists.
+ *
+ * THE ONE EXCEPTION — the bounded bearer echo pass. An opaque bearer token
+ * is claimed only where its `Bearer ` keyword anchors it, and transcripts
+ * routinely echo the same token bare (`Authorization: Bearer <tok>` in a
+ * tool call, then `<tok>` alone in the assistant's reply), so the splice
+ * alone shipped the echo. After the splice, ONE more `String.replace` over
+ * the output redacts every remaining occurrence of the unique values the
+ * `bearer` pattern claimed — bare or embedded inside a longer identifier —
+ * as `<REDACTED:bearer>`. It is bounded on both axes: values must be
+ * >= BEARER_ECHO_MIN_CHARS, and only the first BEARER_ECHO_MAX_UNIQUE unique
+ * values (claim order) join a single escaped-alternation RegExp (longest
+ * first, so a value that is a prefix of another is not cut short), so the
+ * pass is O(text) with a bounded regex, never one replaceAll per value. A
+ * bearer token past the cap is the accepted miss. The pass adds NO findings:
+ * `redactions` stays one record per CLAIMED occurrence, and an echo is not a
+ * claim. It is deliberately NOT extended to `high_entropy_assignment` — a
+ * real transcript claims thousands of unique entropy values, and any
+ * per-value re-scan would re-open the O(unique values × text) cost the
+ * splice removed; the pass stays a bearer-only boundary.
  *
  * Per-line spans are disjoint from each other by construction; a per-line
  * span can only overlap a whole-text PEM block (a bearer value whose class
@@ -752,6 +780,21 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
  * by emitting the uncovered tail of the later span as its own token rather
  * than skipping it, so nothing claimed is ever left in the output.
  */
+/**
+ * Floor for a `bearer` value to take part in the echo pass. The `bearer`
+ * pattern's own class is `{20,}`, so every claimed value already clears it;
+ * restated here so a pattern edit alone can never widen the echo pass to
+ * short, collision-prone values.
+ */
+export const BEARER_ECHO_MIN_CHARS = 20;
+
+/**
+ * Cap on the unique bearer values the echo pass will look for (claim order,
+ * first N). The cap is what keeps the pass a single bounded regex over the
+ * text; an echo of a token past the cap is the documented, accepted miss.
+ */
+export const BEARER_ECHO_MAX_UNIQUE = 64;
+
 export function redactFindings(
   text: string,
   opts: ScanOpts = {},
@@ -759,11 +802,19 @@ export function redactFindings(
   const allowlist = opts.allowlist ?? [];
   const redactions: SecretFinding[] = [];
   const claimed: Array<{ abs: number; end: number; pattern: string }> = [];
+  const bearerValues = new Set<string>();
   for (const hit of scanInternal(text, opts)) {
     const fullHex = sha256Hex(hit.value);
     if (valueAllowlisted(fullHex, allowlist)) continue;
     redactions.push(toFinding(hit, fullHex));
     claimed.push({ abs: hit.abs, end: hit.abs + hit.value.length, pattern: hit.pattern });
+    if (
+      hit.pattern === 'bearer' &&
+      hit.value.length >= BEARER_ECHO_MIN_CHARS &&
+      bearerValues.size < BEARER_ECHO_MAX_UNIQUE
+    ) {
+      bearerValues.add(hit.value);
+    }
   }
   if (claimed.length === 0) return { text, redactions };
   claimed.sort((a, b) => a.abs - b.abs);
@@ -776,5 +827,28 @@ export function redactFindings(
     cur = c.end;
   }
   parts.push(text.slice(cur));
-  return { text: parts.join(''), redactions };
+  const spliced = parts.join('');
+  return {
+    text: bearerValues.size > 0 ? redactBearerEchoes(spliced, bearerValues) : spliced,
+    redactions,
+  };
+}
+
+/**
+ * One `String.replace` over the spliced output with an escaped alternation
+ * of the claimed bearer values, longest first. Every remaining occurrence —
+ * bare, or embedded inside a longer identifier — becomes `<REDACTED:bearer>`.
+ * The values never contain `<`/`>`/`:` (the bearer class), so a match can
+ * never straddle a token the splice already emitted.
+ */
+function redactBearerEchoes(text: string, values: Set<string>): string {
+  const alternation = [...values]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  return text.replace(new RegExp(alternation, 'g'), '<REDACTED:bearer>');
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

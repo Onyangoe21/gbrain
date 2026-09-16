@@ -243,7 +243,7 @@ scanning" for details.
 ## Building
 
 ```bash
-bun build --compile --outfile bin/gbrain src/cli.ts
+bun build --compile --no-compile-autoload-bunfig --outfile bin/gbrain src/cli.ts
 ```
 
 ## Adding a new operation

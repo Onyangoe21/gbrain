@@ -165,9 +165,12 @@ gbrain jobs work --allow-shell-jobs        # or: GBRAIN_ALLOW_SHELL_JOBS=1 gbrai
 
 `--allow-shell-jobs` (equivalently `GBRAIN_ALLOW_SHELL_JOBS=1` exported on the
 worker; a `.env` in the worker's directory cannot set it) is the worker-side
-opt-in. Without it, shell jobs sit in `waiting` indefinitely. Put the flag on
-the worker's command line (or the variable in its deploy unit / launchd
-plist), not per-submission — submitter env is a weak proxy for worker env.
+opt-in. The handler is always registered but guarded: an unflagged worker that
+claims a shell job dead-letters it immediately (`UnrecoverableError`, no
+retries) — a shell job that stays in `waiting` means no worker is running at
+all. Put the flag on the worker's command line (or the variable in its deploy
+unit / launchd plist), not per-submission — submitter env is a weak proxy for
+worker env.
 
 ## Decision table
 

@@ -14,7 +14,9 @@
  *   - The #427 DATABASE_URL guard (`config.ts:effectiveEnvDatabaseUrl`) is a
  *     VALUE match: the URL is ignored when it equals a cwd-.env assignment.
  *     Running gbrain inside a web-app checkout must not retarget the brain at
- *     that app's database; `GBRAIN_DATABASE_URL` is never auto-ignored.
+ *     that app's database. That value guard never touches
+ *     `GBRAIN_DATABASE_URL`; the key-presence quarantine below is what drops
+ *     it when a cwd .env ASSIGNS it (a planted brain URL is never intent).
  *   - The security quarantine below is a KEY-PRESENCE match: a protected key
  *     that any cwd .env file assigns is dropped, whatever its value. Value
  *     matching is unsound for a security list because Bun expands `${VAR}`
@@ -157,10 +159,11 @@ export function cwdDotenvAssignsKey(key: string, dir: DirOrAssignments = process
  * a hostile cloned repo, not a serve cwd — SECURITY.md says to launch
  * `serve --http` from a directory you control): GBRAIN_ADMIN_BOOTSTRAP_TOKEN,
  * GBRAIN_HTTP_CORS_ORIGIN, GBRAIN_HTTP_TRUST_PROXY. Deferred for a later
- * decision (TODOS): GBRAIN_DATABASE_URL, GBRAIN_SKILLS_DIR, GBRAIN_RECIPES_DIR,
- * GBRAIN_GITHUB_PAT. `test/env-trust-protected-keys.test.ts` fails when a new
- * suspicious-looking read appears in src/ without a decision here or a
- * `cwd-dotenv-ok:` annotation at the read site.
+ * decision (TODOS): GBRAIN_SKILLS_DIR, GBRAIN_RECIPES_DIR, GBRAIN_GITHUB_PAT.
+ * `test/env-trust-protected-keys.test.ts` fails when a new suspicious-looking
+ * read (`_BIN|_CLI|_MODULE|_PATH|_HOME|_URL` suffix, `GBRAIN_ALLOW_` prefix)
+ * appears in src/ without a decision here or a `cwd-dotenv-ok:` annotation at
+ * the read site.
  */
 export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   // --- code-loading: gbrain import()s the named module -------------------
@@ -174,9 +177,11 @@ export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   // --- root / registry redirect ------------------------------------------
   'GBRAIN_HOME',                     // relocates ~/.gbrain (config, .env, keys, registry)
   'GBRAIN_MOUNTS_PATH',              // brain mounts registry file
+  'GBRAIN_DATABASE_URL',             // THE brain connection string: a cwd .env would retarget every hook, query and write at a planted database; the #427 value guard covers only the bare DATABASE_URL, and this key is "stated intent" everywhere it is read
   'GBRAIN_DIRECT_DATABASE_URL',      // direct-pool override (connection-manager.ts): retargets brain writes at a planted host; has no #427 value guard
   'GBRAIN_REMOTE_MCP_URL',           // `init --remote` default: where the thin client sends its MCP traffic and bearer token
   'GBRAIN_REMOTE_ISSUER_URL',        // `init --remote` default: the OAuth issuer the client trusts and hands its credential to
+  'GBRAIN_OAUTH_RELAY_URL',          // the OAuth relay that hands back Google tokens (creds/relay-client.ts): a planted relay is token theft
   // --- re-run marker ------------------------------------------------------
   'GBRAIN_CWD_ENV_QUARANTINED',      // cli-preflight.ts's sanitized re-run marker; only honoured when the startup cwd IS the .env-free dir it names, so a planted one is inert — listed so it is also dropped and named in the warning
   // --- posture-widening ----------------------------------------------------
@@ -230,6 +235,13 @@ export const CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS: readonly string[] = [
   'SSL_CERT_FILE', 'SSL_CERT_DIR', // OpenSSL trust store override → a planted CA intercepts every HTTPS call the children make
   'CURL_CA_BUNDLE',               // curl's (and libcurl-linked git's) CA bundle override
   'REQUESTS_CA_BUNDLE',           // python requests' CA bundle override
+  // --- OpenSSL code loading: every OpenSSL-linked child (git over https, curl, python, ssh) ---
+  'OPENSSL_CONF',                 // a planted openssl.cnf names a provider/engine .so that OpenSSL dlopen()s at init
+  'OPENSSL_ENGINES',              // the directory OpenSSL loads engine .so files from
+  'OPENSSL_MODULES',              // the directory OpenSSL 3 loads provider .so files from
+  // --- per-user roots read raw from the environment by gbrain AND its children ---
+  'TMPDIR', 'TMP', 'TEMP',        // os.tmpdir() honours these at call time: a planted (even relative) value steers the sanitized re-run's neutral dir and every temp write into the hostile tree
+  'HOME', 'USERPROFILE',          // inert while exported (Bun never overrides a live variable) but under systemd/cron HOME is often UNSET, and the planted value then reaches process.env.HOME and every child's $HOME → ~/.gitconfig, ~/.ssh, ~/.gbrain resolve inside the checkout
   // --- programs the children hand control to -------------------------------
   'EDITOR', 'VISUAL',             // takes.ts spawns $EDITOR || $VISUAL — an arbitrary program
   'PAGER',                        // git (and other children) pipe output through it — an arbitrary program

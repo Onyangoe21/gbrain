@@ -470,7 +470,7 @@ jobs:
       # keyless and paid runs each pay the 2-4 min compile.
       - name: Build gbrain (compile once for both door runs)
         run: |
-          bun build --compile --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
+          bun build --compile --no-compile-autoload-bunfig --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
           echo "GBRAIN_COMPILED_BIN=$RUNNER_TEMP/gbrain-door-bin" >> "$GITHUB_ENV"
 
       # SECRETLESS provisioning: the npm registry verifies the per-platform
@@ -681,7 +681,7 @@ jobs:
 
       - name: Build gbrain (compile once for the doors)
         run: |
-          bun build --compile --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
+          bun build --compile --no-compile-autoload-bunfig --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
           echo "GBRAIN_COMPILED_BIN=$RUNNER_TEMP/gbrain-door-bin" >> "$GITHUB_ENV"
 
       - name: Install codex + claude (pinned npm versions, refuse on drift)
@@ -784,7 +784,7 @@ jobs:
       # Compile gbrain ONCE for both bun test invocations below.
       - name: Build gbrain (compile once for both door runs)
         run: |
-          bun build --compile --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
+          bun build --compile --no-compile-autoload-bunfig --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
           echo "GBRAIN_COMPILED_BIN=$RUNNER_TEMP/gbrain-door-bin" >> "$GITHUB_ENV"
 
       # SECRETLESS provisioning, pack-verify-install: `npm pack` DOWNLOADS
@@ -995,7 +995,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Build gbrain
         run: |
-          bun build --compile --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
+          bun build --compile --no-compile-autoload-bunfig --outfile "$RUNNER_TEMP/gbrain-door-bin" src/cli.ts
           echo "GBRAIN_COMPILED_BIN=$RUNNER_TEMP/gbrain-door-bin" >> "$GITHUB_ENV"
       - name: Install opencode@latest (unpinned — the whole point)
         timeout-minutes: 10

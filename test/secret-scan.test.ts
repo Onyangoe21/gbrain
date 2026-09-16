@@ -15,7 +15,7 @@ import { tmpdir } from 'os';
 import {
   scanText, scanFiles, redactFindings, loadWorkspaceAllowlist, matchesGlob,
   globToRegExp, shannonEntropy, pathAllowlisted, SCAN_ALLOW_FILENAME,
-  PEM_BODY_MAX_CHARS,
+  PEM_BODY_MAX_CHARS, BEARER_ECHO_MIN_CHARS, BEARER_ECHO_MAX_UNIQUE,
 } from '../src/core/secret-scan.ts';
 
 // Synthetic fixture values (never real keys).
@@ -622,8 +622,10 @@ describe('high-entropy assignment requires a digit in the value', () => {
 // buildPreview renders a WINDOW around the hit (not the whole line) and
 // redacts every claimed span inside it; redactFindings rebuilds the text by
 // splicing `<REDACTED:pattern>` over exactly the CLAIMED spans (sorted by
-// absolute offset, one pass) — not by replaceAll per unique value. Values
-// below are synthetic and runtime-joined from >= 2 fragments.
+// absolute offset, one pass) — not by replaceAll per unique value — and then
+// runs ONE bounded extra pass over bare echoes of the bearer values it
+// claimed (pinned in its own describe below). Values below are synthetic and
+// runtime-joined from >= 2 fragments.
 describe('redactFindings — span-splice semantics and preview window', () => {
   const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
   /** PREVIEW_MAX_CHARS (160) plus a leading and a trailing ellipsis. */
@@ -642,19 +644,22 @@ describe('redactFindings — span-splice semantics and preview window', () => {
     expect(redactions.map((r) => r.pattern)).toEqual(['bearer', 'db_url_credentials']);
   });
 
-  test('redacts exactly the claimed spans: the corpus write agrees with what scanText reports', () => {
+  test('redacts exactly the claimed spans (every pattern but bearer): the corpus write agrees with what scanText reports', () => {
     // Documented semantic delta from the replaceAll form: a claimed value's
     // bytes at a position the scanner did NOT claim (embedded inside a longer
-    // identifier, or a bare opaque re-occurrence with no `Bearer ` anchor)
-    // are left as-is, so `redactFindings(t).text` never redacts something
-    // `scanText(t)` would not have reported. A vendor-prefixed key repeated
-    // bare IS claimed on its own and both occurrences go.
-    const text = `Authorization: Bearer ${OPAQUE_VALUE}\nid=prefix${OPAQUE_VALUE}\nbare ${OPAQUE_VALUE}\nk=${OPENAI} again ${OPENAI}\n`;
-    const findings = scanText(text);
-    expect(findings.map((f) => [f.pattern, f.line])).toEqual([['bearer', 1], ['openai', 4], ['openai', 4]]);
-    const { text: out, redactions } = redactFindings(text);
+    // identifier, or a bare re-occurrence no pattern anchors) are left as-is,
+    // so `redactFindings(t).text` never redacts something `scanText(t)` would
+    // not have reported. The ONE exception is the bounded bearer echo pass,
+    // pinned in the next describe. A vendor-prefixed key repeated bare IS
+    // claimed on its own and both occurrences go; a keyword-anchored entropic
+    // value echoed bare is NOT redacted (the deliberate boundary, see below).
+    const HI = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
+    const text = `k=${OPENAI} again ${OPENAI}\napi_key = "${HI}"\nid=prefix${HI}\nbare ${HI}\n`;
+    const findings = scanText(text, { highEntropy: true });
+    expect(findings.map((f) => [f.pattern, f.line])).toEqual([['openai', 1], ['openai', 1], ['high_entropy_assignment', 2]]);
+    const { text: out, redactions } = redactFindings(text, { highEntropy: true });
     expect(redactions.length).toBe(findings.length);
-    expect(out).toBe(`Authorization: Bearer <REDACTED:bearer>\nid=prefix${OPAQUE_VALUE}\nbare ${OPAQUE_VALUE}\nk=<REDACTED:openai> again <REDACTED:openai>\n`);
+    expect(out).toBe(`k=<REDACTED:openai> again <REDACTED:openai>\napi_key = "<REDACTED:high_entropy_assignment>"\nid=prefix${HI}\nbare ${HI}\n`);
   });
 
   test('a per-line span running into a PEM block: both spans redact, nothing claimed survives', () => {
@@ -722,5 +727,98 @@ describe('redactFindings — span-splice semantics and preview window', () => {
       expect(f.redactedPreview.includes(long.slice(-12))).toBe(false);
       expect(f.redactedPreview).toContain('<REDACTED:bearer>');
     }
+  });
+});
+
+// ── Bounded bearer echo pass ─────────────────────────────────────────────────
+//
+// An opaque bearer token is claimed only where `Bearer ` anchors it, and a
+// transcript routinely echoes the same token bare (in a tool call's header,
+// then alone in the assistant's reply). After the span-splice, redactFindings
+// runs ONE `String.replace` with a single escaped alternation of the unique
+// bearer values it claimed (longest first, first BEARER_ECHO_MAX_UNIQUE
+// values in claim order, values >= BEARER_ECHO_MIN_CHARS). The pass adds no
+// findings and is deliberately NOT extended to high_entropy_assignment.
+describe('redactFindings — bounded bearer echo pass', () => {
+  const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
+  const unique = (k: number) => `${OPAQUE_VALUE}${k.toString(36).padStart(4, 'z')}`;
+
+  test('the transcript shape: anchored in a tool call, echoed bare and embedded in the reply — every site is redacted, only the claim is counted', () => {
+    const text = `tool: curl -H "Authorization: Bearer ${OPAQUE_VALUE}" https://api.example/v1\nassistant: the token ${OPAQUE_VALUE} expired; id=prefix${OPAQUE_VALUE} embeds it\n`;
+    const findings = scanText(text);
+    expect(findings.map((f) => [f.pattern, f.line])).toEqual([['bearer', 1]]);
+    const { text: out, redactions } = redactFindings(text);
+    // An echo is not a claim: `redactions` stays one record per CLAIMED occurrence.
+    expect(redactions.length).toBe(1);
+    expect(out).toBe('tool: curl -H "Authorization: Bearer <REDACTED:bearer>" https://api.example/v1\nassistant: the token <REDACTED:bearer> expired; id=prefix<REDACTED:bearer> embeds it\n');
+    expect(out.includes(OPAQUE_VALUE)).toBe(false);
+  });
+
+  test('a bare high-entropy value is NOT echo-redacted (deliberate boundary, documented delta)', () => {
+    // A real transcript claims thousands of unique entropic values; any
+    // per-value re-scan there would re-open the O(unique values × text) cost
+    // the span-splice removed. The pass stops at bearer on purpose.
+    const HI = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
+    const text = `api_key = "${HI}"\nthen the agent pasted ${HI} again\n`;
+    const { text: out, redactions } = redactFindings(text, { highEntropy: true });
+    expect(redactions.map((r) => r.pattern)).toEqual(['high_entropy_assignment']);
+    expect(out).toBe(`api_key = "<REDACTED:high_entropy_assignment>"\nthen the agent pasted ${HI} again\n`);
+  });
+
+  test('a vendor key behind Bearer keeps its vendor attribution everywhere; the echo pass has nothing to do', () => {
+    // Vendor shapes are claimed on their own wherever they appear, so both
+    // occurrences are vendor tokens and no `<REDACTED:bearer>` is emitted.
+    const { text: out, redactions } = redactFindings(`Bearer ${ANTHROPIC}\nbare ${ANTHROPIC}\n`);
+    expect(redactions.map((r) => r.pattern)).toEqual(['anthropic', 'anthropic']);
+    expect(out).toBe('Bearer <REDACTED:anthropic>\nbare <REDACTED:anthropic>\n');
+  });
+
+  test(`the cap is exactly ${BEARER_ECHO_MAX_UNIQUE} unique values in claim order; the next value's echo is the accepted miss`, () => {
+    expect(BEARER_ECHO_MAX_UNIQUE).toBe(64);
+    const vals = Array.from({ length: BEARER_ECHO_MAX_UNIQUE + 1 }, (_, k) => unique(k));
+    const text = vals.map((v) => `Bearer ${v}`).join('\n') + `\necho ${vals[0]} ${vals[BEARER_ECHO_MAX_UNIQUE - 1]} ${vals[BEARER_ECHO_MAX_UNIQUE]}`;
+    const { text: out, redactions } = redactFindings(text);
+    // Every CLAIM past the cap is still redacted and counted — the cap bounds
+    // the echo pass, not the splice.
+    expect(redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE + 1);
+    expect(out.endsWith(`echo <REDACTED:bearer> <REDACTED:bearer> ${vals[BEARER_ECHO_MAX_UNIQUE]}`)).toBe(true);
+    expect(out.split('<REDACTED:bearer>').length - 1).toBe(BEARER_ECHO_MAX_UNIQUE + 1 + 2);
+  });
+
+  test('repeated claims of one value take one cap slot (the cap counts unique values, not occurrences)', () => {
+    const text = Array.from({ length: BEARER_ECHO_MAX_UNIQUE }, () => `Bearer ${unique(0)}`).join('\n') + `\nBearer ${unique(1)}\necho ${unique(1)}`;
+    const { text: out, redactions } = redactFindings(text);
+    expect(redactions.length).toBe(BEARER_ECHO_MAX_UNIQUE + 1);
+    expect(out.endsWith('echo <REDACTED:bearer>')).toBe(true);
+  });
+
+  test(`the echo floor is exactly ${BEARER_ECHO_MIN_CHARS} — the bearer class floor, restated (pinned so an edit is a visible edit)`, () => {
+    expect(BEARER_ECHO_MIN_CHARS).toBe(20);
+    const v20 = ['opaque', 'Tok0123456789X'].join('');
+    expect(v20.length).toBe(20);
+    expect(redactFindings(`Bearer ${v20}\necho ${v20}`).text).toBe('Bearer <REDACTED:bearer>\necho <REDACTED:bearer>');
+  });
+
+  test('an allowlisted bearer value is neither claimed nor echo-redacted (declared safe)', () => {
+    const text = `Bearer ${OPAQUE_VALUE}\necho ${OPAQUE_VALUE}`;
+    const [f] = scanText(text);
+    const { text: out, redactions } = redactFindings(text, { allowlist: [f!.fingerprint] });
+    expect(redactions).toEqual([]);
+    expect(out).toBe(text);
+  });
+
+  test('a claimed value that is a prefix of another: the alternation matches longest first, neither echo is cut short', () => {
+    const short = OPAQUE_VALUE;
+    const long = OPAQUE_VALUE + 'MORE0';
+    const text = `Bearer ${short}\nBearer ${long}\necho ${long} then ${short}`;
+    expect(redactFindings(text).text).toBe('Bearer <REDACTED:bearer>\nBearer <REDACTED:bearer>\necho <REDACTED:bearer> then <REDACTED:bearer>');
+  });
+
+  test('regex metacharacters in the bearer class (`.` `+`) are escaped in the alternation', () => {
+    const v = ['abc.def+ghi', '=jkl~mno/pqr012345'].join('');
+    expect(redactFindings(`Bearer ${v}\nbare ${v}`).text).toBe('Bearer <REDACTED:bearer>\nbare <REDACTED:bearer>');
+    // An unescaped `.` would also have matched this near-miss.
+    const nearMiss = v.replace('.', 'X');
+    expect(redactFindings(`Bearer ${v}\nbare ${nearMiss}`).text).toBe(`Bearer <REDACTED:bearer>\nbare ${nearMiss}`);
   });
 });

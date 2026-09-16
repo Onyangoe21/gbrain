@@ -2,11 +2,13 @@
  * Structural guard: the cwd-.env quarantine list cannot silently rot.
  *
  * Every `process.env.GBRAIN_*` / `Bun.env.GBRAIN_*` / `env.GBRAIN_*` read in src/ whose NAME looks
- * like a code-loading, exec-target, root-redirect or posture-widening knob
- * (`_BIN`, `_CLI`, `_MODULE`, `_PATH`, `_HOME` suffix or `GBRAIN_ALLOW_`
- * prefix) must either be in CWD_DOTENV_PROTECTED_KEYS or carry a
- * `cwd-dotenv-ok: <why>` annotation on the same or the previous line.
+ * like a code-loading, exec-target, root-redirect, endpoint-redirect or
+ * posture-widening knob (`_BIN`, `_CLI`, `_MODULE`, `_PATH`, `_HOME`, `_URL`
+ * suffix or `GBRAIN_ALLOW_` prefix) must either be in CWD_DOTENV_PROTECTED_KEYS
+ * or carry a `cwd-dotenv-ok: <why>` annotation on the same or the previous line.
  * Adding a new such variable without deciding its cwd-.env posture fails here.
+ * (`_URL` — review cycle 3: a cwd .env retargeting GBRAIN_DATABASE_URL or the
+ * OAuth relay is endpoint redirection with the operator's credentials attached.)
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
@@ -14,7 +16,7 @@ import { describe, expect, test } from 'bun:test';
 import { CWD_DOTENV_PROTECTED_KEYS } from '../src/core/env-trust.ts';
 
 const SRC_ROOT = join(import.meta.dir, '..', 'src');
-const SUSPICIOUS_NAME = /_BIN$|_CLI$|_MODULE$|_PATH$|^GBRAIN_ALLOW_|_HOME$/;
+const SUSPICIOUS_NAME = /_BIN$|_CLI$|_MODULE$|_PATH$|_URL$|^GBRAIN_ALLOW_|_HOME$/;
 const READ_SITE = /(?:process\.env|Bun\.env|\benv)(?:\.(GBRAIN_[A-Z0-9_]+)|\[['"](GBRAIN_[A-Z0-9_]+)['"]\])/g;
 const OK_MARKER = 'cwd-dotenv-ok:';
 
@@ -32,6 +34,8 @@ describe('CWD_DOTENV_PROTECTED_KEYS covers every suspicious GBRAIN_* env read in
       .map((m) => m[1] ?? m[2]!);
     expect(hits).toEqual(['GBRAIN_FAKE_BIN', 'GBRAIN_FAKE_MODULE']);
     for (const h of hits) expect(SUSPICIOUS_NAME.test(h)).toBe(true);
+    expect(SUSPICIOUS_NAME.test('GBRAIN_DATABASE_URL')).toBe(true);
+    expect(SUSPICIOUS_NAME.test('GBRAIN_OAUTH_RELAY_URL')).toBe(true);
     expect(SUSPICIOUS_NAME.test('GBRAIN_SOURCE')).toBe(false);
   });
 

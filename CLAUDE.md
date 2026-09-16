@@ -522,7 +522,7 @@ ms, max waiters) for `--json`; a one-line summary prints to stderr.
 
 ## Build
 
-`bun build --compile --outfile bin/gbrain src/cli.ts`
+`bun build --compile --no-compile-autoload-bunfig --outfile bin/gbrain src/cli.ts`
 
 ## Version locations (single source of truth: `VERSION` file)
 

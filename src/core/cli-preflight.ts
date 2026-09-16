@@ -23,6 +23,10 @@
  *      `skipCwdCheck`). Fail-closed: set-but-broken aborts rather than
  *      silently running without the operator's firewall; unset costs nothing.
  *
+ * Fail-closed corollary of step 1 (see "GBRAIN_GUARDRAILS_MODULE" below): when
+ * the quarantine dropped a NON-EMPTY `GBRAIN_GUARDRAILS_MODULE`, preflight
+ * refuses to run at all instead of re-running without it.
+ *
  * Every runtime entry — commands, `hook *`, `serve` (stdio and --http),
  * `mcp`, the supervisor-spawned `jobs work`, the per-job `jobs run-child` —
  * dispatches through `main()`, so this one call covers every gbrain process.
@@ -73,14 +77,38 @@
  *
  * ## Signals
  *
- * The re-run shares the wrapper's foreground process group, so the terminal
- * delivers Ctrl-C to it directly; the wrapper does NOT forward SIGINT (a
- * second delivery would consume a `once('SIGINT')` graceful-shutdown handler
- * such as serve-http's and turn Ctrl-C into an abrupt kill). The wrapper
- * ignores SIGINT itself so it survives to relay the re-run's exit status.
- * SIGTERM and SIGHUP — which a supervisor sends to the wrapper pid alone —
- * ARE forwarded. Exit status: the re-run's code, or 128+signal when a signal
- * killed it (shell convention).
+ * Handlers are installed BEFORE the spawn (a signal in the gap would take the
+ * default action, kill the wrapper and orphan the re-run). SIGTERM and SIGHUP
+ * — which a supervisor sends to the wrapper pid alone — are always forwarded.
+ * SIGINT depends on whether a terminal is attached:
+ *   - stdin IS a tty: the re-run shares the wrapper's foreground process
+ *     group, so the terminal delivers Ctrl-C to it directly; the wrapper does
+ *     NOT forward (a second delivery would consume a `once('SIGINT')`
+ *     graceful-shutdown handler such as serve-http's and turn Ctrl-C into an
+ *     abrupt kill) and ignores the signal itself so it survives to relay the
+ *     re-run's exit status.
+ *   - stdin is NOT a tty (a supervisor, cron, an agent harness, a pipe): no
+ *     terminal exists to do process-group delivery, so a SIGINT that reaches
+ *     the wrapper pid alone would otherwise orphan the re-run. Each received
+ *     SIGINT is forwarded once. (A harness that signals the whole group
+ *     instead delivers twice here — accepted: no tty, no graceful Ctrl-C
+ *     expectation.)
+ * Exit status: the re-run's code, or 128+signal when a signal killed it
+ * (shell convention).
+ *
+ * ## GBRAIN_GUARDRAILS_MODULE: fail closed, not open
+ *
+ * The quarantine is key-presence: when a cwd .env assigns the key, the value
+ * in process.env is dropped whether it came from the file or from the
+ * operator's shell (Bun merges the file before any code runs and never
+ * overrides a live variable, so the two are indistinguishable). For every
+ * other protected key a false drop is a loud downgrade with the fix in the
+ * warning. For THIS key it would be the opposite of the #3688 contract: the
+ * re-run would simply have no module and run without the operator's firewall,
+ * with nothing but a stderr line. So when a non-empty value was dropped,
+ * preflight refuses to run (exit 1). A benign repository never assigns this
+ * gbrain-specific key, and the `~/.gbrain/.env` home is unaffected: it is
+ * read AFTER the quarantine (step 2), never dropped by it.
  *
  * Zero cost on the normal path: no .env in the cwd, or nothing protected
  * assigned there, means no spawn.
@@ -186,16 +214,23 @@ function selfArgv(): string[] | null {
 }
 
 /**
- * A fresh, empty directory that is ours. `tmpdir()` first; the home dir when
- * TMPDIR (unprotected, so a cwd .env may point it anywhere) is unusable. A
- * mkdtemp dir is new by definition, so neither can hold a .env.
+ * A fresh, empty directory that is ours, as an ABSOLUTE canonical path.
+ * `tmpdir()` first — it reads TMPDIR/TMP/TEMP at call time, and those are on
+ * the protected list, so a value planted by the cwd .env (a relative `t`, a
+ * path inside the checkout) is already gone when this runs; the home dir when
+ * the temp root is unusable. A mkdtemp dir is new by definition, so neither
+ * can hold a .env. `realpathSync` so the marker's `neutral` and the re-run's
+ * startup cwd compare canonically even if a caller-exported TMPDIR is
+ * relative or a symlink.
  */
 function makeNeutralDir(): string {
+  let dir: string;
   try {
-    return mkdtempSync(join(tmpdir(), 'gbrain-hop-'));
+    dir = mkdtempSync(join(tmpdir(), 'gbrain-hop-'));
   } catch {
-    return mkdtempSync(join(homedir(), '.gbrain-hop-'));
+    dir = mkdtempSync(join(homedir(), '.gbrain-hop-'));
   }
+  return realpathSync(dir);
 }
 
 async function reexecSanitized(originalCwd: string): Promise<void> {
@@ -211,20 +246,23 @@ async function reexecSanitized(originalCwd: string): Promise<void> {
   env[CWD_ENV_QUARANTINED_MARKER] = JSON.stringify({ cwd: originalCwd, neutral } satisfies HopMarker);
   let code: number;
   let signalCode: string | null;
+  // See "Signals". Installed BEFORE the spawn; the spawn is synchronous in the
+  // same tick, so a handler can only ever run with `child` set.
+  let child: ReturnType<typeof Bun.spawn> | null = null;
+  const forward = (sig: NodeJS.Signals) => () => {
+    try { child?.kill(sig); } catch { /* already exited */ }
+  };
+  process.on('SIGTERM', forward('SIGTERM'));
+  process.on('SIGHUP', forward('SIGHUP'));
+  // tty: the terminal already delivered Ctrl-C to the child; only outlive it.
+  // no tty: nothing else will deliver it — forward.
+  process.on('SIGINT', process.stdin.isTTY ? () => {} : forward('SIGINT'));
   try {
-    const child = Bun.spawn([process.execPath, ...argv], {
+    child = Bun.spawn([process.execPath, ...argv], {
       cwd: neutral,
       env,
       stdio: ['inherit', 'inherit', 'inherit'],
     });
-    // See "Signals": the tty delivers Ctrl-C to the child itself; the wrapper
-    // only has to outlive it to relay the exit status.
-    process.on('SIGINT', () => {});
-    const forward = (sig: NodeJS.Signals) => () => {
-      try { child.kill(sig); } catch { /* already exited */ }
-    };
-    process.on('SIGTERM', forward('SIGTERM'));
-    process.on('SIGHUP', forward('SIGHUP'));
     code = await child.exited;
     signalCode = child.signalCode;
   } finally {
@@ -236,6 +274,17 @@ async function reexecSanitized(originalCwd: string): Promise<void> {
   }
   process.exit(code);
 }
+
+/**
+ * The refusal printed when a non-empty GBRAIN_GUARDRAILS_MODULE was dropped
+ * (see "GBRAIN_GUARDRAILS_MODULE: fail closed, not open"). Exported for tests.
+ */
+export const GUARDRAILS_ASSIGNED_BY_CWD_DOTENV =
+  'guardrails: GBRAIN_GUARDRAILS_MODULE is assigned by a .env file in the current directory; ' +
+  "refusing to run without the operator's firewall. Bun merges that file before gbrain starts, " +
+  "so a value you exported cannot be told apart from the file's — remove the assignment from the " +
+  "project's .env, or run gbrain from a directory that does not assign it. Your own setting " +
+  'belongs in your shell environment or in ~/.gbrain/.env (never in a project .env).';
 
 export async function runCliPreflight(): Promise<void> {
   const hop = verifiedHop(process.cwd());
@@ -252,7 +301,12 @@ export async function runCliPreflight(): Promise<void> {
   const assignments = parseCwdDotenv(cwd);
   const collision = cwdIsOperatorConfigDir(cwd, assignments);
   if (!hop && !collision) {
+    const hadGuardrailsModule = (process.env.GBRAIN_GUARDRAILS_MODULE ?? '').trim() !== '';
     const dropped = quarantineCwdDotenv(process.env, cwd, { assignments });
+    if (hadGuardrailsModule && dropped.includes('GBRAIN_GUARDRAILS_MODULE')) {
+      console.error(GUARDRAILS_ASSIGNED_BY_CWD_DOTENV);
+      process.exit(1);
+    }
     if (dropped.length > 0) await reexecSanitized(cwd);
   }
   loadGbrainEnvFile(configDir);

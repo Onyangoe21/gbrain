@@ -773,8 +773,10 @@ describe('re-ingest over a soft-deleted base page', () => {
     expect(alive).not.toBeNull();
     expect(alive!.deleted_at).toBeNull();
     // Because the session was NOT all-skipped, the compare-before-write
-    // probe (the only getRawData with includeDeleted:true in ingest) is not
-    // reached; the raw row is written fresh over the resurrected page.
+    // probe is not reached; the raw row is written fresh over the
+    // resurrected page. (The probe reads ACTIVE rows only — it never needs
+    // to see through a tombstone, because a tombstoned base page never
+    // reaches the all-skipped branch: this test is that proof.)
     expect(probeCalls).toEqual([]);
     expect(putCalls.length).toBe(1);
     expect((await engine.getRawData(slug, undefined, { sourceId: 'default' })).length).toBe(1);
@@ -796,7 +798,7 @@ describe('re-ingest over a soft-deleted base page', () => {
     expect(probeCalls.length).toBe(1);
     expect(probeCalls[0][0]).toBe(slug);
     expect(probeCalls[0][1]).toBe('transcript:openclaw');
-    expect(probeCalls[0][2]).toMatchObject({ sourceId: 'default', includeDeleted: true });
+    expect(probeCalls[0][2]).toEqual({ sourceId: 'default' }); // active rows only — no includeDeleted
     expect(putCalls).toEqual([]);
   });
 });

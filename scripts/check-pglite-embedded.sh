@@ -46,7 +46,7 @@ ln -s "$REPO_ROOT/node_modules" "$BUILD_DIR/node_modules"
 
 # Compile a focused smoketest (imports PGLiteEngine, not the whole CLI) so the
 # failure mode is laser-focused on PGLite asset embedding, not unrelated wiring.
-if ! (cd "$BUILD_DIR" && bun build --compile --outfile "$OUT_BIN" scripts/pglite-embedded-smoketest.ts >"$BUILD_DIR/compile.log" 2>&1); then
+if ! (cd "$BUILD_DIR" && bun build --compile --no-compile-autoload-bunfig --outfile "$OUT_BIN" scripts/pglite-embedded-smoketest.ts >"$BUILD_DIR/compile.log" 2>&1); then
   # In some sandboxes `bun build --compile` is unavailable (no network for the
   # baseline download, seccomp, etc). Fail SOFT there — like the compiled-binary
   # e2e — so local dev without compile support isn't blocked. CI has compile.

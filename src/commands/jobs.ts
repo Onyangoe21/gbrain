@@ -814,15 +814,15 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       } catch { /* audit failures never block submission */ }
 
       // Starvation warning (DX polish). Fire for every non-`--follow` shell submit
-      // regardless of the submitter's own `GBRAIN_ALLOW_SHELL_JOBS` — the submitter
-      // env is a weak proxy for the worker env (they may run on different machines),
-      // so the warning remains useful any time the job might sit in 'waiting'.
+      // regardless of the submitter's own `GBRAIN_ALLOW_SHELL_JOBS` — submitter env
+      // is a weak proxy for worker env. Two outcomes: no worker → the job waits;
+      // an UNFLAGGED worker → the always-registered guarded handler dead-letters it.
       if (!follow && name === 'shell') {
         process.stderr.write(
           `\n⚠  Shell jobs require the shell handler enabled on the worker process\n` +
           `   (--allow-shell-jobs, or GBRAIN_ALLOW_SHELL_JOBS=1 exported from your shell).\n` +
-          `   Your job was queued (id=${job.id}) but will sit in 'waiting' until a\n` +
-          `   worker with shell jobs enabled starts. To run now:\n\n` +
+          `   Your job was queued (id=${job.id}). It waits until a worker starts; a worker\n` +
+          `   WITHOUT shell jobs enabled dead-letters it immediately (no retries). To run now:\n\n` +
           `     GBRAIN_ALLOW_SHELL_JOBS=1 gbrain jobs submit shell \\\n` +
           `       --params '...' --follow\n\n` +
           `   Or start a persistent worker (Postgres only — PGLite uses --follow):\n\n` +

@@ -343,13 +343,15 @@ export async function runTranscriptsIngest(
                 // write so healthy re-runs stay write-free.
                 let needsRaw = true;
                 if (allSkipped) {
-                  // includeDeleted: this is a compare-before-write probe on
-                  // the page's own row, so it must see the row regardless of
-                  // its soft-delete state — otherwise a tombstoned row reads
-                  // as "no raw yet" and gets a fresh write.
+                  // Active rows only: `allSkipped` means the import hash check
+                  // (which reads ACTIVE rows) just matched every page, so the
+                  // base page is alive here by construction — a tombstoned
+                  // page never reaches this branch (it reads as missing and is
+                  // re-imported, see the "resurrects the page" e2e). No
+                  // includeDeleted flag: the probe must never read through a
+                  // soft-delete the hash check did not.
                   const existing = await engine.getRawData(resolvedBaseSlug, rawSource, {
                     sourceId: opts.sourceId,
-                    includeDeleted: true,
                   });
                   // Key-order-insensitive compare: JSONB hands keys back in
                   // its own canonical order, so a plain JSON.stringify never
