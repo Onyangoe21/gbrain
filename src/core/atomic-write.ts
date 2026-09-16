@@ -51,11 +51,14 @@ export interface AtomicWriteOpts {
 }
 
 export function atomicStagingPath(filePath: string): string {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- internal name allocation only; coordinator checks owner-root containment before staging and publication.
   return `${resolve(filePath)}.tmp.${randomUUID()}`;
 }
 
 export function validateAtomicStagingPath(filePath: string, stagingPath: string): void {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- normalization for the exact sibling check below; callers authorize and confine the target before filesystem use.
   const target = resolve(filePath);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- normalized only to reject non-sibling stages below; recovery also checks symlink-aware root containment before file access.
   const staged = resolve(stagingPath);
   if (dirname(target) !== dirname(staged) || !staged.startsWith(`${target}.tmp.`)
     || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(staged.slice(target.length + 5))) {

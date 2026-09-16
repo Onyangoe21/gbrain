@@ -22,12 +22,15 @@ async function readChange(engine:BrainEngine,id:string):Promise<TopologyChange>{
   if(!row)throw new OperationError('not_found','Source lifecycle request not found.');
   return row;
 }
+function matchesCloneStage(target:string,stage:string):boolean{
+  const name=basename(stage),prefix=`.gbrain-clone-${basename(target)}-`;
+  return name.startsWith(prefix)&&/^[a-f0-9-]{36}$/.test(name.slice(prefix.length));
+}
 function validateRecord(record:TopologyCloneRecovery):void{
-  const uuid='[a-f0-9-]{36}';
   if(record.version!==1||record.kind!=='clone'||record.ownerHostId!==localHostId()
     ||dirname(record.stage)!==dirname(record.target)||dirname(record.aside)!==dirname(record.target)
-    ||!new RegExp(`^\\.gbrain-clone-${basename(record.target).replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}-${uuid}$`).test(basename(record.stage))
-    ||!record.aside.startsWith(`${record.target}.gbrain-old-`)||!new RegExp(`${uuid}$`).test(record.aside)
+    ||!matchesCloneStage(record.target,record.stage)
+    ||!record.aside.startsWith(`${record.target}.gbrain-old-`)||!/[a-f0-9-]{36}$/.test(record.aside)
     ||canonicalFilesystemPath(record.target)!==record.target||canonicalFilesystemPath(record.stage)!==record.stage||canonicalFilesystemPath(record.aside)!==record.aside)
     throw new OperationError('recovery_required','The recorded clone paths no longer belong to this owner.');
 }
