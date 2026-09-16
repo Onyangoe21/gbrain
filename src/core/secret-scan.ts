@@ -14,9 +14,11 @@
  * plus a per-workspace override file (`<ws>/.gbrain-scan-allow`, one
  * glob-or-fingerprint per line, `#` comments).
  *
- * Rendering reuses `redactSecretsInText` [ENG-9] so every surface prints
- * `<REDACTED:pattern>` — a finding preview or redacted corpus NEVER contains
- * the secret value, and this module never returns raw matched values.
+ * Every surface prints the one canonical token `<REDACTED:pattern>` [ENG-9]:
+ * finding previews render through `redactSecretsInText`, the corpus writer
+ * (`redactFindings`) splices the same token over each claimed span — neither
+ * ever contains the secret value, and this module never returns raw matched
+ * values.
  *
  * The generic high-entropy assignment heuristic is OFF by default (opt-in
  * via `ScanOpts.highEntropy`) — named-prefix patterns are precise; the
@@ -151,16 +153,35 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // prefix — this is the wire format of many service-role / session
   // credentials, so it is matched on shape. Same source as the PII family in
   // eval-capture-scrub.ts; secret-scan is the owner for redaction lanes.
-  { name: 'jwt', source: 'eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}' },
+  //
+  // Prebuilt so the left boundary can exclude `-` as well as `_`: the value
+  // class contains both, so with the default boundary every `-` in a run like
+  // `-eyJ-eyJ-eyJ…` was a fresh start that consumed to end-of-line and
+  // backtracked — quadratic (a 200 KB run took ~25 s). Each segment is also
+  // bounded at 4096 so a start that never finds its `.` does constant work.
+  // A JWT immediately preceded by `-` is not a realistic wire shape (headers,
+  // JSON, URLs and env files put whitespace, a quote, `=`, `:` or `/` in
+  // front of it); a segment over 4096 chars is the accepted miss.
+  {
+    name: 'jwt',
+    source:
+      '(^|[^A-Za-z0-9_-])' +
+      '(eyJ[A-Za-z0-9_-]{8,4096}\\.[A-Za-z0-9_-]{8,4096}\\.[A-Za-z0-9_-]{8,4096})',
+    prebuilt: true,
+  },
   // ── Catch-alls: LAST, so vendor/JWT attribution above claims the span first.
   // Bearer: prebuilt two-group layout — the `Bearer ` keyword is the anchor
   // (group 1), only the token is the value (group 2), so the redacted text
   // reads `Bearer <REDACTED:bearer>` and the fingerprint is the token's.
+  // RFC 7235 auth-scheme names are case-insensitive; the three spellings
+  // seen on the wire (`Bearer`, `bearer`, `BEARER`) are accepted, and the
+  // precheck tests both suffix spellings so an all-caps header line is not
+  // skipped before the regex runs.
   {
     name: 'bearer',
-    source: '((?:^|[^A-Za-z0-9_])[Bb]earer\\s+)([A-Za-z0-9._~+/=-]{20,})',
+    source: '((?:^|[^A-Za-z0-9_])[Bb](?:earer|EARER)\\s+)([A-Za-z0-9._~+/=-]{20,})',
     prebuilt: true,
-    precheck: (line) => line.includes('earer'),
+    precheck: (line) => line.includes('earer') || line.includes('EARER'),
   },
   // Connection strings with inline credentials: the value is exactly the
   // scheme://user:pass@ span (an empty user is allowed — a redis URL whose
@@ -169,26 +190,34 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
   // `https://user@host` never fires. Literal example spellings are avoided
   // in this comment on purpose (scripts/check-pg-url-redaction.sh).
   //
-  // Both userinfo segments are BOUNDED (user 0-128, password 1-256) and both
-  // classes stop at `/` and at the characters RFC 3986 forbids raw in
-  // userinfo (`"` `<` `>` `\` `^` backtick `{` `|` `}`) plus `'` — every
-  // sub-delim (`!$&()*+,;=`), `:` in the password and `%XX` escapes still
-  // match. The old unbounded `[^\s@]+` ran to the end of the line and
-  // backtracked once per scheme occurrence: quadratic on long @-free lines
-  // (a 250 KB minified JSON line of credential-less redis URLs took ~4 s,
-  // 160 KB of repeated `redis://:` ~5.6 s, 1 MB minutes). It ALSO turned a
+  // Both userinfo segments are BOUNDED (user 0-128, password 1-256). The
+  // user segment stops at `:` and `/`; the password stops ONLY at whitespace,
+  // `@` and the two string delimiters `"` `'`. Everything else is a legal
+  // password character — every sub-delim (`!$&()*+,;=`), `:`, `%XX` escapes,
+  // and the characters real (copy-pasted, unescaped) passwords carry: `/`
+  // from base64, `{` `}` `<` `>` `|` `^` `\` and backtick. An earlier cut
+  // excluded those on RFC 3986 grounds and let every such password through
+  // unredacted, which is the wrong side of the trade for a redaction lane.
+  // The cost is that `scheme://host:port/path@x` (an `@` inside a path) now
+  // reads as a credential — a rare, harmless over-redaction.
+  //
+  // The old unbounded `[^\s@]+` ran to the end of the line and backtracked
+  // once per scheme occurrence: quadratic on long @-free lines (a 250 KB
+  // minified JSON line of credential-less redis URLs took ~4 s, 160 KB of
+  // repeated `redis://:` ~5.6 s, 1 MB minutes). It ALSO turned a
   // credential-less URL followed within 256 chars by any `@` (an email in
   // the same minified JSON object) into a bogus finding, because the string
-  // delimiters between them were legal password characters — the class
-  // exclusions are what end that run at the URL's closing quote. With the
-  // bounds the work per scheme occurrence is a constant; the precheck skips
-  // the regex on lines with no `@` at all. A password over 256 chars is the
-  // accepted miss (a JWT that long is still claimed by `jwt` above).
+  // delimiters between them were legal password characters — excluding `"`
+  // and `'` is what ends that run at the URL's closing quote; the LENGTH
+  // bounds, not the exclusions, are the ReDoS fix. With the bounds the work
+  // per scheme occurrence is a constant; the precheck skips the regex on
+  // lines with no `@` at all. A password over 256 chars is the accepted miss
+  // (a JWT that long is still claimed by `jwt` above).
   {
     name: 'db_url_credentials',
     source:
       '(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis|rediss|amqp|mssql):\\/\\/' +
-      '[^\\s:/@"\'<>\\\\^`{|}]{0,128}:[^\\s@/"\'<>\\\\^`{|}]{1,256}@',
+      '[^\\s:/@"\']{0,128}:[^\\s@"\']{1,256}@',
     precheck: (line) => line.includes('@'),
   },
   // NOTE: private_key_pem is NOT here — a PEM key spans multiple lines and the
@@ -204,12 +233,23 @@ const CORE_PATTERNS: ReadonlyArray<CorePattern> = [
  * matching the whole span means the key body is scrubbed. The body+footer are
  * OPTIONAL so a lone/truncated header (a body-only leak, or a header with no
  * END) still fires the push-block gate — value is then just the header. The
- * lazy `[\s\S]*?` stops at the first END marker so two adjacent keys don't
- * collapse into one span. `-----BEGIN CERTIFICATE-----` never matches (the
- * literal `PRIVATE KEY` is required).
+ * lazy body stops at the first END marker so two adjacent keys don't collapse
+ * into one span. `-----BEGIN CERTIFICATE-----` never matches (the literal
+ * `PRIVATE KEY` is required).
+ *
+ * The body is BOUNDED at 16384 chars (PEM_BODY_MAX_CHARS). The unbounded lazy
+ * `[\s\S]*?` scanned from every header to the end of the text when no END
+ * followed — quadratic on header-without-END texts (2000 header-only mentions
+ * ahead of a 1 MB tail took ~4 s). With the bound a header does constant
+ * work; a real key is far smaller (an RSA-4096 PEM is ~3.3 KB, RSA-16384
+ * ~12.5 KB). A body longer than the bound degrades to the header-only match —
+ * the gate still fires, the body is the accepted miss.
  */
-export const PEM_BLOCK_RE =
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----)?/g;
+export const PEM_BODY_MAX_CHARS = 16384;
+export const PEM_BLOCK_RE = new RegExp(
+  `-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\\s\\S]{0,${PEM_BODY_MAX_CHARS}}?-----END [A-Z ]*PRIVATE KEY-----)?`,
+  'g',
+);
 
 // Opt-in: `secret|token|password|api key`-shaped assignment whose value has
 // high Shannon entropy. Keyword-anchored (compiled inline below so the group
@@ -238,6 +278,18 @@ export const PEM_BLOCK_RE =
 // machine-minted secrets essentially always carry digits; a digitless
 // passphrase is the accepted miss. A 40-hex git sha assigned to a `token:`
 // key still redacts (digits + entropy) — documented, acceptable.
+//
+// Both quantifiers after the keyword are BOUNDED. The trailing identifier
+// segments used to be `[A-Za-z0-9_-]*`: because the left boundary admits `-`
+// and `_` and that class contains them too, every `-`/`_` in a run like
+// `-apikey-apikey…` or `_token_token…` was a fresh keyword start whose
+// suffix ran to end-of-line and backtracked — quadratic (210 KB of
+// `-apikey` took ~35 s, 180 KB of `_token` ~15 s). At `{0,64}` a start does
+// constant work; no real credential key carries 64 identifier characters
+// after its keyword. The value is capped at 4096 for the same
+// constant-work-per-occurrence guarantee (the jwt segments share the cap):
+// a value longer than that is redacted only through its first 4096 chars —
+// the accepted miss, well above any real token or base64 key blob.
 const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 3.5;
 const HIGH_ENTROPY_REQUIRES_DIGIT_RE = /[0-9]/;
 
@@ -254,7 +306,7 @@ function compilePatterns(opts: ScanOpts): CompiledPattern[] {
     out.push({
       name: 'high_entropy_assignment',
       re: new RegExp(
-        `((?:^|[^A-Za-z0-9])(?:secret|token|passwd|password|passphrase|credential|api[_-]?key|apikey)[A-Za-z0-9_-]*["']?\\s*[:=]\\s*["']?)([A-Za-z0-9+/_=-]{12,})`,
+        `((?:^|[^A-Za-z0-9])(?:secret|token|passwd|password|passphrase|credential|api[_-]?key|apikey)[A-Za-z0-9_-]{0,64}["']?\\s*[:=]\\s*["']?)([A-Za-z0-9+/_=-]{12,4096})`,
         'gi',
       ),
       entropyGated: true,
@@ -408,6 +460,8 @@ interface LineSpans {
 
 interface RawHit extends LineSpan {
   line: number; // 1-based
+  /** Absolute offset of `value` within the scanned text (redactFindings splices on it). */
+  abs: number;
   lineText: string;
   spans: LineSpans;
 }
@@ -418,10 +472,17 @@ interface RawHit extends LineSpan {
  * therefore gets redacted, never left behind. `lineText` is set to the whole
  * matched block so buildPreview / redactSecretsInText replace the entire span
  * with `<REDACTED:private_key_pem>`.
+ *
+ * The 1-based header line is counted INCREMENTALLY: a running cursor walks
+ * the text between consecutive hits (global exec yields them in ascending
+ * index order), so the pass is O(text) overall. Recomputing it per hit with
+ * `text.slice(0, m.index).split('\n')` was O(hits × text).
  */
 function scanPemBlocks(text: string): RawHit[] {
   const hits: RawHit[] = [];
   PEM_BLOCK_RE.lastIndex = 0;
+  let cursor = 0;
+  let line = 1;
   let m: RegExpExecArray | null;
   while ((m = PEM_BLOCK_RE.exec(text)) !== null) {
     const value = m[0];
@@ -429,10 +490,12 @@ function scanPemBlocks(text: string): RawHit[] {
       PEM_BLOCK_RE.lastIndex++; // zero-width safety
       continue;
     }
-    // 1-based line of the header start.
-    const line = text.slice(0, m.index).split('\n').length;
+    for (let nl = text.indexOf('\n', cursor); nl !== -1 && nl < m.index; nl = text.indexOf('\n', nl + 1)) {
+      line++;
+    }
+    cursor = m.index;
     const span: LineSpan = { pattern: 'private_key_pem', value, start: 0 };
-    hits.push({ ...span, line, lineText: value, spans: { all: [span] } });
+    hits.push({ ...span, line, abs: m.index, lineText: value, spans: { all: [span] } });
   }
   return hits;
 }
@@ -447,16 +510,28 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
   // No per-line length cap, deliberately: a secret on a 1 MB minified line
   // must still be found and redacted, so long lines are scanned in full.
   // What keeps that bounded is (a) every pattern doing constant work per
-  // candidate occurrence — the one shape that could backtrack to end-of-line
-  // (db_url_credentials) carries bounded quantifiers — and (b) each
-  // catch-all's `precheck`, a substring test that skips its regex on lines
-  // without the anchor. The first-wins overlap check and the preview window
-  // are both O(log hits) per hit (claimed-char bitmap; sorted spans), so a
-  // line with tens of thousands of hits costs O(hits), not O(hits²) — and
-  // preview rendering is windowed (buildPreview), not O(hits × line).
+  // candidate occurrence — the shapes whose value class could otherwise run
+  // to end-of-line and backtrack (db_url_credentials, jwt,
+  // high_entropy_assignment, and PEM_BLOCK_RE over the whole text) carry
+  // bounded quantifiers, and jwt's boundary excludes `-` so a `-` run is
+  // never a fresh start — and (b) each catch-all's `precheck`, a substring
+  // test that skips its regex on lines without the anchor. The first-wins
+  // overlap check is O(value) per hit (claimed-char bitmap) and the preview
+  // window is O(log hits) per hit (binary search over the sorted spans), so
+  // a line with tens of thousands of hits costs O(hits × value), not
+  // O(hits²) — and preview rendering is windowed (buildPreview), not
+  // O(hits × line).
+  //
+  // `offset` is the absolute start of the current line (the `+ 1` is the
+  // `\n` split away); each hit records `abs = offset + start` so
+  // redactFindings can splice the text once instead of searching it per
+  // value.
+  let offset = 0;
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line || line.length < 8) continue;
+    const line = lines[i] ?? '';
+    const lineStart = offset;
+    offset += line.length + 1;
+    if (line.length < 8) continue;
     const spans: LineSpans = { all: [] };
     // Claimed-character bitmap behind the first-wins dedupe: allocated on the
     // line's FIRST hit only (most lines have none), then O(value) to test and
@@ -477,7 +552,7 @@ function scanInternal(text: string, opts: ScanOpts): RawHit[] {
         if (p.entropyGated && shannonEntropy(value) < HIGH_ENTROPY_MIN_BITS_PER_CHAR) continue;
         (taken ??= new Uint8Array(line.length)).fill(1, start, end);
         spans.all.push({ pattern: p.name, value, start });
-        hits.push({ pattern: p.name, value, start, line: i + 1, lineText: line, spans });
+        hits.push({ pattern: p.name, value, start, abs: lineStart + start, line: i + 1, lineText: line, spans });
       }
     }
   }
@@ -563,13 +638,13 @@ function sha256Hex(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function toFinding(hit: RawHit, fullHex: string, file?: string): SecretFinding {
+/** `file` is stamped by scanFiles on the way out, not here. */
+function toFinding(hit: RawHit, fullHex: string): SecretFinding {
   return {
     pattern: hit.pattern,
     line: hit.line,
     redactedPreview: buildPreview(hit),
     fingerprint: `sha256:${fullHex.slice(0, 16)}`,
-    ...(file !== undefined ? { file } : {}),
   };
 }
 
@@ -646,18 +721,36 @@ export function scanFiles(paths: string[], opts: ScanOpts = {}): SecretFinding[]
 }
 
 /**
- * Corpus-write mode [S3#2]: replace every matched span in place with
- * `<REDACTED:pattern>` (via redactSecretsInText) and report what was
- * redacted. Allowlisted values are left intact — the user declared them
- * safe. Returns the redacted text plus one finding per original occurrence.
+ * Corpus-write mode [S3#2]: replace every CLAIMED span in place with
+ * `<REDACTED:pattern>` and report what was redacted. Allowlisted values are
+ * left intact — the user declared them safe. Returns the redacted text plus
+ * one finding per original occurrence (`redactions` keeps scan order: PEM
+ * blocks, then line order).
  *
- * The unique (pattern, value) pairs are collected first and replaced in ONE
- * redactSecretsInText call, LONGEST value first. Order matters when one
- * value is a substring of another — a bearer token that is also the password
- * inside a connection string: replacing the short value first (discovery
- * order) corrupted the longer span, so it was never replaced and its
- * username survived. The same value under two pattern names keeps the
- * first-discovered name (stable sort).
+ * The output is rebuilt by SPAN-SPLICE, O(text + hits): every hit carries its
+ * absolute offset from scanInternal, the spans are sorted by offset, and the
+ * text between consecutive spans is copied through once. The previous
+ * implementation ran one full-text `replaceAll` per unique (pattern, value)
+ * pair — O(unique values × text): a 1 MB transcript with ~5k unique
+ * high-entropy values took ~3-5 s to redact after a ~70 ms scan.
+ *
+ * SEMANTIC DELTA (deliberate): `replaceAll` also scrubbed a claimed value at
+ * positions the scanner did NOT claim — the same bytes embedded inside a
+ * longer identifier, or a bare re-occurrence that no pattern anchors (an
+ * opaque bearer token repeated without its `Bearer ` keyword). The splice
+ * redacts exactly the claimed spans, so `redactFindings(text).text` now
+ * agrees byte-for-byte with what `scanText(text)` reports: the corpus write
+ * and the push gate see the same findings. A value that recurs on two lines
+ * is two claimed spans and both are redacted; a value that is a substring of
+ * another claimed value is moot, because claimed spans never overlap (the
+ * per-line bitmap dedupe keeps them disjoint) — the longest-first ordering
+ * the replaceAll form needed no longer exists.
+ *
+ * Per-line spans are disjoint from each other by construction; a per-line
+ * span can only overlap a whole-text PEM block (a bearer value whose class
+ * admits `-` running into the block's `-----BEGIN`). The splice handles that
+ * by emitting the uncovered tail of the later span as its own token rather
+ * than skipping it, so nothing claimed is ever left in the output.
  */
 export function redactFindings(
   text: string,
@@ -665,15 +758,23 @@ export function redactFindings(
 ): { text: string; redactions: SecretFinding[] } {
   const allowlist = opts.allowlist ?? [];
   const redactions: SecretFinding[] = [];
-  const pairs = new Map<string, readonly [string, string]>(); // pattern\0value → [pattern, value]
+  const claimed: Array<{ abs: number; end: number; pattern: string }> = [];
   for (const hit of scanInternal(text, opts)) {
     const fullHex = sha256Hex(hit.value);
     if (valueAllowlisted(fullHex, allowlist)) continue;
     redactions.push(toFinding(hit, fullHex));
-    const key = `${hit.pattern}\0${hit.value}`;
-    if (!pairs.has(key)) pairs.set(key, [hit.pattern, hit.value]);
+    claimed.push({ abs: hit.abs, end: hit.abs + hit.value.length, pattern: hit.pattern });
   }
-  if (pairs.size === 0) return { text, redactions };
-  const ordered = [...pairs.values()].sort((a, b) => b[1].length - a[1].length);
-  return { text: redactSecretsInText(text, ordered), redactions };
+  if (claimed.length === 0) return { text, redactions };
+  claimed.sort((a, b) => a.abs - b.abs);
+  const parts: string[] = [];
+  let cur = 0;
+  for (const c of claimed) {
+    if (c.end <= cur) continue; // fully inside an already-emitted span
+    if (c.abs > cur) parts.push(text.slice(cur, c.abs));
+    parts.push(`<REDACTED:${c.pattern}>`);
+    cur = c.end;
+  }
+  parts.push(text.slice(cur));
+  return { text: parts.join(''), redactions };
 }

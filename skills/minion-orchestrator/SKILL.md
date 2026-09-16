@@ -117,7 +117,7 @@ tasks where no LLM reasoning loop is needed.
 
 ### Preconditions (read before submitting your first shell job)
 
-- **`GBRAIN_ALLOW_SHELL_JOBS=1` must be set on the worker environment.**
+- **The worker must be started with `gbrain jobs work --allow-shell-jobs`** (equivalently `GBRAIN_ALLOW_SHELL_JOBS=1` exported on the worker; a `.env` in the worker's directory cannot set it).
   Without it, the shell handler refuses to register and submissions sit in
   `waiting` silently. Gate lives in `src/core/minions/handlers/shell.ts`.
 - **Security:** flipping `GBRAIN_ALLOW_SHELL_JOBS=1` authorizes arbitrary

@@ -25,6 +25,7 @@ import {
   cwdDotenvAssignsKey,
   dotenvValuesForKey,
   isCwdDotenvProtectedKey,
+  parseCwdDotenv,
   quarantineCwdDotenv,
 } from '../src/core/env-trust.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -93,6 +94,43 @@ describe('CWD_DOTENV_PROTECTED_KEYS', () => {
     for (const k of ['GBRAIN_ADMIN_BOOTSTRAP_TOKEN', 'GBRAIN_HTTP_CORS_ORIGIN', 'GBRAIN_HTTP_TRUST_PROXY', 'GBRAIN_DATABASE_URL']) {
       expect(CWD_DOTENV_PROTECTED_KEYS).not.toContain(k);
     }
+  });
+
+  test('endpoint-redirect GBRAIN_* keys and the sanitized re-run marker are protected (review cycle 2)', () => {
+    for (const k of ['GBRAIN_DIRECT_DATABASE_URL', 'GBRAIN_REMOTE_MCP_URL', 'GBRAIN_REMOTE_ISSUER_URL', 'GBRAIN_CWD_ENV_QUARANTINED']) {
+      expect(CWD_DOTENV_PROTECTED_KEYS).toContain(k);
+      expect(isCwdDotenvProtectedKey(k)).toBe(true);
+    }
+  });
+});
+
+// ── Parse once (A2-7): the pre-parsed list is interchangeable with `dir` ─────
+describe('parseCwdDotenv — one read shared by both consumers', () => {
+  test('cwdDotenvAssignsKey and quarantineCwdDotenv give identical answers for `dir` and for parseCwdDotenv(dir)', () => {
+    const dir = tmpProject({
+      '.env': 'GIT_CONFIG_COUNT=1\nGBRAIN_HOME=${PWD}/h\nPROJECT_NAME=demo\n',
+      '.env.local': 'export XDG_CONFIG_HOME="/x"\n',
+    });
+    const assignments = parseCwdDotenv(dir);
+    expect(assignments).toEqual([
+      ['GIT_CONFIG_COUNT', '1'], ['GBRAIN_HOME', '${PWD}/h'], ['PROJECT_NAME', 'demo'], ['XDG_CONFIG_HOME', '"/x"'],
+    ]);
+    for (const k of ['GIT_CONFIG_COUNT', 'GBRAIN_HOME', 'PROJECT_NAME', 'XDG_CONFIG_HOME', 'ABSENT']) {
+      expect(cwdDotenvAssignsKey(k, assignments)).toBe(cwdDotenvAssignsKey(k, dir));
+    }
+    const mk = () => ({ GIT_CONFIG_COUNT: '1', GBRAIN_HOME: `${dir}/h`, PROJECT_NAME: 'demo', XDG_CONFIG_HOME: '/x', GIT_AUTHOR_NAME: 'shell' });
+    const viaDir = mk(); const viaList = mk();
+    const w1: string[] = []; const w2: string[] = [];
+    const d1 = quarantineCwdDotenv(viaDir, dir, { warn: (m) => w1.push(m) });
+    const d2 = quarantineCwdDotenv(viaList, '/nonexistent/never-read', { warn: (m) => w2.push(m), assignments });
+    expect(d2).toEqual(d1);
+    expect(d2).toEqual(['GBRAIN_HOME', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME']);
+    expect(viaList).toEqual(viaDir);
+    expect(w2).toEqual(w1);
+  });
+
+  test('parseCwdDotenv of a dir without .env files is empty', () => {
+    expect(parseCwdDotenv(tmpProject({}))).toEqual([]);
   });
 });
 
@@ -231,6 +269,18 @@ describe('non-GBRAIN hijack families (A2)', () => {
     // Ordinary project variables keep loading from a cwd .env.
     for (const k of ['GITHUB_TOKEN', 'GBRAIN_SOURCE', 'DATABASE_URL', 'PATH', 'HOME', 'LDFLAGS', 'NODE_ENV', 'OPENAI_API_KEY', 'GITLAB_CI', 'BUNDLE_PATH']) {
       expect(isCwdDotenvProtectedKey(k)).toBe(false);
+    }
+    // Review cycle 2 (red team): XDG config roots git reads as GLOBAL config, TLS trust roots,
+    // the programs children hand control to, and every provider endpoint the gateway reads from env.
+    for (const k of [
+      'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'GNUPGHOME',
+      'SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE',
+      'EDITOR', 'VISUAL', 'PAGER',
+      'OPENROUTER_BASE_URL', 'LITELLM_BASE_URL', 'OLLAMA_BASE_URL', 'LMSTUDIO_BASE_URL',
+      'LLAMA_SERVER_BASE_URL', 'LLAMA_SERVER_RERANKER_BASE_URL',
+    ]) {
+      expect(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).toContain(k);
+      expect(isCwdDotenvProtectedKey(k)).toBe(true);
     }
     for (const p of ['LD_', 'DYLD_', 'GIT_', 'BUN_', 'NPM_CONFIG_', 'npm_config_']) expect(CWD_DOTENV_PROTECTED_PREFIXES).toContain(p);
     expect(CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS).toContain('NODE_OPTIONS');

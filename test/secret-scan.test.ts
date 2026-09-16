@@ -15,6 +15,7 @@ import { tmpdir } from 'os';
 import {
   scanText, scanFiles, redactFindings, loadWorkspaceAllowlist, matchesGlob,
   globToRegExp, shannonEntropy, pathAllowlisted, SCAN_ALLOW_FILENAME,
+  PEM_BODY_MAX_CHARS,
 } from '../src/core/secret-scan.ts';
 
 // Synthetic fixture values (never real keys).
@@ -287,6 +288,42 @@ describe('redactFindings (corpus-write mode, S3#2)', () => {
     const header = scanText('leaked: -----BEGIN RSA PRIVATE KEY-----\n');
     expect(header.map((f) => f.pattern)).toEqual(['private_key_pem']);
   });
+
+  test('several PEM blocks report exact 1-based header lines (incremental line cursor)', () => {
+    // Header/footer joined from fragments so the committed source never carries a whole PEM block (gitleaks private-key rule).
+    const key = (b: string) => [['-----BEGIN', ' EC PRIVATE KEY', '-----'].join(''), b, ['-----END', ' EC PRIVATE KEY', '-----'].join('')].join('\n');
+    const text = [
+      'a',                       // 1
+      key('MHcCAQEEIBody0001'),  // 2-4
+      'b',                       // 5
+      key('MHcCAQEEIBody0002'),  // 6-8
+      'c',                       // 9
+      ['-----BEGIN', ' RSA PRIVATE KEY', '-----'].join(''), // 10, header-only, last so no later END can extend it
+    ].join('\n');
+    const findings = scanText(text);
+    expect(findings.map((f) => f.pattern)).toEqual(['private_key_pem', 'private_key_pem', 'private_key_pem']);
+    expect(findings.map((f) => f.line)).toEqual([2, 6, 10]);
+    const { text: out } = redactFindings(text);
+    expect(out).toBe('a\n<REDACTED:private_key_pem>\nb\n<REDACTED:private_key_pem>\nc\n<REDACTED:private_key_pem>');
+  });
+
+  test(`the PEM body bound is exactly ${PEM_BODY_MAX_CHARS} chars (pinned so an edit is a visible edit)`, () => {
+    // Body = everything between the header and the END marker, newlines
+    // included. At the bound the whole block (body + END) is one redacted
+    // span; one char over degrades to the header-only match — the gate still
+    // fires, the body is the accepted miss (an RSA-16384 PEM is ~12.5 KB).
+    // Header/footer joined from fragments (see above).
+    const wrap = (body: string) => ['-----BEGIN', ' RSA PRIVATE KEY', '-----', body, '-----END', ' RSA PRIVATE KEY', '-----'].join('');
+    const atBound = wrap('\n' + 'Q'.repeat(PEM_BODY_MAX_CHARS - 2) + '\n');
+    let { text: out } = redactFindings(atBound);
+    expect(out).toBe('<REDACTED:private_key_pem>');
+    const overBound = wrap('\n' + 'Q'.repeat(PEM_BODY_MAX_CHARS - 1) + '\n');
+    const findings = scanText(overBound);
+    expect(findings.map((f) => f.pattern)).toEqual(['private_key_pem']);
+    ({ text: out } = redactFindings(overBound));
+    expect(out.startsWith('<REDACTED:private_key_pem>\nQ')).toBe(true);
+    expect(out.endsWith('-----END RSA PRIVATE KEY-----')).toBe(true);
+  });
 });
 
 describe('glob dialect (shared with the push deny-list)', () => {
@@ -339,6 +376,26 @@ describe('high-entropy assignment reaches compound credential keys', () => {
     for (const k of ['passphrase', 'credential'] as const) {
       expect(scanText(`${k}=${HI}`, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
     }
+  });
+
+  test('the keyword may carry up to 64 trailing identifier chars before the `=` (bounded, closes a quadratic)', () => {
+    // `[A-Za-z0-9_-]*` after the keyword ran to end-of-line and backtracked
+    // once per `-`/`_` in an adversarial run (secret-scan-perf pins the
+    // timing); `{0,64}` keeps AWS_SECRET_ACCESS_KEY-style compounds and
+    // anything a real config key could plausibly be named.
+    const tail64 = '_' + 'X'.repeat(63);
+    expect(scanText(`SECRET${tail64}=${HI}`, { highEntropy: true }).map((f) => f.pattern)).toEqual(['high_entropy_assignment']);
+    expect(scanText(`SECRET${tail64}X=${HI}`, { highEntropy: true })).toEqual([]);
+  });
+
+  test('the value is redacted through 4096 chars (pinned so a bound edit is a visible edit)', () => {
+    // The cap gives the rule constant work per occurrence; a longer value is
+    // redacted only through its first 4096 chars — the accepted miss, well
+    // above any real token or base64 key blob.
+    const v4096 = (HI + '0').repeat(4096 / (HI.length + 1) + 1).slice(0, 4096);
+    expect(v4096.length).toBe(4096);
+    expect(redactFindings(`token=${v4096}`, { highEntropy: true }).text).toBe('token=<REDACTED:high_entropy_assignment>');
+    expect(redactFindings(`token=${v4096}Z`, { highEntropy: true }).text).toBe('token=<REDACTED:high_entropy_assignment>Z');
   });
 
   /** Known limitation, asserted so it stays visible rather than being
@@ -514,6 +571,18 @@ describe('format-based detectors — negatives (identifiers and public shapes st
     expect(scanText(`two ${JWT_SEGMENTS[0]}.${JWT_SEGMENTS[1]} segments`)).toEqual([]);
   });
 
+  test('a JWT fires after every real wire delimiter; `-` is not a boundary (documented, closes a quadratic)', () => {
+    // The jwt boundary excludes `-` (as well as `_`): with `-` admitted, every
+    // `-` in a `-eyJ-eyJ…` run was a fresh start that consumed to end-of-line
+    // and backtracked (secret-scan-perf pins the timing). Headers, JSON, env
+    // files and URLs put one of these in front of a token instead.
+    for (const prefix of ['Bearer ', '"', '=', ':', '/', '(', '\t']) {
+      expect(scanText(`x${prefix}${JWT}`).map((f) => f.pattern)).toEqual(['jwt']);
+    }
+    expect(scanText(`x-${JWT}`)).toEqual([]);
+    expect(scanText(`x_${JWT}`)).toEqual([]);
+  });
+
   test('embedded inside an identifier, vendor prefixes still do not fire', () => {
     expect(scanText(`x_${STRIPE_LIVE}`)).toEqual([]);
     expect(scanText(`my${GITLAB_SHAPE}`)).toEqual([]);
@@ -548,26 +617,60 @@ describe('high-entropy assignment requires a digit in the value', () => {
   });
 });
 
-// ── Preview windowing + corpus redaction ordering ────────────────────────────
+// ── Preview windowing + corpus redaction (span-splice) ───────────────────────
 //
 // buildPreview renders a WINDOW around the hit (not the whole line) and
-// redacts every claimed span inside it; redactFindings replaces the unique
-// (pattern, value) pairs longest-first in one pass. Values below are
-// synthetic and runtime-joined from >= 2 fragments.
-describe('redactFindings — replacement order and preview window', () => {
+// redacts every claimed span inside it; redactFindings rebuilds the text by
+// splicing `<REDACTED:pattern>` over exactly the CLAIMED spans (sorted by
+// absolute offset, one pass) — not by replaceAll per unique value. Values
+// below are synthetic and runtime-joined from >= 2 fragments.
+describe('redactFindings — span-splice semantics and preview window', () => {
   const OPAQUE_VALUE = ['opaque', 'Token0123456789abcdefXYZ'].join('');
   /** PREVIEW_MAX_CHARS (160) plus a leading and a trailing ellipsis. */
   const PREVIEW_CEILING = 162;
 
-  test('a value that is a substring of another value: both redact whole, longest first', () => {
+  test('a value that is a substring of another value: both redact whole', () => {
     // The bearer token is discovered first (line 1) and is ALSO the password
-    // inside the line-2 connection string. Replacing the short value first
-    // used to corrupt the longer span, leaving the username and a bare
-    // `<REDACTED:bearer>` where the connection string should have been.
+    // inside the line-2 connection string. The replaceAll form needed a
+    // longest-first sort here (replacing the short value first corrupted the
+    // longer span, leaving the username and a bare `<REDACTED:bearer>`).
+    // Claimed spans never overlap, so the splice has no ordering hazard —
+    // kept as the regression pin for that shape.
     const url = ['postgres://', 'svc', ':', OPAQUE_VALUE, '@db.internal/app'].join('');
     const { text, redactions } = redactFindings(`Authorization: Bearer ${OPAQUE_VALUE}\nDATABASE_URL=${url}\n`);
     expect(text).toBe('Authorization: Bearer <REDACTED:bearer>\nDATABASE_URL=<REDACTED:db_url_credentials>db.internal/app\n');
     expect(redactions.map((r) => r.pattern)).toEqual(['bearer', 'db_url_credentials']);
+  });
+
+  test('redacts exactly the claimed spans: the corpus write agrees with what scanText reports', () => {
+    // Documented semantic delta from the replaceAll form: a claimed value's
+    // bytes at a position the scanner did NOT claim (embedded inside a longer
+    // identifier, or a bare opaque re-occurrence with no `Bearer ` anchor)
+    // are left as-is, so `redactFindings(t).text` never redacts something
+    // `scanText(t)` would not have reported. A vendor-prefixed key repeated
+    // bare IS claimed on its own and both occurrences go.
+    const text = `Authorization: Bearer ${OPAQUE_VALUE}\nid=prefix${OPAQUE_VALUE}\nbare ${OPAQUE_VALUE}\nk=${OPENAI} again ${OPENAI}\n`;
+    const findings = scanText(text);
+    expect(findings.map((f) => [f.pattern, f.line])).toEqual([['bearer', 1], ['openai', 4], ['openai', 4]]);
+    const { text: out, redactions } = redactFindings(text);
+    expect(redactions.length).toBe(findings.length);
+    expect(out).toBe(`Authorization: Bearer <REDACTED:bearer>\nid=prefix${OPAQUE_VALUE}\nbare ${OPAQUE_VALUE}\nk=<REDACTED:openai> again <REDACTED:openai>\n`);
+  });
+
+  test('a per-line span running into a PEM block: both spans redact, nothing claimed survives', () => {
+    // The bearer value class admits `-`, so a token glued to a PEM header
+    // claims `<token>-----BEGIN` on its line while the whole-text PEM pass
+    // claims the block from `-----BEGIN`. The splice emits the later span's
+    // uncovered tail as its own token instead of skipping it. (The replaceAll
+    // form redacted the longer PEM value first, after which the bearer value
+    // no longer existed in the text and the token survived.)
+    const body = ['MIIEvQIBADANBgkqhkiG9w0BAQEF', 'AASCBKcwggSjAgEAAoIBAQC7VJTU'].join('');
+    const text = `Authorization: Bearer ${OPAQUE_VALUE}${['-----BEGIN', ' RSA PRIVATE KEY', '-----'].join('')}\n${body}\n${['-----END', ' RSA PRIVATE KEY', '-----'].join('')}\nafter`;
+    const { text: out, redactions } = redactFindings(text);
+    expect(redactions.map((r) => r.pattern).sort()).toEqual(['bearer', 'private_key_pem']);
+    expect(out).toBe('Authorization: Bearer <REDACTED:bearer><REDACTED:private_key_pem>\nafter');
+    expect(out.includes(OPAQUE_VALUE)).toBe(false);
+    expect(out.includes(body)).toBe(false);
   });
 
   test('one redaction record per occurrence even when the same value repeats', () => {

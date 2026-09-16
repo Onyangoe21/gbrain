@@ -5,9 +5,12 @@
  * long line is a denial-of-service lever, not a slow path. Pre-fix timings
  * for the inputs below were seconds (8000 credential-less redis URLs on one
  * JSON line: ~4 s; 160k chars of repeated `redis://:`: ~5.6 s; 5000 Bearer
- * tokens on one line: ~2.6 s vs 41 ms one-per-line). The thresholds sit
- * 10-50x above the fixed timings and 10-100x below the broken ones, so they
- * bind on a regression without flaking on a loaded CI box.
+ * tokens on one line: ~2.6 s vs 41 ms one-per-line; 200 KB of `-eyJ`: ~25 s;
+ * 210 KB of `-apikey`: ~42 s; 2000 PEM headers without END ahead of a 1 MB
+ * tail: ~3.8 s; redacting a 1 MB transcript with ~5k unique values: ~3 s).
+ * The thresholds sit 3-50x above the fixed timings and 10-1000x below the
+ * broken ones, so they bind on a regression without flaking on a loaded CI
+ * box.
  *
  * Every credential-shaped value is synthetic and runtime-joined from >= 2
  * fragments; constant names keep scanner keywords away from the `=`.
@@ -68,11 +71,17 @@ describe('db_url_credentials is linear on long lines', () => {
     expect(ms).toBeLessThan(200);
   });
 
-  test('(ii-b) 160k chars of repeated `redis://:` followed by a single @: < 200ms', () => {
+  test('(ii-b) 160k chars of repeated `redis://:` followed by a single @: one bounded finding, < 200ms', () => {
+    // `/` is a legal password character (base64 passwords are pasted
+    // unescaped), so the ≤256 chars of `redis://:` runs ahead of the `@` read
+    // as `user="" password="redis://:redis://:…"` — ONE credential-shaped
+    // finding whose value ends at the `@`, not one per scheme occurrence and
+    // not a run to the end of the line. The timing is the pin; the count
+    // shows the bound is doing the work.
     const line = 'redis://:'.repeat(17_778) + '@';
-    let findings: unknown[] = [];
+    let findings: ReturnType<typeof scanText> = [];
     const ms = elapsedMs(() => { findings = scanText(line); });
-    expect(findings).toEqual([]);
+    expect(findings.map((f) => f.pattern)).toEqual(['db_url_credentials']);
     expect(ms).toBeLessThan(200);
   });
 });
@@ -102,7 +111,8 @@ describe('preview + corpus redaction are linear in hits on one line', () => {
   test('(iii-c) hit count scales linearly: 20000 tokens on one 760k line < 1500ms', () => {
     // The first-wins overlap check and the preview window used to walk every
     // prior span per hit (O(hits²)): 5000 hits 305 ms, 10000 1.4 s, 20000
-    // 5.4 s. Both are O(log hits) now.
+    // 5.4 s. The overlap check is O(value) per hit now (claimed-char bitmap)
+    // and the preview window O(log hits) (binary search over sorted spans).
     const line = Array.from({ length: 20_000 }, () => `Bearer ${OPAQUE}`).join(' ');
     let findings: ReturnType<typeof scanText> = [];
     const ms = elapsedMs(() => { findings = scanText(line); });
@@ -150,12 +160,126 @@ describe('the bounded connection-string pattern still fires on real credentials'
     expect(redactFindings(url).text).toBe('<REDACTED:db_url_credentials>h/db');
   });
 
-  test('the user bound is 128 chars; an unescaped `/` cannot be part of a URL password', () => {
+  test('the user bound is 128 chars; the user segment stops at `/`, the password does not', () => {
     const user128 = 'u'.repeat(128);
     expect(scanText(['amqp://', user128, ':', 'p4ss', '@h'].join('')).map((f) => f.pattern)).toEqual(['db_url_credentials']);
     expect(scanText(['amqp://', user128 + 'u', ':', 'p4ss', '@h'].join(''))).toEqual([]);
-    // `scheme://user:pa/th@host` is a path with an `@` in it, not a
-    // credential — the old unbounded form matched it.
-    expect(scanText(['mssql://', 'svc', ':', 'pa/th', '@h'].join(''))).toEqual([]);
+    // A `/` in the USER segment ends it (`scheme://host/path:x@y` is not a
+    // credential); a `/` in the PASSWORD is legal — base64 passwords are
+    // pasted unescaped all the time, and an earlier cut that excluded it let
+    // every such password through (pinned positively in
+    // secret-scan-format-detectors-extra).
+    expect(scanText(['mssql://', 'sv/c', ':', 'p4ss', '@h'].join(''))).toEqual([]);
+    expect(scanText(['mssql://', 'svc', ':', 'pa/th0', '@h'].join('')).map((f) => f.pattern)).toEqual(['db_url_credentials']);
+  });
+});
+
+describe('jwt + high_entropy_assignment are linear on adversarial `-`/`_` runs', () => {
+  // Both value classes contain `-` and `_`. When the LEFT BOUNDARY admits the
+  // same characters, every `-`/`_` in the run is a fresh start whose value
+  // consumes to end-of-line and backtracks — quadratic. jwt now excludes `-`
+  // from its boundary and bounds each segment; the entropy rule bounds the
+  // keyword's trailing identifier segments (`{0,64}`) and the value.
+  test('200 KB of `-eyJ`: 0 findings, < 200ms (was ~25 s)', () => {
+    const line = '-eyJ'.repeat(50_000);
+    let findings: unknown[] = [];
+    const ms = elapsedMs(() => { findings = scanText(line); });
+    expect(findings).toEqual([]);
+    expect(ms).toBeLessThan(200);
+  });
+
+  test('210 KB of `-apikey` with highEntropy: 0 findings, < 200ms (was ~42 s)', () => {
+    const line = '-apikey'.repeat(30_000);
+    let findings: unknown[] = [];
+    const ms = elapsedMs(() => { findings = scanText(line, { highEntropy: true }); });
+    expect(findings).toEqual([]);
+    expect(ms).toBeLessThan(200);
+  });
+
+  test('180 KB of `_token` with highEntropy: 0 findings, < 200ms (was ~18 s)', () => {
+    const line = '_token'.repeat(30_000);
+    let findings: unknown[] = [];
+    const ms = elapsedMs(() => { findings = scanText(line, { highEntropy: true }); });
+    expect(findings).toEqual([]);
+    expect(ms).toBeLessThan(200);
+  });
+});
+
+describe('PEM_BLOCK_RE is linear in headers and text', () => {
+  const MB_TAIL = 'x'.repeat(1024 * 1024);
+  const PEM_BODY_LINE = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj', 'AgEAAoIBAQC7VJTUt9Us8cKj'].join('');
+  // Header/footer joined from fragments so the committed source never carries a whole PEM block (gitleaks private-key rule).
+  const PEM_KEY = [['-----BEGIN', ' RSA PRIVATE KEY', '-----'].join(''), PEM_BODY_LINE, ['-----END', ' RSA PRIVATE KEY', '-----'].join('')].join('\n');
+
+  test('2000 header-only mentions ahead of a 1 MB tail: 2000 findings, < 300ms (was ~3.8 s)', () => {
+    // The unbounded lazy body scanned from EVERY header to the end of the
+    // text looking for an END that never comes. Bounded at
+    // PEM_BODY_MAX_CHARS, each header does constant work.
+    const text = Array.from({ length: 2000 }, () => 'leaked -----BEGIN RSA PRIVATE KEY----- here').join('\n') + '\n' + MB_TAIL;
+    let findings: ReturnType<typeof scanText> = [];
+    const ms = elapsedMs(() => { findings = scanText(text); });
+    expect(findings.length).toBe(2000);
+    expect(findings.every((f) => f.pattern === 'private_key_pem')).toBe(true);
+    expect(ms).toBeLessThan(300);
+  });
+
+  test('2000 well-formed keys ahead of a 1 MB tail: 2000 findings with correct lines, < 300ms', () => {
+    // The 1-based header line used to be recomputed per hit as
+    // `text.slice(0, index).split('\n').length` — O(hits × text). It is a
+    // running cursor now; the line numbers must still be exact.
+    const text = Array.from({ length: 2000 }, () => PEM_KEY).join('\n') + '\n' + MB_TAIL;
+    let findings: ReturnType<typeof scanText> = [];
+    const ms = elapsedMs(() => { findings = scanText(text); });
+    expect(findings.length).toBe(2000);
+    expect(findings.map((f) => f.line)).toEqual(Array.from({ length: 2000 }, (_, k) => 3 * k + 1));
+    expect(JSON.stringify(findings).includes(PEM_BODY_LINE)).toBe(false);
+    expect(ms).toBeLessThan(300);
+  });
+
+  test('2000 well-formed keys AFTER a 1 MB preamble: exact lines, < 300ms (was ~1.1 s)', () => {
+    // The shape that isolates the per-hit line recount: every hit sits
+    // behind >= 1 MB of text, so O(hits × prefix) slicing is >= 2 GB of
+    // characters, while the running cursor walks the preamble once.
+    const preamble = Array.from({ length: 10_000 }, () => 'x'.repeat(104)).join('\n');
+    expect(preamble.length).toBeGreaterThan(1024 * 1024);
+    const text = preamble + '\n' + Array.from({ length: 2000 }, () => PEM_KEY).join('\n');
+    let findings: ReturnType<typeof scanText> = [];
+    const ms = elapsedMs(() => { findings = scanText(text); });
+    expect(findings.length).toBe(2000);
+    expect(findings.map((f) => f.line)).toEqual(Array.from({ length: 2000 }, (_, k) => 10_001 + 3 * k));
+    expect(ms).toBeLessThan(300);
+  });
+});
+
+describe('redactFindings is linear in unique values (span-splice, not replaceAll per value)', () => {
+  test('1 MB transcript with 5000 UNIQUE high-entropy values: redact < 400ms (was ~3 s for a ~70 ms scan)', () => {
+    // One full-text replaceAll per unique (pattern, value) pair made the
+    // rebuild O(unique × text); the output is now spliced from the claimed
+    // spans in one pass. Two prose lines between assignments keep the
+    // transcript ~1 MB and mostly non-secret, as a real session is.
+    const prose = 'the quick brown fox jumps over the lazy dog and keeps going for a while yet more prose to pad it out';
+    const base = ['aB3xZ9qL7m', 'Np2Rt5Vw8Yk1D4'].join('');
+    const values = Array.from({ length: 5000 }, (_, k) => base + k.toString(36).padStart(6, 'q'));
+    const lines: string[] = [];
+    for (const v of values) lines.push(`api_key = "${v}"`, prose, prose);
+    const text = lines.join('\n');
+    expect(text.length).toBeGreaterThan(1024 * 1024);
+    let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
+    const ms = elapsedMs(() => { result = redactFindings(text, { highEntropy: true }); });
+    expect(result.redactions.length).toBe(5000);
+    expect(result.text.split('<REDACTED:high_entropy_assignment>').length - 1).toBe(5000);
+    for (const v of [values[0], values[2499], values[4999]]) expect(result.text.includes(v!)).toBe(false);
+    expect(result.text.startsWith(`api_key = "<REDACTED:high_entropy_assignment>"\n${prose}\n${prose}\napi_key = "<REDACTED:high_entropy_assignment>"`)).toBe(true);
+    expect(ms).toBeLessThan(400);
+  });
+
+  test('5000 UNIQUE Bearer tokens on one line: redact < 200ms (was ~360 ms)', () => {
+    const line = Array.from({ length: 5000 }, (_, k) => `Bearer ${OPAQUE}${k.toString(36).padStart(4, 'z')}`).join(' ');
+    let result = { text: '', redactions: [] as ReturnType<typeof scanText> };
+    const ms = elapsedMs(() => { result = redactFindings(line); });
+    expect(result.redactions.length).toBe(5000);
+    expect(result.text.includes(OPAQUE)).toBe(false);
+    expect(result.text).toBe(Array.from({ length: 5000 }, () => 'Bearer <REDACTED:bearer>').join(' '));
+    expect(ms).toBeLessThan(200);
   });
 });

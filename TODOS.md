@@ -40,13 +40,27 @@
 - [ ] **P3 — `scripts/generate-flag-registry.ts` attributes `jobs work --allow-shell-jobs` to the `doctor` scan surface.**
   **What:** the `facadeExpansion` heuristic filed the new flag under `doctor`; verify that is the intended registry shape or teach the generator the `jobs work` surface. **Effort:** XS. **Priority:** P3.
 - [ ] **P3 — Pass `env: process.env` explicitly at the remaining git exec sites.**
-  **What:** the preflight re-exec already sanitizes the environment those `execFileSync('git', …)` calls in `src/commands/doctor/bootstrap-checks.ts` and `src/core/skill-fix-gates.ts` inherit; the hook path carries the explicit env as belt-and-braces and these two do not. **Effort:** XS. **Priority:** P3.
-- [ ] **P3 — cwd-`.env` re-exec when gbrain is started via `bun -e` or a wrapper with no re-runnable entry.**
+  **What:** the sanitized re-run already cleans the environment those `execFileSync('git', …)` calls in `src/commands/doctor/bootstrap-checks.ts` and `src/core/skill-fix-gates.ts` inherit; the hook path carries the explicit env as belt-and-braces and these two do not. **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — cwd-`.env` sanitized re-run when gbrain is started via `bun -e` or a wrapper with no re-runnable entry.**
   **What:** `cli-preflight.ts:selfArgv` returns null there and the process keeps the in-process-only quarantine (descendants may still see planted values). Only dev/wrapper invocations are affected. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — `DeleteThroughResult.skipped` union: add `already_soft_deleted`.**
   **What:** `delete_page purge` on a tombstoned row reports `write_through: { removed: false, skipped: 'already_soft_deleted' }` via an inline `as const` (the `subagent_sandbox` precedent); widening the closed union in `write-through.ts` is a one-liner. **Effort:** XS. **Priority:** P3.
 - [ ] **P3 — Drop the dead `includeDeleted` at the transcript ingest raw probe.**
   **What:** `importFromContent` re-imports (and revives) a soft-deleted base page, so the all-skipped probe at `src/core/transcripts/ingest.ts` only ever runs against a live page; the flag is harmless but dead (pinned by the "probe never runs" test). **Effort:** XS. **Priority:** P3.
+- [ ] **P2 — Allowlist-based environment for spawned tools instead of the cwd-`.env` denylist.**
+  **What:** `src/core/env-trust.ts` protects a denylist of known hijack families (loader, git, node, proxies, XDG roots, trust stores, editors, provider endpoints); a denylist is reactive by nature (the XDG config-root vector was found only in review). A per-spawn-site allowlist for git, the claude CLI and workers, built from `env-trust.ts`, would make the boundary positive. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — gbrain self-spawn sites pass a pre-sanitized env + neutral cwd.**
+  **What:** supervisor → worker, hook → detached push and worker → run-child inherit the hostile cwd, so each subtree pays its own sanitized re-run and warning once; `cli-preflight.ts` could export the hop env builder so descendants start clean. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — cwd `bunfig.toml` under the dev runtime (`preload`) is a sibling vector to cwd `.env` for `bun src/cli.ts`.**
+  **What:** compiled binaries are unaffected; decide whether preflight should refuse or warn when a cwd bunfig names a preload. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — SIGINT sent to the re-run wrapper pid alone (not the process group) is ignored by design.**
+  **What:** the wrapper lets the tty deliver Ctrl-C to the child and forwards only SIGTERM/SIGHUP; a supervisor that signals the wrapper alone must use those. Document, or forward once when stdin is not a tty. **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — `sources_remove` confinement uses the read ladder; consider the write-authority rule for a destructive op.**
+  **What:** remote `sources_remove` may name any id inside `sourceIds ?? [sourceId]` (federated read grant), while `delete_page` requires the caller's write source. A `sources_admin` token bound to `a` with `federated_read: [a, b]` can hard-remove `b`. Strict improvement over the pre-wave behavior; tightening to the write source would mirror `delete_page`. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Per-client pending-consent cap can be used to lock a known client out of consent.**
+  **What:** anyone holding a `client_id` + registered `redirect_uri` (both appear in `/authorize` URLs) can hold ten pending requests per ten-minute window, so the legitimate connector is redirected with `error=too_many_requests` until the owner decides them. Consider counting per `(client_id, remote address)`, a bulk-deny in the admin UI, or exempting operator-registered clients. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `delete_page --purge` sweep of slug-keyed derived rows without FKs.**
+  **What:** the purge response names the residuals (git history, exports, compiled context, `take_proposals`/`open_loops`/`files` rows keyed by slug text); sweeping those tables would make the purge more complete. **Effort:** S. **Priority:** P3.
 
 ## Community fix wave follow-ups (filed 2026-09-09)
 

@@ -2000,7 +2000,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         healthInterval = parsed;
       }
       const allowShellJobs = hasFlag(args, '--allow-shell-jobs') ||
-                             !!process.env.GBRAIN_ALLOW_SHELL_JOBS;
+                             process.env.GBRAIN_ALLOW_SHELL_JOBS === '1'; // same literal the shell handler checks
       const detach = hasFlag(args, '--detach');
       // Supervisor's --max-rss: explicit wins; absent → cgroup-aware auto-size
       // (issue #1678). The supervisor is the main production path, so the
@@ -2817,17 +2817,17 @@ export async function registerBuiltinHandlers(
     };
   });
 
-  // Shell handler is always registered. Runtime env guard lives inside the
-  // handler so claimed jobs emit a clear rejection log on workers missing
-  // GBRAIN_ALLOW_SHELL_JOBS=1.
+  // Shell handler is always registered. Runtime guard lives inside the handler
+  // so claimed jobs emit a clear rejection log on workers started without
+  // --allow-shell-jobs (the flag sets GBRAIN_ALLOW_SHELL_JOBS=1 after preflight).
   {
     const { shellHandler } = await import('../core/minions/handlers/shell.ts');
     worker.register('shell', shellHandler);
     if (!quiet) {
       if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
-        process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
+        process.stderr.write('[minion worker] shell handler enabled (--allow-shell-jobs / GBRAIN_ALLOW_SHELL_JOBS=1)\n');
       } else {
-        process.stderr.write('[minion worker] shell handler registered in guarded mode (set GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)\n');
+        process.stderr.write('[minion worker] shell handler registered in guarded mode (start with `gbrain jobs work --allow-shell-jobs`, or export GBRAIN_ALLOW_SHELL_JOBS=1, to execute shell jobs)\n');
       }
     }
   }

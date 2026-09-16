@@ -83,11 +83,20 @@ process), drops the variable and prints one line to stderr:
 [env] Ignoring GBRAIN_GUARDRAILS_MODULE because a .env file in the current directory assigns it — cwd .env files are untrusted for security settings. Export it from your shell or set it in ~/.gbrain/.env.
 ```
 
-Because a variable removed from one process is still visible to the programs
-that process starts (git, the agent CLI, job workers inherit the environment
-gbrain started with), gbrain then re-runs itself once with the sanitized
-environment and exits with that run's status. Everything it spawns from then
-on sees the clean view. This costs nothing when the working directory has no
+When a `.env` file in the current directory assigns any protected variable,
+gbrain drops it, prints one `[env] Ignoring …` line, and then re-runs itself
+once from an empty temporary directory with the sanitized environment, switches
+back to your directory, and exits with that run's status. The re-run's
+environment simply lacks the dropped variables (they are never carried as empty
+strings, which git and the dynamic loader would treat as set), so every program
+gbrain spawns — git, the claude CLI, workers — inherits the clean view. The
+internal variable `GBRAIN_CWD_ENV_QUARANTINED` marks the re-run — it is not a
+setting, and gbrain honours it only when it provably started in the empty
+directory the marker names. A signal-killed re-run maps to exit 128+signal;
+Ctrl-C reaches the re-run directly from your terminal, and SIGTERM/SIGHUP sent
+to the wrapper are forwarded. gbrain processes that gbrain itself starts from
+that directory (a supervised worker, a background push) repeat the step once
+for their own subtree. This costs nothing when the working directory has no
 `.env`, or when nothing protected is assigned there.
 
 **Protected variables.** Two groups, one predicate
@@ -104,14 +113,24 @@ on sees the clean view. This costs nothing when the working directory has no
   `GBRAIN_NO_SANITY`, `GBRAIN_REMOTE_PRIVATE_PAGES`.
 - The variable families through which a checkout could hijack the programs
   gbrain spawns rather than gbrain itself (`CWD_DOTENV_PROTECTED_PREFIXES`,
-  `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`): dynamic-loader injection (`LD_*`,
-  `DYLD_*`), git configuration/hook/exec injection (`GIT_*`), Bun and npm
-  runtime configuration (`BUN_*`, `NPM_CONFIG_*`/`npm_config_*`), Node preload
-  and TLS knobs (`NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`,
-  `NODE_TLS_REJECT_UNAUTHORIZED`), interpreter preload for Python/Perl/Ruby
-  helpers, ssh askpass programs, HTTP(S)/ALL proxy variables in both
-  spellings, and AI-CLI/API redirection (`CLAUDE_CONFIG_DIR`,
-  `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_BASE_URL`).
+  `CWD_DOTENV_PROTECTED_TOOLCHAIN_KEYS`): the `LD_*`/`DYLD_*` dynamic-loader
+  family, git configuration/hook/exec injection (`GIT_*`), Bun and npm runtime
+  configuration (`BUN_*`, `NPM_CONFIG_*`/`npm_config_*`), Node preload and
+  TLS knobs (`NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`,
+  `NODE_TLS_REJECT_UNAUTHORIZED`), the `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/
+  `XDG_CACHE_HOME` and `GNUPGHOME` roots that git and other tools read as
+  global configuration, the `SSL_CERT_FILE`/`SSL_CERT_DIR`/`CURL_CA_BUNDLE`/
+  `REQUESTS_CA_BUNDLE` trust stores, `EDITOR`/`VISUAL`/`PAGER`, ssh askpass
+  programs, interpreter preload for Python/Perl/Ruby helpers, HTTP(S)/ALL proxy
+  variables in both spellings, and every AI-provider endpoint or credential
+  variable gbrain's gateway reads from the environment (`CLAUDE_CONFIG_DIR`,
+  `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_BASE_URL`,
+  `OPENROUTER_BASE_URL`, `LITELLM_BASE_URL`, `OLLAMA_BASE_URL`,
+  `LMSTUDIO_BASE_URL`, `LLAMA_SERVER_BASE_URL`, `LLAMA_SERVER_RERANKER_BASE_URL`).
+  The endpoint-redirect `GBRAIN_*` keys (`GBRAIN_REMOTE_MCP_URL`,
+  `GBRAIN_REMOTE_ISSUER_URL`, `GBRAIN_DIRECT_DATABASE_URL`) and the re-run
+  marker itself are in the first group. This is a denylist of known hijack
+  families; it grows as new families are identified.
 
 `GBRAIN_GUARDRAILS_MODULE` additionally accepts only an absolute path or a
 `~/` path: cwd-relative specs and bare package names are refused (a package

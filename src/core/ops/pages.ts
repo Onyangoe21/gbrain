@@ -1102,9 +1102,11 @@ async function runAutoLink(
   return { ...result, unresolved };
 }
 
+/** What a purge cannot reach — surfaced on every purged response so a credential remediation never stops at the row. */
+const PURGE_RESIDUALS = 'Brain-repo git history, synced working-tree copies, exports, compiled context files and slug-keyed derived rows (takes, open loops, file records) may still hold the content — rotate the credential and rewrite or regenerate those copies.';
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential). Remote/MCP callers asking for purge get permission_denied (the soft-delete path stays available to them); status purged always carries write_through.',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the result write_through field reports removed + path, or a skipped reason. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true (local CLI only — `gbrain delete <slug> --purge`) removes the row and its chunks/links/raw data immediately with no recovery window; use it when a page must not linger (e.g. it captured a credential); the response names the copies a purge cannot reach (git history, exports, derived rows) — rotate first. Remote/MCP callers asking for purge get permission_denied (the soft-delete path stays available to them); status purged always carries write_through.',
   params: {
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },
     source_id: { type: 'string', description: "#4329: source holding the row to soft-delete (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId. Remote callers may only target their write source — federated read grants do not confer delete access." },
@@ -1163,7 +1165,7 @@ const delete_page: Operation = {
       if (purge) {
         // Remediation path: the tombstone already exists (its artifact went with the earlier soft-delete); finish the removal. Same response shape as the live-row purge.
         await ctx.engine.deletePage(slug, sourceOpts);
-        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: { removed: false, skipped: 'already_soft_deleted' as const } };
+        return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: { removed: false, skipped: 'already_soft_deleted' as const }, residuals: PURGE_RESIDUALS };
       }
       return { status: 'already_soft_deleted', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), deleted_at: existing.deleted_at };
     }
@@ -1180,7 +1182,7 @@ const delete_page: Operation = {
       // Soft-delete first (artifact removal + the same audit shape), then the
       // hard primitive: cascades through chunks/links/raw_data via FKs.
       await ctx.engine.deletePage(slug, sourceOpts);
-      return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough };
+      return { status: 'purged', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough, residuals: PURGE_RESIDUALS };
     }
     // Echo the targeted source so a multi-source caller can verify WHICH row
     // the delete landed on (#4329's false-confidence failure mode).
