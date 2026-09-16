@@ -31,6 +31,7 @@ const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
 let callSpy: ReturnType<typeof spyOn>;
 let logSpy: ReturnType<typeof spyOn>;
 let errSpy: ReturnType<typeof spyOn>;
+let previousExitCode: typeof process.exitCode;
 const logs: string[] = [];
 const errs: string[] = [];
 
@@ -56,9 +57,14 @@ afterAll(() => {
   errSpy.mockRestore();
 });
 
-afterEach(() => { _resetCliExitVerdictForTests(); });
+afterEach(() => {
+  _resetCliExitVerdictForTests();
+  // Verdicts also mirror process.exitCode; undefined does not clear it in Bun.
+  process.exitCode = previousExitCode ?? 0;
+});
 
 beforeEach(() => {
+  previousExitCode = process.exitCode;
   _resetCliExitVerdictForTests();
   calls.length = 0;
   logs.length = 0;
