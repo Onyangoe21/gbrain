@@ -123,7 +123,7 @@ CHECKS=(
   # Containment sprint: module-size ratchet + structural-suite freshness.
   "check:module-size"
   "check:structural-manifest"
-  # v0.50.2.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
+  # v0.50.3.0 security wave: compiled binaries must not autoload a cwd bunfig.toml.
   "check:compile-autoload"
 )
 
