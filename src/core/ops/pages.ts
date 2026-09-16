@@ -10,8 +10,7 @@ import { assertPurgeParams } from '../persistence/preconditions.ts';
  * (cycle); shared contract/context helpers come from the ops/ foundation.
  */
 
-import type { BrainEngine } from '../engine.ts';
-import { clampSearchLimit } from '../engine.ts';
+import { clampSearchLimit, type BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
