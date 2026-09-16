@@ -11,8 +11,8 @@
   **What:** with `--enable-dcr`, a self-registered client may name any `https://` (or loopback / custom-scheme) redirect target; the owner sees it on the consent page but there is no server-side allow-list (e.g. loopback plus the browser-connector callback hosts). **Why:** suggested in a private report as a cheap way to narrow the phishing payoff even with consent in place. **Fix:** `oauth.dcr_redirect_allowlist` config key checked in `registerClient` before the insert; startup summary prints the effective list. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — RFC 7591 initial access tokens for `/register`.**
   **What:** registration is anonymous whenever DCR is on; an operator-minted, single-use registration token would let URL-only connectors register without opening `/register` to everyone. **Why:** suggested in a private report; would also let `--enable-dcr` stay off by default for more deployments. **Effort:** M. **Priority:** P3.
-- [ ] **P3 — `scopes_supported` still advertises `admin` / `agent` to self-registering clients.**
-  **What:** OAuth metadata lists every scope the server knows, but DCR clients are capped at `read write` (read-only for `client_credentials`), so a connector that copies `scopes_supported` into its request is rejected at `/register` or gets an empty grant at `/authorize`, and the consent page shows no badge for the dropped scope. **Fix:** either advertise the DCR-registrable subset when DCR is enabled, or have the consent page explain why a requested scope is absent. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — `scopes_supported` still advertises `admin` / `sources_admin` / `users_admin` to self-registering clients.**
+  **What:** OAuth metadata lists every scope the server knows except the operator-only `agent` scope (omitted from discovery since v0.50.2.0), but DCR clients are capped at `read write` (read-only for `client_credentials`), so a connector that copies `scopes_supported` into its request is rejected at `/register` or gets an empty grant at `/authorize`, and the consent page shows no badge for the dropped scope. **Fix:** either advertise the DCR-registrable subset when DCR is enabled, or have the consent page explain why a requested scope is absent. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — Source fence for operator-registered `sources_admin` clients on the remaining `sources_*` mutating ops.**
   **What:** v0.50.3.0 confines remote `sources_remove` to the caller's resolved source scope (mirroring `sources_status`'s #4433 posture); `sources_archive` and the other mutating source ops still act on any id a `sources_admin` token names. **Effort:** S. **Priority:** P3.
 - [ ] **P3 — Entropy-gated assignment redaction: a hex digest after `token:` still redacts.**
@@ -9340,3 +9340,38 @@ covers DEAD logs; go-forward capture beyond Claude Code is deliberately absent.
   pin in `test/chronicle-ontology-private-visibility.test.ts` and the
   e2e content-privacy suite). **Context:** filed from the #4881 adoption
   (refuter amendment). **Effort:** S.
+
+## v0.50.2.0 persistence and verification follow-ups
+
+- [ ] **P3 — historical migration banner accuracy.** The source-owned v0.32.2
+  feature pitch still promises full database reconstruction from Markdown and
+  refers to an unsupported `--write` flag. Align it with the corrected
+  `skills/migrations/v0.32.2.md` guide, preserving preview/retry behavior and
+  separate backups for DB-only knowledge. The guide is current; the historical
+  banner remains documentation debt.
+
+- [ ] **P2 — durable contention queue and caller revision preconditions (#5105).**
+  The collector rejects a busy worktree before changing the page and reports
+  that the write was not queued. Add a separately reviewed acceptance/replay
+  contract and revision check before claiming queued or conflict-safe writes.
+  Preserve source authorization, cancellation, and idempotency across replay.
+
+- [ ] **P2 — file/database commit-failure recovery.** A crash or database commit
+  failure after atomic rename can leave canonical Markdown ahead of the index.
+  Add fault injection at that boundary and a reconciler with explicit recovery
+  semantics before claiming crash-atomic persistence. Do not treat a Markdown
+  rebuild as recovery of DB-only knowledge or operational state.
+
+- [ ] **P2 — reviewed historical fact and stub repair (#5110, #5111).** New
+  unresolved facts retain provenance without inventing an entity page, and the
+  fence migration skips references without a canonical page. Existing unmatched
+  facts, empty stubs, and fence drift still need a source-scoped preview and
+  backup-backed repair plan. Never erase facts or fabricate backing pages just
+  to improve a parity count.
+
+- [ ] **P3 — native host and client verification for v0.50.2.0.** Exercise the
+  Windows process probe and subdirectory sync on Windows, then verify the
+  installed hosted launcher and read-only OAuth bootstrap in the intended
+  ChatGPT/Claude harness. Injected platform tests and SDK/HTTP tests do not prove
+  those native integrations. Live provider checks require separate consent and
+  configured credentials.

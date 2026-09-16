@@ -1248,6 +1248,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'protocol_installed_at',
   'provider_chat_options',
   'storage',
+  'schema_pack',
   'eval',
   'eval.capture',
   'eval.scrub_pii',
