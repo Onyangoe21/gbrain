@@ -15,6 +15,7 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { installFixtureChunks } from '../helpers/page-projection.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
@@ -2255,17 +2256,24 @@ describeBoth('Engine parity — restorePage arc (D7)', () => {
 describeBoth('Engine parity — open_loops loops-store round-trip', () => {
   let pgEngine: BrainEngine;
   let pgliteEngine: PGLiteEngine;
+  let pgFixture: Awaited<ReturnType<typeof isolatedPersistencePostgres>>;
 
   beforeAll(async () => {
-    pgEngine = await setupDB();
+    // Bootstrap fixtures can remove source FKs from the shared schema, leaving
+    // prior loops behind. Creation/dedup parity requires a fresh brain on both sides.
+    pgFixture = await isolatedPersistencePostgres(process.env.DATABASE_URL!);
+    pgEngine = pgFixture.engine;
     pgliteEngine = new PGLiteEngine();
     await pgliteEngine.connect({});
     await pgliteEngine.initSchema();
   }, 90_000);
 
   afterAll(async () => {
-    await pgliteEngine.disconnect();
-    await teardownDB();
+    try {
+      await pgliteEngine?.disconnect();
+    } finally {
+      await pgFixture?.close();
+    }
   }, 30_000);
 
   // loops-store shares one SQL text across engines (parity by construction);
