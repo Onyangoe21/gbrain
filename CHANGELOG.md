@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.50.3.0] - 2026-09-16
+## [0.50.5.0] - 2026-09-16
 
 **Security hardening pass across the remote OAuth surface, transcript ingest, and environment handling.** This wave closes the critical- and high-severity items from privately reported advisories. Fresh installs and existing brains are on the same footing after upgrade; where an operator kept a security-relevant setting in a project directory's `.env`, gbrain now says so and names the fix. Thanks to the reporters credited below.
 
@@ -26,7 +26,7 @@ All notable changes to GBrain will be documented in this file.
 - Connection strings with inline passwords now count as secrets for `gbrain sources push` / bootstrap verify and are dropped from compiled-context entries; declare a confirmed non-secret value safe with its fingerprint in `.gbrain-scan-allow`. The high-entropy assignment rule now requires a digit in the value, so identifier-shaped assignments in code stop being redacted.
 - Startup banner and warning text plus `docs/mcp/DEPLOY.md`, `docs/mcp/CHATGPT.md`, `SECURITY.md` and `docs/guardrails.md` describe the registration ceiling, the owner-approval step, the widen path, and the cwd-`.env` trust boundary.
 
-### To take advantage of v0.50.3.0
+### To take advantage of v0.50.5.0
 `gbrain upgrade`, then restart `gbrain serve --http` and run `gbrain doctor`. If it lists self-registered OAuth clients with a privileged scope you did not intend, run `gbrain auth rescope-client <client_id> --scopes read,write` or `gbrain auth revoke-client <client_id>`. Connectors that request `admin` at self-registration will now fail to register — pre-register them with `gbrain auth register-client <name> --scopes …` or let them self-register with `read write` and rescope later. If you kept `GBRAIN_GUARDRAILS_MODULE`, `GBRAIN_HOME`, a `GBRAIN_ALLOW_*` flag or another protected variable in a project's `.env`, move it to `~/.gbrain/.env` (or your service's EnvironmentFile / shell profile) — gbrain names the variable it ignored and where to put it. A hand-started worker that runs shell jobs should use `gbrain jobs work --allow-shell-jobs`. If `GBRAIN_GUARDRAILS_MODULE` is a package name or a relative path, change it to the module's absolute path (or a `~/` path) — gbrain exits 1 until you do. If you set `GBRAIN_DATABASE_URL` in a project's `.env` on purpose, export it from your shell or put it in `~/.gbrain/.env` instead. If you build the binary yourself, rebuild it with `bun run build` (**Say to your agent:** *"rebuild the gbrain binary"*) so it carries the new compile flag.
 
 **Say to your agent:** *"archive my session transcripts"* / *"import my conversations"* — *"a secret leaked into a brain page — rotate it and purge the page"* (your agent rotates the credential, then runs `gbrain delete <slug> --purge` on the host) — *"run a brain health check"* (your agent runs `gbrain doctor` and follows any `oauth_client_scope_health` advice) — *"start my brain's MCP server with self-service client registration"* (your agent runs `gbrain serve --http --enable-dcr`; you approve each new connection in the admin UI).
