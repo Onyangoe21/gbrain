@@ -1,4 +1,4 @@
-import { OperationError, type ParamDef } from '../ops/contract.ts';
+import type { ParamDef } from '../ops/contract.ts';
 
 /** Capture input sugar stays data; the owner materializes generated fields once. */
 export const CAPTURE_EVENT_PARAMS: Record<string, ParamDef> = {
@@ -10,7 +10,10 @@ export const CAPTURE_EVENT_PARAMS: Record<string, ParamDef> = {
 };
 import { WRITE_REQUEST_STATES } from './types.ts';
 
-/** Leaf definitions: safe to import while the frozen verb registry is evaluating. */
+/** Leaf definitions: safe to import while the frozen verb registry is evaluating.
+ * Runtime validators belong in preconditions.ts; importing OperationError here
+ * creates a params -> contract -> verbs -> params initialization cycle.
+ */
 export const WRITE_REQUEST_PARAM: ParamDef = {
   type: 'string',
   description: 'Optional caller-generated UUID for this write. Reuse the same UUID and original arguments to recover its outcome after a timeout; a different intent requires a new UUID.',
@@ -56,14 +59,3 @@ export const WRITE_RECEIPT_SCHEMA = {
     updated_at: { type: 'string' },
   },
 };
-
-/** Shape/trust checks do not read the current page or resolve a replay target. */
-export function assertPurgeParams(params: Record<string, unknown>, remote: boolean | undefined): void {
-  if (params.purge !== undefined && typeof params.purge !== 'boolean') {
-    throw new OperationError('invalid_params', 'purge must be a boolean.', 'Pass purge: true (CLI: gbrain delete <slug> --purge).');
-  }
-  if (params.purge === true && remote !== false) {
-    throw new OperationError('permission_denied', 'purge is only available to the local CLI.',
-      'Remote callers soft-delete only; run `gbrain delete <slug> --purge` on the host to remove a page immediately.');
-  }
-}

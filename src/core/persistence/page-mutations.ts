@@ -11,8 +11,7 @@ import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequ
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocalWriter } from './identity.ts';
 import { claimWorktree, getWorktreeBinding } from './ownership.ts';
-import { parseMutationPrecondition } from './preconditions.ts';
-import { assertPurgeParams } from './params.ts';
+import { assertPurgeParams, parseMutationPrecondition } from './preconditions.ts';
 import type { Principal } from './model.ts';
 import { normalizeSubagentPageInput } from './page-input.ts';
 
