@@ -44,6 +44,7 @@
  */
 
 import { existsSync, realpathSync } from 'node:fs';
+import { shellQuote } from './mcp-registration.ts';
 
 export const TAILSCALE_ADMIN_DNS_URL = 'https://login.tailscale.com/admin/dns';
 export const TAILSCALE_ADMIN_ACL_URL = 'https://login.tailscale.com/admin/acls';
@@ -235,9 +236,17 @@ export function tailscaleSetOperatorCommand(user: string): string {
   return `sudo tailscale set --operator=${user}`;
 }
 
-/** What the operator runs themselves when gbrain refuses to `sudo` a non-system binary (`$USER` expands in their shell). */
-export function tailscaleManualLoginCommand(): string {
-  return `${tailscaleSetOperatorCommand('$USER')} && ${tailscaleLoginArgv('linux', '$USER').up.join(' ')}`;
+/**
+ * What the operator runs themselves when gbrain refuses to `sudo` a
+ * non-system binary: the DISCOVERED path, shell-quoted, because a binary
+ * outside sudo's `secure_path` (`~/.local/bin`) is exactly the case that gets
+ * here, and a bare `sudo tailscale` would then say "command not found"
+ * (`$USER` expands in their shell). Owns the `--operator` literal so the
+ * flag-registry scan of `mcp-expose.ts` never sees tailscale's flags.
+ */
+export function tailscaleManualLoginCommand(binary = 'tailscale'): string {
+  const bin = shellQuote(binary);
+  return `sudo ${bin} set --operator=$USER && sudo ${bin} up`;
 }
 
 /** Turns MagicDNS resolution on for THIS node — the fix when the host cannot resolve its own `*.ts.net` name. */

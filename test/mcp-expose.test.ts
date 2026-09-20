@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mcpNeedsEngine, runMcp } from '../src/commands/mcp.ts';
 import { defaultTcpProbe, runMcpExpose, parseExposeArgs, MCP_EXPOSE_HELP, type McpExposeDeps } from '../src/commands/mcp-expose.ts';
+import { defaultLookup, isUnresolvedLookupError, tryFetch } from '../src/commands/mcp-expose-probe.ts';
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import { TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_FUNNEL_KB_URL, type CommandRunner, type CommandRunOptions } from '../src/core/tailscale.ts';
 import { adminTokenPath, readExposeReceipt, receiptPath, wrapperPath, writeExposeReceipt, type ExposeReceipt } from '../src/core/serve-service.ts';
@@ -160,6 +161,8 @@ function fakeTailnet(o: TailnetOpts = {}): Fake {
     },
     // The default tcpProbe opens a real loopback socket; the fake never does.
     tcpProbe: async () => false,
+    // The default lookup asks the real resolver; the fake resolves every name (tests that need an unresolvable name inject their own).
+    lookup: async () => {},
     isTTY: false, prompt: async () => { throw new Error('prompt must not be called'); },
     stdout: (l) => stdout.push(l), stderr: (l) => stderr.push(l),
     now: () => new Date('2026-06-01T12:00:00.000Z'), sleep: async () => {},
@@ -1973,7 +1976,7 @@ describe('early receipt + receipt-less recovery', () => {
     expect(existsSync(g.deps.plistPath!)).toBe(false);
     expect(joinedCalls(g)).toContain(`${APP_TS} serve --https=443 --set-path=/ off`);
   });
-  test('recovery with only a stray wrapper removes just the wrapper; an unreadable serve status is reported and leaves the handler', async () => {
+  test('recovery with only a stray wrapper removes just the wrapper; an unreadable serve status fails closed like the receipt path — service still removed, wrapper KEPT, exit 1 tailscale_serve_status_unreadable — and the re-run finishes the job', async () => {
     const f = fakeTailnet();
     mkdirSync(f.serveDir, { recursive: true });
     writeFileSync(wrapperPath(f.serveDir), '#!/bin/bash\nexit 0\n');
@@ -1984,17 +1987,61 @@ describe('early receipt + receipt-less recovery', () => {
     expect(checkOf(doc, 'tailscale.publish')?.detail).toContain('nothing to turn off');
     expect(existsSync(wrapperPath(f.serveDir))).toBe(false);
     expect(joinedCalls(f).some(c => c.includes('disable') || c.includes('off'))).toBe(false);
+    // stray wrapper + unreadable serve status: the handler cannot be checked, so the wrapper (the corroboration a re-run needs) stays and the exit is 1
     const h = fakeTailnet();
     mkdirSync(h.serveDir, { recursive: true });
     writeFileSync(wrapperPath(h.serveDir), '#!/bin/bash\nexit 0\n');
     const hinner = h.deps.run!;
-    h.deps.run = async (argv, o) => (argv.join(' ') === `${TS} serve status --json` ? { status: 1, stdout: '', stderr: 'Access denied' } : hinner(argv, o));
-    expect(await runMcpExpose(['--remove', '--yes', '--json'], h.deps)).toBe(0);
+    let hbroken = true;
+    h.deps.run = async (argv, o) => (hbroken && argv.join(' ') === `${TS} serve status --json` ? { status: 1, stdout: '', stderr: 'Access denied' } : hinner(argv, o));
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], h.deps)).toBe(1);
     const hdoc = jsonDoc(h);
-    expect(checkOf(hdoc, 'tailscale.publish')).toMatchObject({ status: 'warn' });
-    expect(checkOf(hdoc, 'tailscale.publish')?.detail).toContain('could not read tailscale serve status');
-    expect(h.stderr.join('\n')).toContain('serve status could not be read');
+    expect(hdoc).toMatchObject({ status: 'error', reason: 'tailscale_serve_status_unreadable', message: 'could not read tailscale serve status; handler state unknown', receipt: null });
+    expect(checkOf(hdoc, 'tailscale.publish')).toMatchObject({ status: 'fail' });
+    expect(checkOf(hdoc, 'tailscale.publish')?.detail).toContain('could not read tailscale serve status (exit 1): needs_operator');
+    expect(checkOf(hdoc, 'tailscale.publish')?.detail).toContain('handler state unknown');
+    expect(checkOf(hdoc, 'files')).toMatchObject({ status: 'skipped' });
+    expect(checkOf(hdoc, 'files')?.detail).toContain('kept: the wrapper');
+    expect(checkOf(hdoc, 'plan')?.detail).toContain('cannot be checked — stops after the service step (exit 1)');
+    expect(checkOf(hdoc, 'plan')?.detail).toContain('Files     keep ');
+    expect(hdoc.next_actions).toEqual(['tailscale serve status --json', 'gbrain mcp expose --remove --yes']);
+    expect(h.stderr.join('\n')).toContain('Stopped here: no service was found, but `tailscale serve status` could not be read');
+    expect(h.stderr.join('\n')).not.toContain('Removed the leftovers');
+    expect(existsSync(wrapperPath(h.serveDir))).toBe(true);
+    expect(joinedCalls(h).some(c => c.includes('--set-path=/ off'))).toBe(false);
+    // Tailscale reads again → the same command completes the recovery
+    hbroken = false;
+    h.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], h.deps)).toBe(0);
+    expect(jsonDoc(h).reason).toBe('recovered_without_receipt');
     expect(existsSync(wrapperPath(h.serveDir))).toBe(false);
+    // a full interrupted run (service + wrapper + handler, no receipt) with an unreadable serve status: the service IS uninstalled, the wrapper stays, exit 1; once readable the re-run turns the handler off
+    const s = fakeTailnet();
+    expect(await runMcpExpose(['--yes'], s.deps)).toBe(0);
+    rmSync(receiptPath(s.serveDir));
+    const sinner = s.deps.run!;
+    let sbroken = true;
+    s.deps.run = async (argv, o) => (sbroken && argv.join(' ') === `${TS} serve status --json` ? { status: 1, stdout: '', stderr: 'failed to connect to local Tailscale service; is Tailscale running?' } : sinner(argv, o));
+    s.calls.length = 0;
+    s.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], s.deps)).toBe(1);
+    const sdoc = jsonDoc(s);
+    expect(sdoc).toMatchObject({ status: 'error', reason: 'tailscale_serve_status_unreadable' });
+    expect(checkOf(sdoc, 'service')).toMatchObject({ status: 'ok' });
+    expect(joinedCalls(s)).toContain('systemctl --user disable --now gbrain-serve.service');
+    expect(existsSync(s.deps.unitPath!)).toBe(false);
+    expect(checkOf(sdoc, 'tailscale.publish')?.detail).toContain('could not read tailscale serve status (exit 1): daemon_not_running');
+    expect(checkOf(sdoc, 'files')?.detail).toContain('kept: the wrapper');
+    expect(existsSync(wrapperPath(s.serveDir))).toBe(true);
+    expect(s.stderr.join('\n')).toContain('Stopped here: the service was stopped and removed, but `tailscale serve status` could not be read');
+    expect((await sinner([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:3131');
+    sbroken = false;
+    s.calls.length = 0;
+    s.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], s.deps)).toBe(0);
+    expect(jsonDoc(s).reason).toBe('recovered_without_receipt');
+    expect(joinedCalls(s)).toContain(`${TS} serve --https=443 --set-path=/ off`);
+    expect(existsSync(wrapperPath(s.serveDir))).toBe(false);
     // nothing of ours anywhere AND serve status unreadable → still "nothing to remove", with the caveat recorded
     const i = fakeTailnet();
     const iinner = i.deps.run!;
@@ -2258,11 +2305,12 @@ describe('scoped off + honest recovery (adversarial-review batch)', () => {
     expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(2);
     const doc = jsonDoc(g);
     expect(doc).toMatchObject({ status: 'pending', reason: 'tailscale_login_manual' });
-    expect(doc.message).toBe(`tailscale at ${local} is not a system install, so gbrain will not run it with sudo. Sign in yourself: \`sudo tailscale set --operator=$USER && sudo tailscale up\`, then re-run: gbrain mcp expose --yes`);
+    // the manual command names the discovered binary (it is outside sudo's secure_path, so a bare `sudo tailscale` would not find it) and says the operator is choosing to trust it
+    expect(doc.message).toBe(`tailscale at ${local} is not a system install, so gbrain will not run it with sudo. If you trust that binary, sign in yourself (this runs it as root): \`sudo ${local} set --operator=$USER && sudo ${local} up\`, then re-run: gbrain mcp expose --yes`);
     expect(checkOf(doc, 'tailscale.binary')?.detail).toBe(local);
     expect(checkOf(doc, 'tailscale.login')).toMatchObject({ status: 'pending' });
     expect(checkOf(doc, 'tailscale.login')?.detail).toContain('not a system install');
-    expect(doc.next_actions).toEqual(['sudo tailscale set --operator=$USER && sudo tailscale up', 'gbrain mcp expose --yes']);
+    expect(doc.next_actions).toEqual([`sudo ${local} set --operator=$USER && sudo ${local} up`, 'gbrain mcp expose --yes']);
     expect(joinedCalls(g).some(c => c.startsWith('sudo'))).toBe(false);
     expect(joinedCalls(g).some(c => c.includes(' up') || c.includes('--bg'))).toBe(false);
     expect(existsSync(g.serveDir)).toBe(false);
@@ -2479,4 +2527,70 @@ describe('scoped off + honest recovery (adversarial-review batch)', () => {
     expect(await runMcpExpose(['--status', '--json'], h.deps)).toBe(1);
     expect(jsonDoc(h)).toMatchObject({ status: 'pending', reason: 'tailnet_health_pending' });
   });
+
+  test('tailnet verify under Bun: fetch rejects an unresolvable name EXACTLY like a refused connection, so the resolver decides — lookup ENOTFOUND is the warn (exit 0, publish and --status), a resolving lookup keeps pending, only classified codes count', async () => {
+    // Bun 1.x: both an unresolvable host and a refused connection reject with this message / code, so no message match can tell them apart.
+    const bunReject = () => Object.assign(new Error('Unable to connect. Is the computer able to access the url?'), { code: 'ConnectionRefused' });
+    // (a) lookup says ENOTFOUND → this host cannot resolve the name → warn, exit 0
+    const f = fakeTailnet();
+    const inner = f.deps.fetch!;
+    const looked: string[] = [];
+    f.deps.fetch = async (url, init) => (url.startsWith('https://') ? Promise.reject(bunReject()) : inner(url, init));
+    f.deps.lookup = async (host) => { looked.push(host); throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND', syscall: 'getaddrinfo' }); };
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
+    const doc = jsonDoc(f);
+    expect(doc.status).toBe('exposed');
+    expect(doc.reason).toBeUndefined();
+    expect(checkOf(doc, 'verify.tailnet')).toMatchObject({ status: 'warn' });
+    expect(checkOf(doc, 'verify.tailnet')?.detail).toBe(`https://${DNS}/health: this host cannot resolve ${DNS} (MagicDNS may be off here: \`tailscale set --accept-dns=true\`); devices that do resolve it may already reach the server`);
+    // only the tailnet name reaches the resolver — the loopback probes (IP literal) never do
+    expect(looked.length).toBeGreaterThan(0);
+    expect([...new Set(looked)]).toEqual([DNS]);
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], f.deps)).toBe(0);
+    const sdoc = jsonDoc(f);
+    expect(sdoc.status).toBe('exposed');
+    expect(checkOf(sdoc, 'verify.tailnet')).toMatchObject({ status: 'warn' });
+    expect(checkOf(sdoc, 'verify.tailnet')?.detail).toContain(`this host cannot resolve ${DNS}`);
+    // (b) the same fetch failure while the name DOES resolve is a real "not reachable yet": pending (exit 2 on publish, 1 on --status)
+    const g = fakeTailnet();
+    const ginner = g.deps.fetch!;
+    g.deps.fetch = async (url, init) => (url.startsWith('https://') ? Promise.reject(bunReject()) : ginner(url, init));
+    g.deps.lookup = async () => {};
+    expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(2);
+    const gdoc = jsonDoc(g);
+    expect(gdoc).toMatchObject({ status: 'pending', reason: 'tailnet_health_pending' });
+    expect(checkOf(gdoc, 'verify.tailnet')).toMatchObject({ status: 'pending' });
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(1);
+    expect(jsonDoc(g)).toMatchObject({ status: 'pending', reason: 'tailnet_health_pending' });
+    // a resolver error that is NOT a resolution failure (a SERVFAIL, a cancelled query) proves nothing → still pending
+    const k = fakeTailnet();
+    const kinner = k.deps.fetch!;
+    k.deps.fetch = async (url, init) => (url.startsWith('https://') ? Promise.reject(bunReject()) : kinner(url, init));
+    k.deps.lookup = async () => { throw Object.assign(new Error('queryA ESERVFAIL'), { code: 'ESERVFAIL' }); };
+    expect(await runMcpExpose(['--yes', '--json'], k.deps)).toBe(2);
+    expect(jsonDoc(k)).toMatchObject({ status: 'pending', reason: 'tailnet_health_pending' });
+    // the classifier: the resolver's code first, its message tokens second
+    for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'EAI_NONAME', 'EAI_NODATA', 'DNS_ENOTFOUND']) expect(isUnresolvedLookupError(Object.assign(new Error('x'), { code }))).toBe(true);
+    expect(isUnresolvedLookupError(new Error('getaddrinfo EAI_AGAIN your-machine.your-tailnet.ts.net'))).toBe(true);
+    expect(isUnresolvedLookupError(Object.assign(new Error('queryA ESERVFAIL'), { code: 'ESERVFAIL' }))).toBe(false);
+    expect(isUnresolvedLookupError(new Error('Unable to connect. Is the computer able to access the url?'))).toBe(false);
+  });
+
+  test('the real default resolver: a .invalid name never resolves (RFC 6761; a resolver outage classifies as unresolved too), so Bun\'s refused-looking rejection is reported as unresolved', async () => {
+    const url = 'https://gbrain-unresolvable-test.invalid/health';
+    const outcome = await tryFetch({
+      fetch: async () => { throw Object.assign(new Error('Unable to connect. Is the computer able to access the url?'), { code: 'ConnectionRefused' }); },
+      tcpProbe: async () => false,
+      lookup: defaultLookup,
+      now: () => new Date(), sleep: async () => {}, healthIntervalMs: 1,
+    }, url, 10_000);
+    expect(outcome).toEqual({ res: null, unresolved: true });
+    // and the same rejection for an IP literal / localhost never consults the resolver (no unresolved verdict)
+    const probeDeps = { fetch: async () => { throw new Error('Unable to connect. Is the computer able to access the url?'); }, tcpProbe: async () => false, lookup: async () => { throw new Error('must not be consulted for an IP literal or localhost'); }, now: () => new Date(), sleep: async () => {}, healthIntervalMs: 1 };
+    expect(await tryFetch(probeDeps, 'http://127.0.0.1:3131/health', 1_000)).toEqual({ res: null, unresolved: false });
+    expect(await tryFetch(probeDeps, 'http://[::1]:3131/health', 1_000)).toEqual({ res: null, unresolved: false });
+    expect(await tryFetch(probeDeps, 'http://localhost:3131/health', 1_000)).toEqual({ res: null, unresolved: false });
+  }, 15_000);
 });

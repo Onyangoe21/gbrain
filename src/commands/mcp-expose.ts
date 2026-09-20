@@ -10,12 +10,12 @@
  * Exit codes: 0 done · 1 failed · 2 needs confirmation (`--yes`) or a step is
  * pending (Tailscale login not completed, tailnet health still pending).
  *
- * Every side effect (exec, fetch, prompt, clock, paths) is injectable through
- * `McpExposeDeps` so the command is testable against a fake runner in a
- * tmpdir. Never mutate process.env here — read it through `deps.env`.
+ * Every side effect (exec, fetch, resolver, prompt, clock, paths) is
+ * injectable through `McpExposeDeps` so the command is testable against a
+ * fake runner in a tmpdir. Never mutate process.env here — read it through
+ * `deps.env`. The health / occupancy probes live in `mcp-expose-probe.ts`.
  */
 import { existsSync, unlinkSync } from 'node:fs';
-import { createConnection } from 'node:net';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { promptLineStderr } from '../core/cli-util.ts';
@@ -26,11 +26,17 @@ import { probeLivePgliteHolder } from '../core/bootstrap/uninstall.ts';
 import {
   classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, isSystemTailscaleBinary,
   parseServeStatusStrict, parseTailscaleStatus, publicUrlFromDnsName, tailscaleDaemonStartHint, tailscaleInstallPlan,
-  tailscaleLoginArgv, tailscaleManualLoginCommand, tailscaleServeArgv, tailscaleServeOffArgv, tailscaleSetOperatorCommand, TAILSCALE_ACCEPT_DNS_COMMAND,
+  tailscaleLoginArgv, tailscaleManualLoginCommand, tailscaleServeArgv, tailscaleServeOffArgv, tailscaleSetOperatorCommand,
   TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL, TAILSCALE_FUNNEL_KB_URL,
   TAILSCALE_SERVE_STATUS_ARGV, TAILSCALE_STATUS_ARGV,
   type CommandResult, type CommandRunner, type ServeHandler, type ServeStatusView, type TailscaleStatus,
 } from '../core/tailscale.ts';
+import {
+  defaultLookup, defaultTcpProbe, pollHealth, probeHealth, probeOccupied, tryFetch, unresolvedDetail,
+  type FetchOutcome, type HostLookup, type ProbeFetch, type TcpProbe,
+} from './mcp-expose-probe.ts';
+// The probes were peeled into `mcp-expose-probe.ts`; the default TCP probe keeps its import site here.
+export { defaultTcpProbe };
 import {
   adminTokenPath as adminTokenPathFor, detectServiceTarget, ensureAdminToken, installServeService, launchdBootoutFailed, launchdPlistPath,
   readExposeReceipt, receiptPath as receiptPathFor, renderServeWrapper, resolveServeGbrainCommand, serveCommandArgv,
@@ -104,8 +110,6 @@ const APP_DAEMON_POLL_ATTEMPTS = 20;
 const APP_DAEMON_POLL_INTERVAL_MS = 1_000;
 const SURFACES = ['verbs', 'starter', 'full'] as const;
 type Surface = (typeof SURFACES)[number];
-/** A fetch rejection that means THIS host cannot resolve the name (MagicDNS off here), not that the server is down. */
-const NAME_RESOLUTION_RE = /ENOTFOUND|getaddrinfo|EAI_AGAIN|failed to resolve|Unable to connect.*resolve/i;
 
 // ---------------------------------------------------------------------------
 // Deps
@@ -127,9 +131,15 @@ export interface McpExposeDeps {
   run?: CommandRunner;
   which?: (name: string) => string | null;
   fileExists?: (path: string) => boolean;
-  fetch?: (url: string, init?: { signal?: AbortSignal; redirect?: 'manual' | 'error' | 'follow' }) => Promise<{ ok: boolean; status: number }>;
+  fetch?: ProbeFetch;
   /** Bounded TCP connect to `host:port` (true on connect, false on refusal / timeout); default `node:net`. Tests inject a fake. */
-  tcpProbe?: (host: string, port: number, timeoutMs: number) => Promise<boolean>;
+  tcpProbe?: TcpProbe;
+  /**
+   * Resolver consulted after a tailnet `/health` fetch REJECTS (Bun's fetch
+   * reports an unresolvable name and a refused connection identically);
+   * default `dns.promises.lookup`. Tests inject a fake — never the real one.
+   */
+  lookup?: HostLookup;
   isTTY?: boolean;
   prompt?: (question: string) => Promise<string | null>;
   stdout?: (line: string) => void;
@@ -169,8 +179,9 @@ interface Resolved {
   run: CommandRunner;
   which: (name: string) => string | null;
   fileExists: (path: string) => boolean;
-  fetch: NonNullable<McpExposeDeps['fetch']>;
-  tcpProbe: NonNullable<McpExposeDeps['tcpProbe']>;
+  fetch: ProbeFetch;
+  tcpProbe: TcpProbe;
+  lookup: HostLookup;
   isTTY: boolean;
   prompt: (question: string) => Promise<string | null>;
   out: (line: string) => void;
@@ -187,18 +198,6 @@ interface Resolved {
   healthIntervalMs: number;
   loginTimeoutMs: number;
   pgliteHolder: PgliteHolderProbe;
-}
-
-/** Default `tcpProbe`: one connect attempt, the socket destroyed on every outcome. Any listener — HTTP or not — accepts the connect. */
-export function defaultTcpProbe(host: string, port: number, timeoutMs: number): Promise<boolean> {
-  return new Promise(resolve => {
-    let settled = false;
-    const sock = createConnection({ host, port });
-    const done = (v: boolean) => { if (settled) return; settled = true; sock.destroy(); resolve(v); };
-    sock.setTimeout(Math.max(1, timeoutMs), () => done(false));
-    sock.once('connect', () => done(true));
-    sock.once('error', () => done(false));
-  });
 }
 
 function resolveDeps(deps: McpExposeDeps): Resolved {
@@ -221,6 +220,7 @@ function resolveDeps(deps: McpExposeDeps): Resolved {
     fileExists: deps.fileExists ?? existsSync,
     fetch: deps.fetch ?? ((url, init) => fetch(url, init as RequestInit)),
     tcpProbe: deps.tcpProbe ?? defaultTcpProbe,
+    lookup: deps.lookup ?? defaultLookup,
     isTTY: deps.isTTY ?? (process.stdin.isTTY === true && process.stderr.isTTY === true),
     prompt: deps.prompt ?? ((q: string) => promptLineStderr(q)),
     out: deps.stdout ?? ((line: string) => { process.stdout.write(`${line}\n`); }),
@@ -329,73 +329,6 @@ function engineKind(cfg: GBrainConfig | null): ExposeReceipt['engine'] {
   if (cfg.database_url || cfg.engine === 'postgres') return 'postgres';
   if (cfg.engine === 'pglite') return 'pglite';
   return 'unknown';
-}
-
-interface FetchOutcome {
-  /** The response (whatever its status), or null when the fetch rejected (connection refused / timeout / unresolved name). */
-  res: { ok: boolean } | null;
-  /** The rejection was a name-resolution failure: this host cannot resolve the name, which says nothing about the server. */
-  unresolved: boolean;
-}
-
-/** One bounded fetch, never throws. */
-async function tryFetch(d: Resolved, url: string, timeoutMs: number): Promise<FetchOutcome> {
-  try {
-    return { res: await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' }), unresolved: false };
-  } catch (error) {
-    return { res: null, unresolved: NAME_RESOLUTION_RE.test(error instanceof Error ? error.message : String(error)) };
-  }
-}
-
-/** Health: the fetch resolved AND answered 2xx (`res.ok`). Used by `verify.*` and `--status`. */
-async function probeHealth(d: Resolved, url: string, timeoutMs = 1_500): Promise<boolean> {
-  return (await tryFetch(d, url, timeoutMs)).res?.ok === true;
-}
-
-/**
- * Occupancy: does ANYTHING listen on the port? True when a TCP connect to
- * `127.0.0.1:<port>` is accepted OR the fetch resolves with any status (2xx,
- * 404, 500 …); false only when both are refused / time out. A foreign server
- * that 404s `/health`, or one that does not speak HTTP at all, still owns the
- * port, so the foreign-listener guard and the `--no-service` "does something
- * listen" logic use this, never `probeHealth`.
- */
-async function probeOccupied(d: Resolved, port: number, url: string, timeoutMs = 1_500): Promise<boolean> {
-  const [tcp, http] = await Promise.all([
-    d.tcpProbe('127.0.0.1', port, timeoutMs).catch(() => false),
-    tryFetch(d, url, timeoutMs),
-  ]);
-  return tcp || http.res !== null;
-}
-
-/**
- * Poll until `budgetMs` of wall-clock time (from `d.now()`) has elapsed; each
- * probe's timeout is sized to `min(1500, remaining)` so the last attempt never
- * overruns the budget. Always probes at least once. The attempt cap is a
- * backstop for a clock that does not advance (tests inject a frozen `now`).
- * `unresolved` carries the LAST probe's name-resolution verdict so the caller
- * can tell "this host cannot resolve the name" from "still pending".
- */
-async function pollHealth(d: Resolved, url: string, budgetMs: number): Promise<{ ok: boolean; unresolved: boolean }> {
-  const deadline = d.now().getTime() + Math.max(0, budgetMs);
-  const maxAttempts = Math.max(1, Math.ceil(budgetMs / Math.max(1, d.healthIntervalMs)));
-  let unresolved = false;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const remaining = deadline - d.now().getTime();
-    if (attempt > 0 && remaining <= 0) break;
-    const probe = await tryFetch(d, url, Math.max(1, Math.min(1_500, remaining)));
-    if (probe.res?.ok === true) return { ok: true, unresolved: false };
-    unresolved = probe.unresolved;
-    const left = deadline - d.now().getTime();
-    if (left <= 0) break;
-    await d.sleep(Math.min(d.healthIntervalMs, left));
-  }
-  return { ok: false, unresolved };
-}
-
-/** `verify.tailnet` / `--status` detail when this host cannot resolve the MagicDNS name — a warn, never `pending`. */
-function unresolvedDetail(dnsName: string): string {
-  return `this host cannot resolve ${dnsName} (MagicDNS may be off here: \`${TAILSCALE_ACCEPT_DNS_COMMAND}\`); devices that do resolve it may already reach the server`;
 }
 
 interface ServeRead {
@@ -776,10 +709,10 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
         // Linux login runs `sudo <binary> …`: never hand root to a binary
         // outside the system install locations (a user-writable PATH entry).
         const rerun = rerunCommand(opts);
-        const manual = tailscaleManualLoginCommand();
-        s.check('tailscale.login', 'pending', `${st.status.backendState}; ${binary} is not a system install, so gbrain will not run it with sudo — sign in yourself`);
+        const manual = tailscaleManualLoginCommand(binary);
+        s.check('tailscale.login', 'pending', `${st.status.backendState}; ${binary} is not a system install, so gbrain will not run it with sudo — sign in yourself if you trust that binary`);
         s.nextActions.push(manual, rerun);
-        return s.finish('pending', 2, { reason: 'tailscale_login_manual', message: `tailscale at ${binary} is not a system install, so gbrain will not run it with sudo. Sign in yourself: \`${manual}\`, then re-run: ${rerun}` });
+        return s.finish('pending', 2, { reason: 'tailscale_login_manual', message: `tailscale at ${binary} is not a system install, so gbrain will not run it with sudo. If you trust that binary, sign in yourself (this runs it as root): \`${manual}\`, then re-run: ${rerun}` });
       }
       if (login.setOperator) {
         // Set the operator FIRST (so `serve` works without sudo later); a
@@ -1446,8 +1379,8 @@ async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOpti
   }
   const plan = [
     serviceFound ? `Service   stop + remove ${serviceKindLabel(target)}${serviceState ? ` (${serviceState})` : ''}` : 'Service   none found',
-    handlerOff ? `Tailscale turn off the :443 handler proxying ${handlerOff.proxy}${handlerOff.funnel ? ' (funnel first)' : ''}${evidence ? '' : ' (--force: no wrapper, unit or service corroborates it)'} — Tailscale stays installed and signed in` : serveUnreadable ? `Tailscale could not read serve status; a handler for port ${opts.port} is left as is` : `Tailscale no :443 handler proxies to port ${opts.port}`,
-    wrapperExists ? `Files     delete ${tildify(wrapper, d.home)}` : 'Files     no wrapper found',
+    handlerOff ? `Tailscale turn off the :443 handler proxying ${handlerOff.proxy}${handlerOff.funnel ? ' (funnel first)' : ''}${evidence ? '' : ' (--force: no wrapper, unit or service corroborates it)'} — Tailscale stays installed and signed in` : serveUnreadable ? `Tailscale could not read serve status; a handler for port ${opts.port} cannot be checked — stops after the service step (exit 1)` : `Tailscale no :443 handler proxies to port ${opts.port}`,
+    wrapperExists ? (serveUnreadable ? `Files     keep ${tildify(wrapper, d.home)} (the corroboration a re-run needs while serve status cannot be read)` : `Files     delete ${tildify(wrapper, d.home)}`) : 'Files     no wrapper found',
     `Token     leave ${tildify(adminTokenPathFor(d.serveDir), d.home)} (no receipt names it)`,
   ];
   s.check('receipt', 'warn', `no expose receipt — recovering from what is on disk (port ${opts.port})`);
@@ -1474,8 +1407,17 @@ async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOpti
     }
     left.push('Tailscale itself (installed and signed in)');
   } else if (serveUnreadable) {
-    s.check('tailscale.publish', 'warn', `${describeServeReadFailure(d, serveUnreadable).detail}; handler left as is`);
-    left.push(`any tailscale serve handler for port ${opts.port} (serve status could not be read)`);
+    // Fail closed, as with a receipt: the handler cannot be checked, so the
+    // wrapper stays as the corroboration the re-run needs (the service, when
+    // found, is already gone) and the exit says the job is not finished.
+    const kept = wrapperExists ? 'the wrapper' : 'nothing (no wrapper was found)';
+    const unreadableRerun = recoveryCommand(opts.port, opts.force || !wrapperExists);
+    s.check('tailscale.publish', 'fail', `${describeServeReadFailure(d, serveUnreadable).detail}; handler state unknown`);
+    s.check('files', 'skipped', `kept: ${kept} — the :443 handler for port ${opts.port} could not be checked; re-run --remove once tailscale serve status can be read`);
+    s.nextActions.push('tailscale serve status --json', unreadableRerun);
+    s.say('');
+    s.say(`Stopped here: ${serviceNote}, but \`tailscale serve status\` could not be read, so the handler state for port ${opts.port} is unknown. Left in place: ${kept}. Fix Tailscale, then re-run \`${unreadableRerun}\`.`);
+    return s.finish('error', 1, { receipt: null, reason: 'tailscale_serve_status_unreadable', message: 'could not read tailscale serve status; handler state unknown' });
   } else {
     s.check('tailscale.publish', 'ok', binary ? `no :443 handler proxies to port ${opts.port}; nothing to turn off` : 'tailscale binary not found; nothing to turn off');
   }

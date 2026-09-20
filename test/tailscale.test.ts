@@ -132,6 +132,9 @@ describe('argv builders', () => {
     expect(tailscaleLoginArgv('linux', 'alice-example').up).toEqual(['sudo', 'tailscale', 'up']);
     // the copy-pasteable operator forms (owned here so the flag-registry scan of mcp-expose.ts never sees tailscale's flags)
     expect(tailscaleManualLoginCommand()).toBe('sudo tailscale set --operator=$USER && sudo tailscale up');
+    // the manual login names the DISCOVERED binary (a ~/.local/bin install is outside sudo's secure_path, so a bare `sudo tailscale` would not find it), shell-quoted when needed
+    expect(tailscaleManualLoginCommand('/home/alice-example/.local/bin/tailscale')).toBe('sudo /home/alice-example/.local/bin/tailscale set --operator=$USER && sudo /home/alice-example/.local/bin/tailscale up');
+    expect(tailscaleManualLoginCommand('/Users/alice example/bin/tailscale')).toBe("sudo '/Users/alice example/bin/tailscale' set --operator=$USER && sudo '/Users/alice example/bin/tailscale' up");
     expect(TAILSCALE_ACCEPT_DNS_COMMAND).toBe('tailscale set --accept-dns=true');
   });
   test('CommandRunOptions carries the --json stdout redirect flag', () => {

@@ -148,20 +148,28 @@ Relay every prompt the command surfaces:
 | `tailscale_https_not_enabled` — pre-check, exit 2, nothing published (`CertDomains` empty) | Enable MagicDNS + HTTPS Certificates at `https://login.tailscale.com/admin/dns`, then re-run the printed command. The same reason with exit 1 means the `tailscale serve` call itself refused for the same cause — same fix |
 | `tailscale_funnel_not_enabled` — pre-check, exit 2, nothing published (the node lacks the Funnel capability) | Enable the `funnel` node attribute in the tailnet policy (`https://login.tailscale.com/admin/acls`; see `https://tailscale.com/kb/1223/funnel`), then re-run. Exit 1 with this reason is the post-`funnel` classified form — same fix |
 | `tailscale_needs_operator` | Run `sudo tailscale set --operator=$USER`, then re-run |
+| `tailscale_unknown` (exit 1) — `tailscale serve --bg` did not finish within 60s | The CLI is waiting on the operator (an enablement step the pre-checks could not see). Have them run the printed `tailscale serve --bg <port>` by hand to see its prompt, then re-run |
 | `tailscale_needs_login` | Linux: `sudo tailscale set --operator=$USER` then `sudo tailscale up`; macOS: `tailscale up` or open the Tailscale app and sign in; then re-run |
-| `tailscale_login_manual` (exit 2) — "tailscale at <path> is not a system install, so gbrain will not run it with sudo" | The `tailscale` on `PATH` is user-writable (e.g. `~/.local/bin`); gbrain never runs it as root. Have the user run `sudo tailscale set --operator=$USER && sudo tailscale up` themselves, then re-run the printed command |
+| `tailscale_login_manual` (exit 2) — "tailscale at <path> is not a system install, so gbrain will not run it with sudo" | The `tailscale` on `PATH` is user-writable (e.g. `~/.local/bin`); gbrain never runs it as root. The printed command names that path — `sudo <path> set --operator=$USER && sudo <path> up` (a bare `sudo tailscale` would not find a binary outside sudo's `secure_path`). Running it is the operator choosing to trust that binary: say so, let them run it themselves, then re-run the printed command |
 | `tailscale_receipt_present` (exit 1, `plan` fails) — "This brain is already published on your tailnet at <url>" | `--no-tailscale` was passed while a live Serve/Funnel mapping is on record. Run `gbrain mcp expose --remove --yes` first, or drop `--no-tailscale` |
 | `tailscale_daemon_not_running` (exit 2) | macOS `open -a Tailscale`; Linux `sudo systemctl enable --now tailscaled`; then re-run |
 | `foreign_serve_config` — "tailscale serve already proxies :443 to …" (exit 1) | Show the user what the existing handler proxies (`tailscale serve status`); only `--force` on their explicit yes. A handler owned by another terminal's foreground `tailscale serve` session cannot be taken over — it must be stopped in that terminal |
 | `foreign_listener` — "Something already answers on 127.0.0.1:<port> and no expose receipt claims it" (exit 1, refused BEFORE anything is published; ANY listener counts — an accepted TCP connect from a non-HTTP service as much as a 404) | Stop the other process, pick another `--port`, or pass `--no-service` to publish it as-is. If it is a gbrain server left by an interrupted run, `gbrain mcp expose --remove --yes` first (receipt-less recovery) |
 | `no_brain_config` (exit 1, `plan` fails) — "No brain is configured on this host (gbrain init first), so a service would only crash-loop" | Run `gbrain init` on this host first, then re-run; or pass `--no-service` to only publish a server the operator starts themselves. Never install the service around a missing brain |
 | `pglite_lock` warn — "a live process holds this PGLite brain (pid N, …)" | Tell the user which process holds the lock; the service cannot start until it exits. Stop it (or route to [postgres-adopt](../postgres-adopt/SKILL.md) for concurrent use), then `gbrain mcp expose --status` |
-| "could not read tailscale serve status" — `tailscale.publish` fails (publish: exit 1 `tailscale_<kind>`, nothing published; `--status`: exit 1; `--remove`: exit 1 `tailscale_serve_status_unreadable`, receipt + wrapper kept) | The command fails closed instead of guessing. Run `tailscale serve status --json`, apply the classified fix (operator / daemon / login), then re-run the same command |
+| "could not read tailscale serve status" — `tailscale.publish` fails (publish: exit 1 `tailscale_<kind>`, nothing published; `--status`: exit 1; `--remove`: exit 1 `tailscale_serve_status_unreadable` — with a receipt, receipt + wrapper kept; without one, the service is still removed but the wrapper is kept as the corroboration the re-run needs) | The command fails closed instead of guessing. Run `tailscale serve status --json`, apply the classified fix (operator / daemon / login), then re-run the same command |
 | `handler_not_removed` (`--remove`, exit 1) — "the tailscale handler for port <port> is still present" / "could not be confirmed gone" | The `off` ran but gbrain's handler survived (or the re-read failed). The service is already gone; the receipt and wrapper were kept on purpose. Run `tailscale serve status`, fix what it reports, then `gbrain mcp expose --remove --yes` again — never `serve reset` |
 | `verify.tailnet: warn` — "this host cannot resolve <name>" (exit 0) | MagicDNS is off on the brain host itself; `tailscale set --accept-dns=true`, then `gbrain mcp expose --status`. Other devices may already reach the server; do not treat it as a certificate wait |
 | `service: manual` (no supervisor: cloud sandbox, container) | Relay the printed foreground and `nohup … &` commands; this is a documented outcome, not a failure |
-| `verify.local: warn` (exit 2, `local_health_timeout`) | The service was installed but `/health` did not answer within the wait; check `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status` |
-| `verify.tailnet: pending` (exit 2, `tailnet_health_pending`) | First certificate issuance can take a minute; `gbrain mcp expose --status` later |
+| `verify.local: warn` (exit 2, `local_health_timeout`) | The handler is published, the service installed and the receipt written — this exit 2 is NOT "nothing published"; `--status` / `--remove` find them. `/health` did not answer within the wait: check `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status` |
+| `verify.tailnet: pending` (exit 2, `tailnet_health_pending`; `--status` reports it with exit 1) | Same: handler, service and receipt are already in place. First certificate issuance can take a minute; `gbrain mcp expose --status` later |
+| `confirmation_required` (exit 2) | Non-TTY run without `--yes`. Nothing changed; show the printed plan, get the operator's yes, then re-run with `--yes` |
+| `tailscale_no_dns_name` (exit 1) — the node has no MagicDNS name | Enable MagicDNS + HTTPS Certificates at `https://login.tailscale.com/admin/dns`, then re-run; nothing was published |
+| `tailscale_missing` (exit 1, `--no-install`) / `tailscale_unsupported_platform` / `tailscale_install_failed` (exit 1) | Tailscale is not installed and was not (or could not be) installed. Relay the printed install command or `https://tailscale.com/download`, have the user sign in, then re-run |
+| `tailscale_publish_unconfirmed` (exit 1) — `serve --bg` exited 0 but the re-read shows no handler (or could not be read) | Run `tailscale serve status`; `gbrain mcp expose --remove --yes` clears a handler for the port without a receipt (`--force` when no wrapper or service of gbrain's exists yet), then re-run |
+| `service_install_failed` (exit 1) | The handler IS published and the receipt written with `service.state: stopped`. Read the error and `~/.gbrain/serve/serve.err`, fix, re-run; or `gbrain mcp expose --remove --yes` |
+| `status_unhealthy` (`--status`, exit 1) | A named check failed (`tailscale.publish`, `service`, `verify.local`); apply that row, then `gbrain mcp expose --yes` repairs |
+| `recovered_without_receipt` (`--remove`, exit 0) | The receipt-less recovery finished: report what was removed and what was left (the admin token stays) |
 
 Never work around a classified error by editing Tailscale state by hand;
 apply the printed fix and re-run.
@@ -232,7 +240,10 @@ for `--port`, default 3131, leaving the token; the handler is turned off only
 when the wrapper, unit or service corroborates it — a handler standing alone
 is reported and left until `--force`). A handler that survives the `off` is
 never reported as removed: exit 1 `handler_not_removed`, receipt + wrapper
-kept for the re-run. Declining the prompt exits 2 with "Nothing changed."; a
+kept for the re-run. An unreadable `tailscale serve status` stops both paths
+with exit 1 `tailscale_serve_status_unreadable` (the service is already
+removed; receipt and/or wrapper kept) — fix Tailscale, re-run the printed
+command. Declining the prompt exits 2 with "Nothing changed."; a
 `--no-service` re-run keeps an existing service.
 
 ## PGLite single-writer note
