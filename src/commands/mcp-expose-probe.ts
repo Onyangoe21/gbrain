@@ -101,10 +101,15 @@ async function nameUnresolved(d: ProbeDeps, url: string, error: unknown, timeout
 
 /** One bounded fetch, never throws. */
 export async function tryFetch(d: ProbeDeps, url: string, timeoutMs: number): Promise<FetchOutcome> {
+  // The resolver check after a rejection spends only what the fetch left of
+  // the same budget, so one attempt never exceeds `timeoutMs` even when a
+  // timed-out fetch is followed by a stalled resolver.
+  const started = Date.now();
   try {
     return { res: await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' }), unresolved: false };
   } catch (error) {
-    return { res: null, unresolved: await nameUnresolved(d, url, error, timeoutMs) };
+    const remaining = Math.max(1, timeoutMs - (Date.now() - started));
+    return { res: null, unresolved: await nameUnresolved(d, url, error, remaining) };
   }
 }
 
