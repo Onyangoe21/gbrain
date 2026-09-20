@@ -2,7 +2,7 @@
 
 Read this file, then follow the path appropriate to the user’s request. Default to adding keyless memory to their existing agent, preserving identity and unrelated configuration. API keys, enrichment, automatic capture, and a new personal-agent identity are separate choices.
 
-> **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide and `scripts/setup-in-agent.sh`; its receipt tracks repair and native enablement. For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, provision on the host and install the private handoff inside the harness. This guide covers a local brain for other existing agents.
+> **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide and `scripts/setup-in-agent.sh`; its receipt tracks repair and native enablement. For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, choose the harness's native OAuth/PKCE flow or a private machine handoff. Owner login, client management, permissions, and revocation use the separate [MCP administration](docs/mcp/ADMIN.md) path. This guide covers a local brain for other existing agents.
 >
 > **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory. Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
 >

@@ -5,7 +5,7 @@
 ## Choose your setup
 
 1. **Add GBrain to my existing agent — recommended.** Keep your agent's identity and save memory inside its environment. No new personal-agent identity or private repository is required. Start with the guide for **[Grok Bot](docs/guides/grok-bot.md)**, **[Muse](docs/guides/muse.md)**, or **[Codex / Claude Code](docs/tutorials/connect-coding-agent.md)**. [Other harnesses](#connect-gbrain-to-your-ai-client-mcp).
-2. **Connect my existing hosted brain.** Grant access on the brain host, then install the private connection inside the intended harness. Follow **[hosted harness access](docs/guides/hosted-harness-access.md)**. The default profile can read and write memory; delegation is an explicit choice.
+2. **Connect my existing hosted brain.** Follow **[hosted harness access](docs/guides/hosted-harness-access.md)** to choose native OAuth or a private machine connection. For dashboard login, clients, and permissions, use **[MCP administration](docs/mcp/ADMIN.md)** with the server's separate owner credential.
 
 Grok **Bot** and Grok **Build** are different products. Muse's personal agent and **Muse Code** are different products too. Muse already has native editable memory; GBrain adds an explicit, portable record with provenance and shared access. See each guide's dated evidence and remaining verification steps.
 
@@ -194,7 +194,7 @@ Postgres-at-scale, Supabase, and thin-client setup paths live in [`docs/INSTALL.
 
 ### Connect GBrain to your AI client (MCP)
 
-For a hosted brain, start with the [private handoff and profile guide](docs/guides/hosted-harness-access.md). A **profile** controls authority; a **surface** controls which granted tools are visible. New memory profiles use the starter surface. `--surface verbs` retains exactly the seven memory verbs, with orientation available through `gbrain://capabilities`. Thin CLI connections use the full surface and remain restricted by their grants.
+For a hosted brain, start with the [native OAuth and private machine connection guide](docs/guides/hosted-harness-access.md). To open the dashboard, register clients, edit access, or invalidate tokens, use [MCP administration](docs/mcp/ADMIN.md). A **profile** controls MCP authority; a **surface** controls which granted tools are visible. Neither grants owner dashboard access. New memory profiles use the starter surface. `--surface verbs` retains exactly the seven memory verbs, with orientation available through `gbrain://capabilities`. Thin CLI connections use the full surface and remain restricted by their grants.
 
 The existing connection commands below remain supported. Choose the instructions for your actual product:
 
@@ -216,8 +216,8 @@ commands, embedding costs, and the restrictions that remain after rebuilding.
 - **[OpenClaw](docs/mcp/OPENCLAW.md)** — the ClawHub bundle plugin registers gbrain automatically (`openclaw.plugin.json` ships in this repo), or register the stdio server with `openclaw mcp add gbrain --command "$(command -v gbrain)" --arg serve --env GBRAIN_HOME=$HOME` (absolute path: the launchd gateway PATH lacks `~/.bun/bin`); verify with `openclaw mcp list`.
 - **[Claude Desktop (Cowork)](docs/mcp/CLAUDE_DESKTOP.md)** — Settings → Integrations → add the URL of your HTTP server. Remote only; the local `claude_desktop_config.json` does not work for remote servers.
 - **[Claude Cowork (team plan)](docs/mcp/CLAUDE_COWORK.md)** — org Owner adds the connector under Organization Settings → Connectors.
-- **[Perplexity Computer](docs/mcp/PERPLEXITY.md)** — `gbrain connect https://your-host/mcp --agent perplexity --oauth --register` mints a least-privilege OAuth client and prints the Issuer/Client ID/Secret to paste into Settings → Connectors (OAuth is the right path for a cloud connector; a bearer token also works for local use). Pro subscription required.
-- **[ChatGPT](docs/mcp/CHATGPT.md)** — uses OAuth 2.1 with PKCE (the hard requirement). Register a `chatgpt` client from the admin dashboard with grant type `authorization_code`.
+- **[Perplexity Computer](docs/mcp/PERPLEXITY.md)** — choose native OAuth or a managed bearer connection according to the actual connector settings. The owner registers the matching client and delivers any confidential credentials privately.
+- **[ChatGPT](docs/mcp/CHATGPT.md)** — native OAuth with PKCE. Register the exact callback and token authentication method shown in its MCP settings, then start the connection in ChatGPT and complete owner consent.
 
 For the HTTP server itself:
 
@@ -227,7 +227,7 @@ gbrain serve --http       # HTTP MCP with OAuth 2.1 + admin dashboard at /admin
                           # (required for Claude Desktop, Cowork, Perplexity, ChatGPT)
 ```
 
-The HTTP server includes optional dynamic client registration, scope-gated access (`read` / `write` / `admin` / `agent`), owner-approved OAuth authorization, and rate limiting. Dynamic registration cannot grant delegation; `admin` does not imply `agent`. Deployment guides (ngrok, Railway, Fly.io) live under [`docs/mcp/`](docs/mcp/).
+The HTTP server includes optional dynamic client registration, scope-gated access (`read` / `write` / `admin` / `agent`), owner-approved OAuth authorization, and rate limiting. Dynamic registration cannot grant delegation; `admin` implies neither `agent` nor owner administration. Start with the [MCP task guide](docs/mcp/README.md) for deployment, client setup, and administration.
 
 Running several brains behind one tool catalog? Give each one an identity: `gbrain config set mcp.instructions "Team wiki brain — route product and roadmap questions here"` rides every transport's initialize response under a `Deployment identity:` banner, so a connected agent can tell your brains apart. Restart `gbrain serve` to pick it up; `GBRAIN_MCP_INSTRUCTIONS` in the serve process's environment overrides it for that process, and `gbrain config unset mcp.instructions` returns to the bare contract. **Say to your agent:** *"Tell connected agents which brain this is"* — your agent runs `gbrain config set mcp.instructions "<identity>"`.
 
@@ -674,7 +674,8 @@ completes in seconds on an 80K-page PGLite brain.
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
 - [`docs/guides/`](docs/guides/) — how-to runbooks (google connect, open loops, sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
 - [`docs/integrations/`](docs/integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
-- [`docs/mcp/`](docs/mcp/) — per-client MCP setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
+- [MCP task guide](docs/mcp/README.md) — deployment and per-client setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
+- [MCP administration](docs/mcp/ADMIN.md) — owner dashboard access, client registration, OAuth, permissions, and token recovery
 - [`docs/eval/`](docs/eval/) — eval framework, metric glossary, methodology
 - [`docs/ethos/`](docs/ethos/) — philosophy (thin harness, fat skills, markdown as recipes, origin story)
 - [`AGENTS.md`](AGENTS.md) — entry point for non-Claude agents

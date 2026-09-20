@@ -639,7 +639,19 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/hos
 
 Use this guide when your memory already lives on another machine. If you want to run GBrain inside your current agent instead, start with [Grok Bot](grok-bot.md), [Muse](muse.md), or the [coding-agent walkthrough](../tutorials/connect-coding-agent.md).
 
-You do two things in different places: the brain owner grants access **on the host**, then you install a private handoff **inside the agent's environment**. Installing configuration on the host does not configure your laptop or Bot.
+The brain owner grants access on the running server; the connecting harness
+configures access in its own environment. Installing configuration on the host
+does not configure your laptop or Bot. First select the connection method:
+
+| Intended connection | Follow |
+| --- | --- |
+| Harness has native OAuth/PKCE settings | [Native OAuth path](#native-oauth-path) below |
+| Managed bearer configuration or a thin CLI adapter | The [machine handoff path](#1-grant-access-on-the-brain-host) below |
+| Open the dashboard, inspect clients, change permissions, or end access | [MCP administration](../mcp/ADMIN.md) |
+
+An endpoint URL, ordinary OAuth token, client secret, or MCP `admin` scope does
+not grant owner administration. The owner uses a separately protected bootstrap
+credential. Local stdio connections do not create an HTTP admin panel.
 
 ## One setup prompt
 
@@ -649,12 +661,46 @@ Paste this into the agent that should use the hosted brain:
 Connect this existing agent to my hosted GBrain. Follow:
 https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/hosted-harness-access.md
 Keep my identity and unrelated configuration. Use memory-writer unless I explicitly
-request another capability. Have the brain owner provision the private handoff on
-the host; install it here. Keep secrets out of chat, command arguments, and Git.
+request another capability. Select this harness's native OAuth/PKCE flow when
+available; otherwise have the owner provision a private machine handoff and
+install it here. Keep secrets out of chat, command arguments, and Git.
 Use the actual harness adapter, verify a unique memory round trip, and report
 server checks separately from observed recall in a new harness conversation.
 Do not claim that generated instructions or a job ID prove a working integration.
 ```
+
+## Native OAuth path
+
+1. Obtain the intended harness's actual redirect URI and supported client
+   authentication method from its settings/current guide. Public PKCE uses
+   `none` and has no client secret; confidential PKCE uses its documented
+   `client_secret_post` or `client_secret_basic` method.
+2. The owner follows [native registration](../mcp/ADMIN.md#native-oauth-with-pkce)
+   with `gbrain mcp admin register NAME --redirect-uri URI`. Select the desired
+   source and permissions explicitly; the native CLI default is read access.
+   This creates authorization-code/refresh registration, not a machine token.
+3. The owner runs `gbrain mcp admin setup CLIENT_ID --harness ID --flow
+   authorization-code` against that server. It returns live endpoint,
+   registration, and setup instructions. Confidential delivery additionally
+   requires `--credentials-out PRIVATE_FILE`. An `OAuthClientSetup` export is
+   not the machine handoff accepted by `gbrain connect --credentials-file`.
+4. Enter the setup fields in the actual harness and start its OAuth connection.
+   The native harness generates and retains the PKCE verifier. When the browser
+   asks for owner approval, the authorized administrator issues a login link
+   with `--oauth-request REQUEST_ID` from that browser URL. The owner can use
+   the link in a fresh browser and return to the same consent request.
+5. Approve the displayed client, callback, scopes, and source access. Verify an
+   authenticated call inside the actual harness, then perform the harmless
+   cross-conversation memory check described below. Registration and downloaded
+   instructions alone do not verify a native connection.
+
+If consent expires or the server restarts, start the connection again in the
+native harness. Enabling DCR is an owner choice, not a required repair: manual
+registration works with DCR disabled when the client supports entered client
+metadata. DCR never bypasses owner approval.
+
+The remaining numbered steps describe **machine handoffs**. Do not install one
+as a substitute when the native client requires OAuth/PKCE.
 
 ## 1. Grant access on the brain host
 
@@ -665,10 +711,15 @@ For ordinary memory, choose `memory-writer`:
 ```bash
 gbrain mcp grant agent-example --harness codex --profile memory-writer \
   --source default --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
   --credentials-out /absolute/private/agent-example.json --json
 ```
 
-Replace `codex` with the actual adapter identifier. For a running PGLite server, add `--admin-token-file /absolute/private/admin-token`; this uses the server's authenticated admin API and existing database connection. An ordinary OAuth token or the endpoint URL cannot provision access. Do not open the live PGLite database from a second process.
+Replace `codex` with the actual adapter identifier. The protected owner file (or
+`GBRAIN_ADMIN_BOOTSTRAP_TOKEN` when the flag is absent) uses the server's admin
+API and existing database connection. A local maintenance CLI can omit both
+only when it can safely open the intended brain. Do not open the live PGLite
+database from a second process.
 
 Use `--dry-run` first to inspect a proposed grant without creating a client. Default output is redacted. The credential handoff is written with private permissions before any optional client installation or verification. Transfer it through a private file channel, then retain only the copies you need. Uploading credentials or backups is never automatic.
 
@@ -677,11 +728,11 @@ Use `--dry-run` first to inspect a proposed grant without creating a client. Def
 | `memory-reader` | Read selected memory | Starter |
 | `memory-writer` | Read and write selected memory | Starter |
 | `coding-agent` | Isolated project writes and explicit project reads | Starter |
-| `operator` | Read, write, and administration | Full |
+| `operator` | Read, write, and eligible brain administration operations | Full |
 | `delegating-agent` | Memory plus explicitly bound delegation | Starter |
 | `full` | All eligible remote capabilities at grant time, including bound delegation | Full |
 
-A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
+A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation or owner dashboard/client-management authority. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
 
 New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. Explicitly regrant to include them. Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
 
@@ -729,6 +780,7 @@ gbrain mcp grant research-example --harness grok-bot \
   --profile delegating-agent --source default \
   --bound-tools search,get_page --delegated-namespace job \
   --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
   --credentials-out /absolute/private/research-example.json --json
 ```
 
@@ -749,10 +801,18 @@ Preview an explicit profile update:
 ```bash
 gbrain mcp grant agent-example --client CLIENT_ID --if-version REVISION \
   --harness codex --profile memory-reader --source default \
-  --url https://brain.example.com/mcp --dry-run --json
+  --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token --dry-run --json
 ```
 
-Review the before/after grant, then repeat without `--dry-run`. `--if-version` rejects a stale edit. The client ID and secret remain unchanged. When updating a client, omit `--profile` to preserve its profile, scopes, operation snapshot, and bindings while changing only the fields you supply. An explicit profile selection regrants its eligible operations. For advanced repairs, use `gbrain auth rescope-client CLIENT_ID --help`; omitted restrictions are retained.
+Get the current revision with `gbrain mcp admin client CLIENT_ID` using the
+same server URL and owner credential. Review the before/after grant, then repeat
+without `--dry-run`. `--if-version` rejects a stale edit. The client ID and secret
+remain unchanged. When updating a client, omit `--profile` to preserve its
+profile, scopes, operation snapshot, and bindings while changing only the fields
+you supply. An explicit profile selection regrants its eligible operations.
+Advanced local-maintenance repairs remain available through `gbrain auth
+rescope-client CLIENT_ID --help`; omitted restrictions are retained.
 
 Scope removals affect existing tokens immediately. Added scopes need a newly issued access token; refresh cannot expand its original scope grant. Source, operation, fence, binding, and surface changes apply on the next authenticated request. Repairing bindings benefits an existing token that already carries `agent`. TTL changes apply only to newly issued tokens. New renewable connections use one-hour access tokens; static-token adapters use 30 days. Check the receipt for the selected expiry.
 
@@ -763,14 +823,32 @@ The host retains a private delivery journal before committing a new client. If t
 ```bash
 gbrain mcp grant agent-example --client CLIENT_ID --resume --harness codex \
   --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
   --credentials-out /absolute/private/recovered-agent.json --json
 ```
 
-Add `--admin-token-file` when recovering through the running server. Resume changes no permissions and rotates no secret. If the client ID was lost, repeating the original creation reports the existing ID instead of creating a duplicate.
+Resume changes no permissions and rotates no secret. If the client ID was lost,
+use `gbrain mcp admin clients` with the same URL and owner credential and inspect
+the existing registration before retrying. A lost response can follow a
+committed mutation; it does not prove that creation failed.
 
-In the admin dashboard, use **Recover credentials** for an existing OAuth client. New confidential clients registered there use the same private host journal. If registration loses its response, the form looks up the existing client before offering recovery. Download the recovered handoff and set its permissions to `0600` on the target computer. Recovery refuses a revoked client or a journal whose secret has since been rotated.
+In the admin dashboard, use the existing client's setup/delivery action. New
+confidential clients use the same private host journal. If registration loses
+its response, inspect the existing client before recovery. Machine clients
+receive a machine handoff; native OAuth clients receive their distinct OAuth
+setup. Keep any secret-bearing download private and set its permissions to
+`0600` on the target computer. Recovery refuses a revoked client or a journal
+whose secret has since been rotated.
 
-An expired or lost **access token** can be reissued using the existing client secret. A lost **client secret**, when neither the handoff nor host delivery journal remains, requires explicit secret rotation. These are distinct operations; revoking a client is another separate operation. Protect or remove the host's `.gbrain/credential-deliveries` files deliberately after secure delivery; they contain credentials and are excluded from default backups.
+An expired or lost machine **access token** can be reissued using the existing
+client secret. For native OAuth, reconnect in the harness. A lost **client
+secret** requires journal/handoff recovery or an explicit maintenance decision;
+see [legacy rotation limits](../mcp/ADMIN.md#recover-a-failed-step). The local
+`agent register --reissue` path supports confidential machine clients and leaves
+outstanding access tokens valid; it is not a general remote/native-PKCE recovery
+command. Protect or remove the host's `.gbrain/credential-deliveries` files
+deliberately after secure delivery; they contain credentials and are excluded
+from default backups.
 
 ## Maintenance, removal, and troubleshooting
 
@@ -786,7 +864,12 @@ recover it through the host's delivery procedure first.
 
 Before this security migration, stop old servers and workers and take a protected backup. Start only runtimes that enforce the migrated grants. If rollout fails, disable the affected entry points and restore a compatible runtime while preserving memory and the tightened grants; do not run an older authorization implementation against the migrated database. Local installations can be released independently of hosted delegation.
 
-Remove a managed native configuration with the same private handoff and `gbrain connect ... --remove`. Disable saved skills/routines through the harness controls. Revoke the client on the host when its authority should end. Removing configuration alone does not revoke access or delete memory.
+Remove a managed configuration with the same private handoff and `gbrain connect
+... --remove`, or remove the native OAuth connection through its harness
+settings. Disable saved skills/routines through the harness controls. Use
+[token invalidation, revocation, or deletion](../mcp/ADMIN.md#invalidate-tokens-revoke-or-delete)
+when server authority should change. Removing configuration alone does not
+revoke access or delete memory.
 
 | Symptom | Next action |
 | --- | --- |
@@ -823,7 +906,7 @@ start here.
 >
 > **Inside Grok Bot or Muse:** follow [Grok Bot](docs/guides/grok-bot.md) or [Muse](docs/guides/muse.md), using the isolated [in-agent setup](docs/guides/in-agent-setup.md) entry point. Use the absolute recorded launcher on every call. Sources organize local memory; they do not isolate agents that share files or credentials. Do not mark generated skills or routines as activated without native-harness evidence.
 >
-> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Provision on the host; install the private handoff inside the intended harness. A URL or ordinary OAuth token is not administration authority.
+> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Choose native OAuth/PKCE or a private machine handoff for the intended harness. For login links, clients, permissions, or token lifecycle, follow [MCP administration](docs/mcp/ADMIN.md) or `skills/mcp-access/SKILL.md`. A URL or ordinary OAuth token is not owner administration authority.
 >
 > **Creating a new personal agent, explicitly requested by the user:** follow [BOOTSTRAP_FOR_AGENTS.md](BOOTSTRAP_FOR_AGENTS.md), then return here for the operating protocol.
 
@@ -1953,7 +2036,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/INSTALL_FOR_AGE
 
 Read this file, then follow the path appropriate to the user’s request. Default to adding keyless memory to their existing agent, preserving identity and unrelated configuration. API keys, enrichment, automatic capture, and a new personal-agent identity are separate choices.
 
-> **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide and `scripts/setup-in-agent.sh`; its receipt tracks repair and native enablement. For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, provision on the host and install the private handoff inside the harness. This guide covers a local brain for other existing agents.
+> **Choose the installation path first.** Inside **[Grok Bot](docs/guides/grok-bot.md)** or **[Muse](docs/guides/muse.md)**, use their dedicated guide and `scripts/setup-in-agent.sh`; its receipt tracks repair and native enablement. For an **[existing hosted brain](docs/guides/hosted-harness-access.md)**, choose the harness's native OAuth/PKCE flow or a private machine handoff. Owner login, client management, permissions, and revocation use the separate [MCP administration](docs/mcp/ADMIN.md) path. This guide covers a local brain for other existing agents.
 >
 > **Memory-only path:** install → initialize → relay and confirm the Step 3.5 search-mode choice → connect the harness → verify memory. Skip identity replacement, private-repo bootstrap, automatic capture, cron installation, and paid enrichment unless requested. A keyword-only brain needs no API key. The required search-mode choice still applies; published API cost examples are not prices for the user’s harness subscription.
 >
@@ -2583,6 +2666,7 @@ off until the user opts in, and paid enrichment is a separate choice.
 | Trigger | Skill |
 |---------|-------|
 | "Set up GBrain", "install gbrain into this agent workspace", "add gbrain to my agent", first boot | `skills/setup/SKILL.md` (existing identity, keyless memory by default) |
+| "GBrain admin login link", "open the MCP admin panel", "manage MCP clients", "register an MCP client", "set up MCP OAuth", "connect this harness to my hosted brain", "invalidate MCP tokens", "revoke an MCP client", "delete an MCP client", "edit MCP access levels" | `skills/mcp-access/SKILL.md` (owner administration is separate from MCP OAuth access) |
 | "Now what?", "fill my brain", "cold start", "bootstrap my data", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
 | Explicit request to create a new personal agent with identity and private repository, "gbrain bootstrap" | Run `gbrain bootstrap`; see `BOOTSTRAP_FOR_AGENTS.md`. A generic paste-in install request routes to `skills/setup/SKILL.md`. |
 | "wire this box's coding agents to the brain", "framework-spawned sessions need brain access", "wire gbrain hooks without a workspace", "hook Claude Code/Codex to the running serve" | Run `gbrain bootstrap harness --yes` (machine-level wiring to a running `serve --http`: scoped token + user-scope MCP + headless pre-approval + hooks; no agent.json). See the "Local harness mode" section of `docs/guides/bootstrap.md` |
@@ -2619,6 +2703,7 @@ When multiple skills could match:
 6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat export FILE or session transcripts → conversation-archive; CONNECT an account for live/automatic sync ("connect my chatgpt", "keep synced") → chat-connectors
 7. Identity/personality content (who the agent is, voice, persona) → soul-audit; token/structure hygiene of the always-loaded context stack → context-audit
 8. "Why is X slow/stale" measurement-first ops triage → measure-before-you-fix; code debugging ("why is this function broken") → investigate (GStack)
+9. GBrain MCP server/client OAuth, dashboard login, or client permissions → mcp-access; importing chat account history (including "chatgpt oauth") → chat-connectors. An existing hosted endpoint does not require local initialization.
 
 ## Conventions (cross-cutting)
 
@@ -2663,7 +2748,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/README.md
 ## Choose your setup
 
 1. **Add GBrain to my existing agent — recommended.** Keep your agent's identity and save memory inside its environment. No new personal-agent identity or private repository is required. Start with the guide for **[Grok Bot](docs/guides/grok-bot.md)**, **[Muse](docs/guides/muse.md)**, or **[Codex / Claude Code](docs/tutorials/connect-coding-agent.md)**. [Other harnesses](#connect-gbrain-to-your-ai-client-mcp).
-2. **Connect my existing hosted brain.** Grant access on the brain host, then install the private connection inside the intended harness. Follow **[hosted harness access](docs/guides/hosted-harness-access.md)**. The default profile can read and write memory; delegation is an explicit choice.
+2. **Connect my existing hosted brain.** Follow **[hosted harness access](docs/guides/hosted-harness-access.md)** to choose native OAuth or a private machine connection. For dashboard login, clients, and permissions, use **[MCP administration](docs/mcp/ADMIN.md)** with the server's separate owner credential.
 
 Grok **Bot** and Grok **Build** are different products. Muse's personal agent and **Muse Code** are different products too. Muse already has native editable memory; GBrain adds an explicit, portable record with provenance and shared access. See each guide's dated evidence and remaining verification steps.
 
@@ -2852,7 +2937,7 @@ Postgres-at-scale, Supabase, and thin-client setup paths live in [`docs/INSTALL.
 
 ### Connect GBrain to your AI client (MCP)
 
-For a hosted brain, start with the [private handoff and profile guide](docs/guides/hosted-harness-access.md). A **profile** controls authority; a **surface** controls which granted tools are visible. New memory profiles use the starter surface. `--surface verbs` retains exactly the seven memory verbs, with orientation available through `gbrain://capabilities`. Thin CLI connections use the full surface and remain restricted by their grants.
+For a hosted brain, start with the [native OAuth and private machine connection guide](docs/guides/hosted-harness-access.md). To open the dashboard, register clients, edit access, or invalidate tokens, use [MCP administration](docs/mcp/ADMIN.md). A **profile** controls MCP authority; a **surface** controls which granted tools are visible. Neither grants owner dashboard access. New memory profiles use the starter surface. `--surface verbs` retains exactly the seven memory verbs, with orientation available through `gbrain://capabilities`. Thin CLI connections use the full surface and remain restricted by their grants.
 
 The existing connection commands below remain supported. Choose the instructions for your actual product:
 
@@ -2874,8 +2959,8 @@ commands, embedding costs, and the restrictions that remain after rebuilding.
 - **[OpenClaw](docs/mcp/OPENCLAW.md)** — the ClawHub bundle plugin registers gbrain automatically (`openclaw.plugin.json` ships in this repo), or register the stdio server with `openclaw mcp add gbrain --command "$(command -v gbrain)" --arg serve --env GBRAIN_HOME=$HOME` (absolute path: the launchd gateway PATH lacks `~/.bun/bin`); verify with `openclaw mcp list`.
 - **[Claude Desktop (Cowork)](docs/mcp/CLAUDE_DESKTOP.md)** — Settings → Integrations → add the URL of your HTTP server. Remote only; the local `claude_desktop_config.json` does not work for remote servers.
 - **[Claude Cowork (team plan)](docs/mcp/CLAUDE_COWORK.md)** — org Owner adds the connector under Organization Settings → Connectors.
-- **[Perplexity Computer](docs/mcp/PERPLEXITY.md)** — `gbrain connect https://your-host/mcp --agent perplexity --oauth --register` mints a least-privilege OAuth client and prints the Issuer/Client ID/Secret to paste into Settings → Connectors (OAuth is the right path for a cloud connector; a bearer token also works for local use). Pro subscription required.
-- **[ChatGPT](docs/mcp/CHATGPT.md)** — uses OAuth 2.1 with PKCE (the hard requirement). Register a `chatgpt` client from the admin dashboard with grant type `authorization_code`.
+- **[Perplexity Computer](docs/mcp/PERPLEXITY.md)** — choose native OAuth or a managed bearer connection according to the actual connector settings. The owner registers the matching client and delivers any confidential credentials privately.
+- **[ChatGPT](docs/mcp/CHATGPT.md)** — native OAuth with PKCE. Register the exact callback and token authentication method shown in its MCP settings, then start the connection in ChatGPT and complete owner consent.
 
 For the HTTP server itself:
 
@@ -2885,7 +2970,7 @@ gbrain serve --http       # HTTP MCP with OAuth 2.1 + admin dashboard at /admin
                           # (required for Claude Desktop, Cowork, Perplexity, ChatGPT)
 ```
 
-The HTTP server includes optional dynamic client registration, scope-gated access (`read` / `write` / `admin` / `agent`), owner-approved OAuth authorization, and rate limiting. Dynamic registration cannot grant delegation; `admin` does not imply `agent`. Deployment guides (ngrok, Railway, Fly.io) live under [`docs/mcp/`](docs/mcp/).
+The HTTP server includes optional dynamic client registration, scope-gated access (`read` / `write` / `admin` / `agent`), owner-approved OAuth authorization, and rate limiting. Dynamic registration cannot grant delegation; `admin` implies neither `agent` nor owner administration. Start with the [MCP task guide](docs/mcp/README.md) for deployment, client setup, and administration.
 
 Running several brains behind one tool catalog? Give each one an identity: `gbrain config set mcp.instructions "Team wiki brain — route product and roadmap questions here"` rides every transport's initialize response under a `Deployment identity:` banner, so a connected agent can tell your brains apart. Restart `gbrain serve` to pick it up; `GBRAIN_MCP_INSTRUCTIONS` in the serve process's environment overrides it for that process, and `gbrain config unset mcp.instructions` returns to the bare contract. **Say to your agent:** *"Tell connected agents which brain this is"* — your agent runs `gbrain config set mcp.instructions "<identity>"`.
 
@@ -3332,7 +3417,8 @@ completes in seconds on an 80K-page PGLite brain.
 - [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
 - [`docs/guides/`](docs/guides/) — how-to runbooks (google connect, open loops, sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
 - [`docs/integrations/`](docs/integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
-- [`docs/mcp/`](docs/mcp/) — per-client MCP setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
+- [MCP task guide](docs/mcp/README.md) — deployment and per-client setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
+- [MCP administration](docs/mcp/ADMIN.md) — owner dashboard access, client registration, OAuth, permissions, and token recovery
 - [`docs/eval/`](docs/eval/) — eval framework, metric glossary, methodology
 - [`docs/ethos/`](docs/ethos/) — philosophy (thin harness, fat skills, markdown as recipes, origin story)
 - [`AGENTS.md`](AGENTS.md) — entry point for non-Claude agents
@@ -5782,6 +5868,13 @@ Access your brain from any device, any AI client. GBrain ships two transports:
 `gbrain serve` (stdio) for local agents, and `gbrain serve --http` for remote
 clients over OAuth 2.1.
 
+For **owner login, client registration, setup instructions, permission edits,
+token invalidation, revocation, or deletion**, start with
+[MCP administration](ADMIN.md). For the connecting harness, use
+[hosted setup](../guides/hosted-harness-access.md). The owner bootstrap credential
+is separate from OAuth `admin` scope; only the former authenticates the owner
+dashboard and client-management API.
+
 Authorization-code connections require owner approval in the admin dashboard.
 Existing sessions are preserved. Before upgrading an installation with queued
 work, follow the [authorization and worker upgrade guide](../guides/authorization-upgrade.md)
@@ -5802,10 +5895,10 @@ client back to its registered redirect URI with `error=too_many_requests`
 (and no code) until earlier requests are decided or expire; a `429` status on
 `/authorize` comes only from the MCP SDK's per-IP rate limit.
 
-**Say to your agent:** *"Start the brain server over HTTP with self-service
-registration, then approve my client in the admin dashboard — your agent runs
-`gbrain serve --http --enable-dcr` and you finish the connection by approving
-it at `/admin/`."*
+**Say to the server-hosting harness:** *"Expose my existing brain over HTTPS,
+configure a protected owner credential, and help connect my native OAuth client.
+Use manual registration unless I request self-service registration. Preserve
+the OAuth request when issuing my owner login link."*
 
 ## Three Paths
 
@@ -5827,8 +5920,12 @@ omit the flag (default `full`) for every operation.
 ### Remote over OAuth 2.1 (recommended)
 
 ```bash
-gbrain serve --http --port 3131
 ngrok http 3131 --url your-brain.ngrok.app
+```
+
+Keep the tunnel running in its own terminal, then start the brain server once:
+
+```bash
 gbrain serve --http --port 3131 --public-url https://your-brain.ngrok.app
 ```
 
@@ -5852,7 +5949,7 @@ See the [OAuth 2.1 setup](#oauth-21-setup) section below.
 ```
 Your AI client (Claude Desktop, Perplexity, etc.)
   → ngrok tunnel (https://YOUR-DOMAIN.ngrok.app)
-  → gbrain serve --http  (built-in transport with bearer auth)
+  → gbrain serve --http  (MCP OAuth/bearer access; separate owner administration)
   → Postgres or PGLite
 ```
 
@@ -5884,9 +5981,12 @@ Open http://localhost:3131/admin and paste it to log in.
 
 On a non-TTY start (systemd, Docker, any piped or captured logs) the generated
 token is hidden so it never lands in log storage. For headless deploys either
-set `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` to a value you control before starting, or
-run `gbrain serve --http --print-admin-token` once on a trusted terminal to
-force printing.
+set `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` through the service's protected environment
+before starting. `--print-admin-token` can force printing at that process's
+startup on a trusted terminal; starting a separate process with this flag does
+not recover the existing server's token. If the existing process's generated
+credential was lost, restart that service through the normal maintenance path
+with a configured credential. See [owner credential recovery](ADMIN.md#set-up-or-recover-the-owner-credential).
 
 Save this token. Open `http://localhost:3131/admin` and paste it to access the
 dashboard. The dashboard shows live activity, registered clients, request logs,
@@ -5903,14 +6003,26 @@ and per-client config export.
 
 ### Owner login links for AI agents
 
-**Say to your agent:** *"Give me the GBrain admin login link"* — the agent
-uses the existing HTTP mint endpoint described below.
+**Say to the server-hosting or authorized administrator harness:** *"Give me
+the GBrain admin login link"*. The recommended command wraps the existing HTTP
+mint endpoint:
+
+```bash
+gbrain mcp admin login-link --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token --json
+```
+
+During OAuth connection, add `--oauth-request REQUEST_ID` from the pending
+browser URL. This preserves consent when the owner opens the login link in a
+fresh tab or browser. Expired/restarted requests require a new connection from
+the native client; its PKCE verifier stays in that client. Full commands and
+recovery instructions: [MCP administration](ADMIN.md).
 
 When an authenticated owner asks **"Give me the GBrain admin login link"**,
 use the existing single-use login flow. A static `/admin/` URL opens the login
 page; it does not authenticate the owner.
 
-1. Confirm the requesting owner and a private destination for the login link.
+1. Use the requesting owner's authorization and a private destination for the login link.
 2. Obtain the running server's bootstrap credential through the host's existing
    protected credential mechanism. `GBRAIN_ADMIN_BOOTSTRAP_TOKEN` is the supported
    deployment setting. Never expose its value in chat, logs, shell arguments,
@@ -5942,43 +6054,47 @@ starting the server; generated secrets are deliberately hidden in captured logs.
 
 ### 2. Register OAuth clients
 
-Register clients from the **`/admin` dashboard**:
+Register from the **`/admin` dashboard's Agents page**. Choose machine
+credentials, public PKCE (`none`), or confidential PKCE (POST/Basic) according
+to the intended harness. Native OAuth requires its actual redirect URI. Review
+permissions and connection metadata before registration, then use the setup
+instructions for that client. Public clients have no secret; confidential
+delivery is explicit and recoverable from the protected host journal while
+the live secret still matches.
 
-1. Click **Register client**.
-2. Enter a name (e.g. `perplexity`, `chatgpt`).
-3. Pick scopes: `read`, `write`, `admin` (checkboxes).
-4. Pick grant type: `client_credentials` for machine-to-machine (Perplexity,
-   Claude Desktop bearer mode) or `authorization_code` for browser-based
-   clients with PKCE (ChatGPT).
-5. For `authorization_code` clients, paste the redirect URI.
-6. Hit **Register**. The credential-reveal modal shows the `client_id` (and
-   `client_secret` for confidential clients) once. Copy or Download JSON
-   immediately — secrets are hashed on storage and never shown again.
-
-Or from the CLI — faster for scripting:
+For a running server, use the owner HTTP CLI:
 
 ```bash
-gbrain auth register-client perplexity \
-  --grant-types client_credentials \
-  --scopes "read write"
+gbrain mcp admin register agent-example \
+  --redirect-uri https://client.example.com/oauth/callback \
+  --token-endpoint-auth-method none --scopes read,write --source default \
+  --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token --dry-run --json
 ```
+
+Review and repeat without `--dry-run`. Machine credentials use `gbrain mcp
+grant … --credentials-out PRIVATE_FILE` instead. See [registration and
+setup](ADMIN.md#register-and-connect-a-client) for both flows. The legacy
+`gbrain auth register-client` command remains a local database-maintenance path;
+do not open an already running PGLite brain through it.
 
 **Source-scoped clients.** Multi-source brains can scope a client's write
 authority to one source and its read scope to a curated set with the
 `--source` and `--federated-read` flags:
 
 ```bash
-gbrain auth register-client dept-x-agent \
-  --grant-types client_credentials \
-  --scopes "read write" \
-  --source dept-x \
-  --federated-read dept-x,shared,parent-canon
+gbrain mcp grant dept-x-agent --harness generic --profile memory-writer \
+  --source dept-x --federated-read dept-x,shared,parent-canon \
+  --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
+  --credentials-out /absolute/private/dept-x-agent.json --json
 ```
 
 `--source` controls the write authority — `put_page` / `add_link` / etc only
 land in `dept-x`. `--federated-read` controls the read axis independently;
-queries return rows from any of the listed sources. Omit both flags for an
-unscoped super-client. A client with no recorded source is backfilled to
+queries return rows from any of the listed sources. New registrations that omit
+both flags use source `default`; omission does not create an unscoped
+super-client. A client with no recorded source is backfilled to
 `source_id='default'` on `gbrain upgrade`. Within a source,
 slug-level write fencing is also available: `--bound-slug-prefixes p1/,p2/`
 rejects slug-mutating writes outside the listed prefixes (update later with
@@ -5994,6 +6110,8 @@ await oauthProvider.registerClientManual(
   [],  // redirect_uris, empty for CC
 );
 ```
+
+### Dynamic client registration (DCR)
 
 For self-service client registration (Dynamic Client Registration, RFC 7591),
 start the server with `--enable-dcr`. DCR is off by default.
@@ -6150,7 +6268,7 @@ Remote agents cannot reach local filesystem surface area.
 |-------|---------------|
 | `read` | `search`, `query`, `get_page`, `list_pages`, graph traversal |
 | `write` | `put_page`, `delete_page`, `add_link`, `add_timeline_entry` |
-| `admin` | Client management, token revocation, sweep; local-only restrictions still apply |
+| `admin` | Eligible admin-tagged brain operations; local-only restrictions still apply. Does not grant dashboard or client-management authority. |
 
 Write ops can additionally be fenced per client with `--bound-slug-prefixes`
 (see [Register OAuth clients](#2-register-oauth-clients) above).

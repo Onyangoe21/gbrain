@@ -1,6 +1,6 @@
 # Connect GBrain to Claude Code
 
-For an existing agent, start with the [memory-only walkthrough](../tutorials/connect-coding-agent.md); a personal-agent identity and private repository are optional. For an existing hosted brain, use [private handoff and profiles](../guides/hosted-harness-access.md).
+For an existing agent, start with the [memory-only walkthrough](../tutorials/connect-coding-agent.md); a personal-agent identity and private repository are optional. For an existing hosted brain, choose [native OAuth or a private machine handoff](../guides/hosted-harness-access.md). Owner login and client management use [MCP administration](ADMIN.md), independently of the harness's OAuth scopes.
 
 > New to this? The [Give your coding agent a memory](../tutorials/connect-coding-agent.md)
 > tutorial walks both paths (local-from-nothing and connect-to-an-existing-brain)
@@ -152,7 +152,7 @@ You should see results from your GBrain knowledge base.
 > full surfaces (prefer it for quick notes — auto-slug + dedupe; `put_page` for
 > full-control writes); if your tool list doesn't carry it, use `put_page`, or
 > `remember` on the verbs surface.
-> Why brains differ on the default: [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-serve-over-http).
+> Why brains differ on the default: [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-grant-memory-access).
 
 ## Ambient recall at session boundaries
 

@@ -111,6 +111,7 @@ off until the user opts in, and paid enrichment is a separate choice.
 | Trigger | Skill |
 |---------|-------|
 | "Set up GBrain", "install gbrain into this agent workspace", "add gbrain to my agent", first boot | `skills/setup/SKILL.md` (existing identity, keyless memory by default) |
+| "GBrain admin login link", "open the MCP admin panel", "manage MCP clients", "register an MCP client", "set up MCP OAuth", "connect this harness to my hosted brain", "invalidate MCP tokens", "revoke an MCP client", "delete an MCP client", "edit MCP access levels" | `skills/mcp-access/SKILL.md` (owner administration is separate from MCP OAuth access) |
 | "Now what?", "fill my brain", "cold start", "bootstrap my data", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
 | Explicit request to create a new personal agent with identity and private repository, "gbrain bootstrap" | Run `gbrain bootstrap`; see `BOOTSTRAP_FOR_AGENTS.md`. A generic paste-in install request routes to `skills/setup/SKILL.md`. |
 | "wire this box's coding agents to the brain", "framework-spawned sessions need brain access", "wire gbrain hooks without a workspace", "hook Claude Code/Codex to the running serve" | Run `gbrain bootstrap harness --yes` (machine-level wiring to a running `serve --http`: scoped token + user-scope MCP + headless pre-approval + hooks; no agent.json). See the "Local harness mode" section of `docs/guides/bootstrap.md` |
@@ -147,6 +148,7 @@ When multiple skills could match:
 6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat export FILE or session transcripts → conversation-archive; CONNECT an account for live/automatic sync ("connect my chatgpt", "keep synced") → chat-connectors
 7. Identity/personality content (who the agent is, voice, persona) → soul-audit; token/structure hygiene of the always-loaded context stack → context-audit
 8. "Why is X slow/stale" measurement-first ops triage → measure-before-you-fix; code debugging ("why is this function broken") → investigate (GStack)
+9. GBrain MCP server/client OAuth, dashboard login, or client permissions → mcp-access; importing chat account history (including "chatgpt oauth") → chat-connectors. An existing hosted endpoint does not require local initialization.
 
 ## Conventions (cross-cutting)
 

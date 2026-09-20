@@ -1,6 +1,6 @@
 # Connect GBrain to Codex
 
-Adding memory to an existing Codex agent preserves its identity and needs no private repository. Use the [memory-only walkthrough](../tutorials/connect-coding-agent.md). Connecting an existing hosted brain? Use [private handoff and profiles](../guides/hosted-harness-access.md), including configuration that survives a new shell.
+Adding memory to an existing Codex agent preserves its identity and needs no private repository. Use the [memory-only walkthrough](../tutorials/connect-coding-agent.md). Connecting an existing hosted brain? Choose [native OAuth or a private machine handoff](../guides/hosted-harness-access.md). Opening the owner dashboard or managing clients uses [MCP administration](ADMIN.md) with its separate owner credential.
 
 > New to this? The [Give your coding agent a memory](../tutorials/connect-coding-agent.md)
 > tutorial walks both paths (local-from-nothing and connect-to-an-existing-brain)
@@ -144,7 +144,7 @@ everything it can do.
 > prefer `capture` for quick notes (auto-slug + dedupe), `put_page` for
 > full-control writes; if a narrowed token's list lacks capture, use `put_page`.
 > Why brains differ on the default:
-> [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-serve-over-http).
+> [tutorial A1](../tutorials/connect-coding-agent.md#a1-on-the-host-grant-memory-access).
 
 ## Remove
 

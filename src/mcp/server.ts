@@ -16,7 +16,7 @@ import { gcSessionContextState } from '../core/context/session-state.ts';
 import { bindResolveIpcForServe } from './resolve-ipc-binding.ts';
 import { createPersistenceIpcProvider } from '../core/persistence/provider.ts';
 import { resolveMcpInstructions } from './instructions.ts';
-import { installCapabilitiesResource } from './capabilities.ts';
+import { installCapabilitiesResource, mcpAdministrationGuidance } from './capabilities.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { isEngineDegraded, onEngineRecovered } from '../core/degraded-marker.ts';
 import { assertStdioSourceBindable } from './source-preflight.ts';
@@ -228,6 +228,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     const scope = await resolveMcpStdioSourceScope(engine);
     return { transport: 'stdio', scopes: [], surface, source_id: scope.sourceId,
       available_operations: (await stdioVisibleTools(engine, surfacedOps)).map(op => op.name),
+      administration: mcpAdministrationGuidance(),
       worker: { status: 'unknown' }, note: 'This local MCP pipe has no OAuth profile; agent-facing operation restrictions still apply.' };
   });
 

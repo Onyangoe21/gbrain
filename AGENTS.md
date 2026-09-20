@@ -8,7 +8,7 @@ start here.
 >
 > **Inside Grok Bot or Muse:** follow [Grok Bot](docs/guides/grok-bot.md) or [Muse](docs/guides/muse.md), using the isolated [in-agent setup](docs/guides/in-agent-setup.md) entry point. Use the absolute recorded launcher on every call. Sources organize local memory; they do not isolate agents that share files or credentials. Do not mark generated skills or routines as activated without native-harness evidence.
 >
-> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Provision on the host; install the private handoff inside the intended harness. A URL or ordinary OAuth token is not administration authority.
+> **Existing hosted brain:** follow [hosted harness access](docs/guides/hosted-harness-access.md). Choose native OAuth/PKCE or a private machine handoff for the intended harness. For login links, clients, permissions, or token lifecycle, follow [MCP administration](docs/mcp/ADMIN.md) or `skills/mcp-access/SKILL.md`. A URL or ordinary OAuth token is not owner administration authority.
 >
 > **Creating a new personal agent, explicitly requested by the user:** follow [BOOTSTRAP_FOR_AGENTS.md](BOOTSTRAP_FOR_AGENTS.md), then return here for the operating protocol.
 

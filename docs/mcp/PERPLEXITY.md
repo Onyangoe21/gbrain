@@ -39,41 +39,38 @@ tunnel.
 
 ## 3. Create credentials
 
-Two supported auth paths. (Full client-registration mechanics — the `/admin`
-dashboard flow, grant types, scope format — live in
-[DEPLOY.md — Register OAuth clients](DEPLOY.md#2-register-oauth-clients);
-below is the Perplexity-specific shape.)
+Choose the authentication flow actually offered by the intended Perplexity
+connection. For native OAuth/PKCE, follow
+[native hosted setup](../guides/hosted-harness-access.md#native-oauth-path), using
+its exact callback and authentication method. Do not assume every Perplexity
+product uses the same settings.
 
-**OAuth 2.1 client credentials (recommended).** Perplexity is a cloud
-service, so it holds whatever credential you give it. OAuth is the correct choice:
-least-privilege scopes + short-lived rotating access tokens instead of a
-long-lived full-access secret. Mint a client and print the connector fields in
-one step (on the brain host):
+For a connection that accepts **machine client credentials**, the authorized
+administrator provisions a scoped handoff through the existing server:
 
 ```bash
-gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --agent perplexity --oauth --register
+gbrain mcp grant perplexity-example --harness perplexity \
+  --profile memory-writer --source default \
+  --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
+  --credentials-out /absolute/private/perplexity-example.json --json
 ```
 
-Or register separately and pass the creds (works anywhere, no DB needed):
+Use `--dry-run` first to review the grant. Generate instructions for that actual
+registration:
 
 ```bash
-gbrain auth register-client perplexity --grant-types client_credentials --scopes "read write"
-gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --agent perplexity --oauth \
-  --client-id gbrain_cl_xxx --client-secret gbrain_cs_xxx
+gbrain mcp admin setup CLIENT_ID --harness perplexity --flow client-credentials \
+  --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token --json
 ```
 
-`connect --oauth` prints the **Issuer URL + Client ID + Client Secret** to paste
-in step 4.
-
-**Legacy bearer token (simplest, best for local/personal):**
-
-```bash
-gbrain auth create "perplexity"
-gbrain connect https://YOUR-DOMAIN.ngrok.app/mcp --token gbrain_xxx --agent perplexity
-```
-
-(Perplexity is a GUI connector, so there's no `--install` — `connect` prints the
-exact values to paste in step 4.)
+Keep the client secret in the private handoff and enter it only in the intended
+authentication settings. Ordinary setup output is redacted; explicit recovery
+uses `--credentials-out PRIVATE_FILE`. Never pass the owner credential to
+Perplexity. For legacy bearer connections, see [legacy setup](DEPLOY.md#legacy-bearer-token-setup).
+The generic/manual adapter produces instructions; it does not claim to install
+or activate Perplexity's native settings.
 
 ## 4. Add the connector in Perplexity
 

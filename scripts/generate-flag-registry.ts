@@ -123,6 +123,7 @@ function facadeExpansion(p: string): string[] {
     return out;
   };
   if (rel === 'src/core/operations.ts') return collect(join(ROOT, 'src/core/ops'));
+  if (rel === 'src/commands/mcp.ts') return ['mcp-admin.ts', 'mcp-admin-http.ts'].map(f => join(ROOT, 'src/commands', f));
   if (rel === 'src/commands/doctor.ts') return collect(join(ROOT, 'src/commands/doctor'));
   if (rel === 'src/commands/skillpack.ts') return collect(join(ROOT, 'src/commands/skillpack'));
   // connectors is a peeled command dir (index.ts dispatches to auth/sync/status);

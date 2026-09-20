@@ -118,9 +118,13 @@ material, and backups may remain.
 
 ## Path A: connect an agent to a brain you already have
 
-Use [hosted harness access](../guides/hosted-harness-access.md) for the full
-procedure. There are two environments: the owner grants access on the brain
-host, then you install the private handoff inside your coding agent's environment.
+Use [hosted harness access](../guides/hosted-harness-access.md) to choose the
+connection method. A harness with native OAuth settings follows the
+[native OAuth path](../guides/hosted-harness-access.md#native-oauth-path).
+The steps below install a private machine connection: the owner grants access
+on the brain host, then you install the handoff inside your coding agent's
+environment. Dashboard access and client management use the separate
+[owner administration](../mcp/ADMIN.md) protocol.
 
 ### A1. On the host, grant memory access
 
@@ -130,6 +134,7 @@ separate `memory-writer` client for each intended agent:
 ```bash
 gbrain mcp grant coding-example --harness codex --profile memory-writer \
   --source default --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/owner-token \
   --credentials-out /absolute/private/coding-example.json --json
 ```
 

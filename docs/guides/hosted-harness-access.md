@@ -2,7 +2,19 @@
 
 Use this guide when your memory already lives on another machine. If you want to run GBrain inside your current agent instead, start with [Grok Bot](grok-bot.md), [Muse](muse.md), or the [coding-agent walkthrough](../tutorials/connect-coding-agent.md).
 
-You do two things in different places: the brain owner grants access **on the host**, then you install a private handoff **inside the agent's environment**. Installing configuration on the host does not configure your laptop or Bot.
+The brain owner grants access on the running server; the connecting harness
+configures access in its own environment. Installing configuration on the host
+does not configure your laptop or Bot. First select the connection method:
+
+| Intended connection | Follow |
+| --- | --- |
+| Harness has native OAuth/PKCE settings | [Native OAuth path](#native-oauth-path) below |
+| Managed bearer configuration or a thin CLI adapter | The [machine handoff path](#1-grant-access-on-the-brain-host) below |
+| Open the dashboard, inspect clients, change permissions, or end access | [MCP administration](../mcp/ADMIN.md) |
+
+An endpoint URL, ordinary OAuth token, client secret, or MCP `admin` scope does
+not grant owner administration. The owner uses a separately protected bootstrap
+credential. Local stdio connections do not create an HTTP admin panel.
 
 ## One setup prompt
 
@@ -12,12 +24,46 @@ Paste this into the agent that should use the hosted brain:
 Connect this existing agent to my hosted GBrain. Follow:
 https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/hosted-harness-access.md
 Keep my identity and unrelated configuration. Use memory-writer unless I explicitly
-request another capability. Have the brain owner provision the private handoff on
-the host; install it here. Keep secrets out of chat, command arguments, and Git.
+request another capability. Select this harness's native OAuth/PKCE flow when
+available; otherwise have the owner provision a private machine handoff and
+install it here. Keep secrets out of chat, command arguments, and Git.
 Use the actual harness adapter, verify a unique memory round trip, and report
 server checks separately from observed recall in a new harness conversation.
 Do not claim that generated instructions or a job ID prove a working integration.
 ```
+
+## Native OAuth path
+
+1. Obtain the intended harness's actual redirect URI and supported client
+   authentication method from its settings/current guide. Public PKCE uses
+   `none` and has no client secret; confidential PKCE uses its documented
+   `client_secret_post` or `client_secret_basic` method.
+2. The owner follows [native registration](../mcp/ADMIN.md#native-oauth-with-pkce)
+   with `gbrain mcp admin register NAME --redirect-uri URI`. Select the desired
+   source and permissions explicitly; the native CLI default is read access.
+   This creates authorization-code/refresh registration, not a machine token.
+3. The owner runs `gbrain mcp admin setup CLIENT_ID --harness ID --flow
+   authorization-code` against that server. It returns live endpoint,
+   registration, and setup instructions. Confidential delivery additionally
+   requires `--credentials-out PRIVATE_FILE`. An `OAuthClientSetup` export is
+   not the machine handoff accepted by `gbrain connect --credentials-file`.
+4. Enter the setup fields in the actual harness and start its OAuth connection.
+   The native harness generates and retains the PKCE verifier. When the browser
+   asks for owner approval, the authorized administrator issues a login link
+   with `--oauth-request REQUEST_ID` from that browser URL. The owner can use
+   the link in a fresh browser and return to the same consent request.
+5. Approve the displayed client, callback, scopes, and source access. Verify an
+   authenticated call inside the actual harness, then perform the harmless
+   cross-conversation memory check described below. Registration and downloaded
+   instructions alone do not verify a native connection.
+
+If consent expires or the server restarts, start the connection again in the
+native harness. Enabling DCR is an owner choice, not a required repair: manual
+registration works with DCR disabled when the client supports entered client
+metadata. DCR never bypasses owner approval.
+
+The remaining numbered steps describe **machine handoffs**. Do not install one
+as a substitute when the native client requires OAuth/PKCE.
 
 ## 1. Grant access on the brain host
 
@@ -28,10 +74,15 @@ For ordinary memory, choose `memory-writer`:
 ```bash
 gbrain mcp grant agent-example --harness codex --profile memory-writer \
   --source default --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
   --credentials-out /absolute/private/agent-example.json --json
 ```
 
-Replace `codex` with the actual adapter identifier. For a running PGLite server, add `--admin-token-file /absolute/private/admin-token`; this uses the server's authenticated admin API and existing database connection. An ordinary OAuth token or the endpoint URL cannot provision access. Do not open the live PGLite database from a second process.
+Replace `codex` with the actual adapter identifier. The protected owner file (or
+`GBRAIN_ADMIN_BOOTSTRAP_TOKEN` when the flag is absent) uses the server's admin
+API and existing database connection. A local maintenance CLI can omit both
+only when it can safely open the intended brain. Do not open the live PGLite
+database from a second process.
 
 Use `--dry-run` first to inspect a proposed grant without creating a client. Default output is redacted. The credential handoff is written with private permissions before any optional client installation or verification. Transfer it through a private file channel, then retain only the copies you need. Uploading credentials or backups is never automatic.
 
@@ -40,11 +91,11 @@ Use `--dry-run` first to inspect a proposed grant without creating a client. Def
 | `memory-reader` | Read selected memory | Starter |
 | `memory-writer` | Read and write selected memory | Starter |
 | `coding-agent` | Isolated project writes and explicit project reads | Starter |
-| `operator` | Read, write, and administration | Full |
+| `operator` | Read, write, and eligible brain administration operations | Full |
 | `delegating-agent` | Memory plus explicitly bound delegation | Starter |
 | `full` | All eligible remote capabilities at grant time, including bound delegation | Full |
 
-A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
+A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation or owner dashboard/client-management authority. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
 
 New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. Explicitly regrant to include them. Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
 
@@ -92,6 +143,7 @@ gbrain mcp grant research-example --harness grok-bot \
   --profile delegating-agent --source default \
   --bound-tools search,get_page --delegated-namespace job \
   --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
   --credentials-out /absolute/private/research-example.json --json
 ```
 
@@ -112,10 +164,18 @@ Preview an explicit profile update:
 ```bash
 gbrain mcp grant agent-example --client CLIENT_ID --if-version REVISION \
   --harness codex --profile memory-reader --source default \
-  --url https://brain.example.com/mcp --dry-run --json
+  --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token --dry-run --json
 ```
 
-Review the before/after grant, then repeat without `--dry-run`. `--if-version` rejects a stale edit. The client ID and secret remain unchanged. When updating a client, omit `--profile` to preserve its profile, scopes, operation snapshot, and bindings while changing only the fields you supply. An explicit profile selection regrants its eligible operations. For advanced repairs, use `gbrain auth rescope-client CLIENT_ID --help`; omitted restrictions are retained.
+Get the current revision with `gbrain mcp admin client CLIENT_ID` using the
+same server URL and owner credential. Review the before/after grant, then repeat
+without `--dry-run`. `--if-version` rejects a stale edit. The client ID and secret
+remain unchanged. When updating a client, omit `--profile` to preserve its
+profile, scopes, operation snapshot, and bindings while changing only the fields
+you supply. An explicit profile selection regrants its eligible operations.
+Advanced local-maintenance repairs remain available through `gbrain auth
+rescope-client CLIENT_ID --help`; omitted restrictions are retained.
 
 Scope removals affect existing tokens immediately. Added scopes need a newly issued access token; refresh cannot expand its original scope grant. Source, operation, fence, binding, and surface changes apply on the next authenticated request. Repairing bindings benefits an existing token that already carries `agent`. TTL changes apply only to newly issued tokens. New renewable connections use one-hour access tokens; static-token adapters use 30 days. Check the receipt for the selected expiry.
 
@@ -126,14 +186,32 @@ The host retains a private delivery journal before committing a new client. If t
 ```bash
 gbrain mcp grant agent-example --client CLIENT_ID --resume --harness codex \
   --url https://brain.example.com/mcp \
+  --admin-token-file /absolute/private/admin-token \
   --credentials-out /absolute/private/recovered-agent.json --json
 ```
 
-Add `--admin-token-file` when recovering through the running server. Resume changes no permissions and rotates no secret. If the client ID was lost, repeating the original creation reports the existing ID instead of creating a duplicate.
+Resume changes no permissions and rotates no secret. If the client ID was lost,
+use `gbrain mcp admin clients` with the same URL and owner credential and inspect
+the existing registration before retrying. A lost response can follow a
+committed mutation; it does not prove that creation failed.
 
-In the admin dashboard, use **Recover credentials** for an existing OAuth client. New confidential clients registered there use the same private host journal. If registration loses its response, the form looks up the existing client before offering recovery. Download the recovered handoff and set its permissions to `0600` on the target computer. Recovery refuses a revoked client or a journal whose secret has since been rotated.
+In the admin dashboard, use the existing client's setup/delivery action. New
+confidential clients use the same private host journal. If registration loses
+its response, inspect the existing client before recovery. Machine clients
+receive a machine handoff; native OAuth clients receive their distinct OAuth
+setup. Keep any secret-bearing download private and set its permissions to
+`0600` on the target computer. Recovery refuses a revoked client or a journal
+whose secret has since been rotated.
 
-An expired or lost **access token** can be reissued using the existing client secret. A lost **client secret**, when neither the handoff nor host delivery journal remains, requires explicit secret rotation. These are distinct operations; revoking a client is another separate operation. Protect or remove the host's `.gbrain/credential-deliveries` files deliberately after secure delivery; they contain credentials and are excluded from default backups.
+An expired or lost machine **access token** can be reissued using the existing
+client secret. For native OAuth, reconnect in the harness. A lost **client
+secret** requires journal/handoff recovery or an explicit maintenance decision;
+see [legacy rotation limits](../mcp/ADMIN.md#recover-a-failed-step). The local
+`agent register --reissue` path supports confidential machine clients and leaves
+outstanding access tokens valid; it is not a general remote/native-PKCE recovery
+command. Protect or remove the host's `.gbrain/credential-deliveries` files
+deliberately after secure delivery; they contain credentials and are excluded
+from default backups.
 
 ## Maintenance, removal, and troubleshooting
 
@@ -149,7 +227,12 @@ recover it through the host's delivery procedure first.
 
 Before this security migration, stop old servers and workers and take a protected backup. Start only runtimes that enforce the migrated grants. If rollout fails, disable the affected entry points and restore a compatible runtime while preserving memory and the tightened grants; do not run an older authorization implementation against the migrated database. Local installations can be released independently of hosted delegation.
 
-Remove a managed native configuration with the same private handoff and `gbrain connect ... --remove`. Disable saved skills/routines through the harness controls. Revoke the client on the host when its authority should end. Removing configuration alone does not revoke access or delete memory.
+Remove a managed configuration with the same private handoff and `gbrain connect
+... --remove`, or remove the native OAuth connection through its harness
+settings. Disable saved skills/routines through the harness controls. Use
+[token invalidation, revocation, or deletion](../mcp/ADMIN.md#invalidate-tokens-revoke-or-delete)
+when server authority should change. Removing configuration alone does not
+revoke access or delete memory.
 
 | Symptom | Next action |
 | --- | --- |
