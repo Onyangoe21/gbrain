@@ -1129,7 +1129,7 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
   const wrapperFile = receipt.service.wrapper_path;
   const tokenFile = receipt.admin_token_file;
   const plan = [
-    receipt.service.state === 'skipped' ? 'Service   none installed' : `Service   stop + remove ${serviceKindLabel(receipt.service.target)}`,
+    receipt.service.state === 'skipped' ? 'Service   none installed' : receipt.service.target === 'none' ? 'Service   manual — nothing to stop here (stop the wrapper process yourself); the wrapper file is deleted below' : `Service   stop + remove ${serviceKindLabel(receipt.service.target)}`,
     receipt.tailscale.binary ? `Tailscale turn off OUR :443 handler${receipt.mode === 'funnel' ? ' (funnel first)' : ''} — Tailscale stays installed and signed in` : 'Tailscale nothing to undo',
     inServeDir(wrapperFile)
       ? `Files     delete ${tildify(wrapperFile, d.home)} and ${tildify(receiptPath, d.home)}`
@@ -1168,8 +1168,9 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
     for (const note of r.notes) s.say(`Note: ${note}`);
     s.check('service', 'ok', r.removed.length ? `removed ${r.removed.join(', ')}` : 'stopped (no unit file to delete)');
   } else {
-    s.check('service', 'skipped', receipt.service.target === 'none' ? 'manual service: stop the wrapper process yourself if it is running' : 'none installed');
-    if (receipt.service.target === 'none' && receipt.service.state !== 'skipped') left.push('a manually started server process (if any)');
+    const manualLeft = receipt.service.target === 'none' && receipt.service.state !== 'skipped';
+    s.check('service', 'skipped', manualLeft ? 'manual service: stop the wrapper process yourself if it is running' : 'none installed');
+    if (manualLeft) left.push('a manually started server process (if any)');
   }
   // tailscale handler
   if (receipt.tailscale.binary || receipt.tailscale.dns_name) {

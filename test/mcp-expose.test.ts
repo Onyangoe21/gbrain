@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { mcpNeedsEngine, runMcp } from '../src/commands/mcp.ts';
 import { runMcpExpose, parseExposeArgs, MCP_EXPOSE_HELP, type McpExposeDeps } from '../src/commands/mcp-expose.ts';
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
-import { TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_FUNNEL_KB_URL, type CommandRunner, type CommandRunOptions } from '../src/core/tailscale.ts';
+import { TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_FUNNEL_KB_URL, type CommandRunner, type CommandRunOptions } from '../src/core/tailscale.ts';
 import { adminTokenPath, readExposeReceipt, receiptPath, wrapperPath, writeExposeReceipt, type ExposeReceipt } from '../src/core/serve-service.ts';
 
 const roots: string[] = [];
@@ -21,6 +21,15 @@ const DNS = 'your-machine.your-tailnet.ts.net';
 const TS = '/usr/bin/tailscale';
 const APP_TS = '/Applications/Tailscale.app/Contents/MacOS/Tailscale';
 const TOKEN = 'f'.repeat(64);
+/**
+ * Hermetic `fileExists`: every Tailscale binary candidate answers from the
+ * fake (`present`), never from the developer's real filesystem — a real
+ * Tailscale at /usr/local/bin, /opt/homebrew/bin or in /Applications must not
+ * leak into `findTailscaleBinary`. Other paths fall through to `existsSync`
+ * only under the test's tmp home.
+ */
+const hermeticExists = (home: string, present: (candidate: string) => boolean) => (p: string): boolean =>
+  TAILSCALE_BINARY_CANDIDATES.includes(p) ? present(p) : (p === home || p.startsWith(`${home}/`)) && existsSync(p);
 
 interface TailnetOpts {
   /** Path the fake tailscale answers under (default /usr/bin/tailscale; darwin runs use the app bundle). */
@@ -137,7 +146,7 @@ function fakeTailnet(o: TailnetOpts = {}): Fake {
     serveDir, gbrainEnvFile: join(home, '.gbrain', 'env'), plistPath: join(home, 'LaunchAgents', 'com.gbrain.serve.plist'), unitPath: join(home, '.config', 'systemd', 'user', 'gbrain-serve.service'),
     loadConfig: () => ({ engine: 'pglite', database_path: join(home, 'brain.pglite') } as never), executionEnv: 'local', run,
     which: (n) => (n === 'tailscale' ? TS : n === 'systemctl' ? '/usr/bin/systemctl' : n === 'gbrain' ? '/usr/local/bin/gbrain' : null),
-    fileExists: (p) => p === ts || existsSync(p),
+    fileExists: hermeticExists(home, (p) => p === ts),
     fetch: async (url) => {
       fetches.push(url);
       if (url.startsWith('http://127.0.0.1:')) {
@@ -163,7 +172,7 @@ function fakeMac(o: TailnetOpts = {}): Fake {
   f.deps.platform = 'darwin';
   f.deps.uid = 501;
   f.deps.which = (n) => (n === 'brew' ? '/opt/homebrew/bin/brew' : n === 'gbrain' ? '/usr/local/bin/gbrain' : null);
-  f.deps.fileExists = (p) => p === APP_TS || existsSync(p);
+  f.deps.fileExists = hermeticExists(f.home, (p) => p === APP_TS);
   return f;
 }
 
@@ -324,7 +333,7 @@ describe('tailscale steps', () => {
       return inner(argv, o);
     };
     f.deps.which = (n) => (n === 'tailscale' ? (installed ? TS : null) : n === 'systemctl' ? '/usr/bin/systemctl' : n === 'gbrain' ? '/usr/local/bin/gbrain' : null);
-    f.deps.fileExists = (p) => (p === TS ? installed : existsSync(p));
+    f.deps.fileExists = hermeticExists(f.home, (p) => p === TS && installed);
     expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
     const doc = jsonDoc(f);
     expect(checkOf(doc, 'tailscale.binary')?.detail).toContain(`installed: ${TS}`);
@@ -691,7 +700,7 @@ describe('happy path: darwin (launchd, app-bundle CLI)', () => {
       if (argv[0] === 'open') { f.calls.push(argv); return { status: 1, stdout: '', stderr: 'LSOpenURLsWithRole() failed' }; }
       return inner(argv, o);
     };
-    f.deps.fileExists = (p) => (p === APP_TS ? installed : existsSync(p));
+    f.deps.fileExists = hermeticExists(f.home, (p) => p === APP_TS && installed);
     expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
     const calls = joinedCalls(f);
     const brewAt = calls.indexOf('brew install --cask tailscale-app');
@@ -717,7 +726,7 @@ describe('happy path: darwin (launchd, app-bundle CLI)', () => {
         if (argv.join(' ') === `${APP_TS} status --json`) { statusReads++; f.calls.push(argv); if (statusReads <= readyAfterFailures) return DOWN; }
         return inner(argv, o);
       };
-      f.deps.fileExists = (p) => (p === APP_TS ? installed : existsSync(p));
+      f.deps.fileExists = hermeticExists(f.home, (p) => p === APP_TS && installed);
       return { f, slept, reads: () => statusReads };
     };
     // fast-ready: the first poll finds the daemon down, the second finds it up → the login step's own read is the third and the run proceeds
@@ -986,6 +995,20 @@ describe('--remove', () => {
     expect(await runMcpExpose(['--remove', '--yes'], f.deps)).toBe(0);
     expect(joinedCalls(f).some(c => c.startsWith('systemctl'))).toBe(false);
     expect(f.stdout.join('\n')).toContain('manually started server process');
+    // the plan says what the step then does: nothing to stop through a supervisor, the wrapper file goes
+    expect(f.stdout.join('\n')).toContain('Service   manual — nothing to stop here (stop the wrapper process yourself); the wrapper file is deleted below');
+    expect(f.stdout.join('\n')).not.toContain('stop + remove');
+  });
+  test('--remove after a --no-service publish (target none, state skipped) → service "none installed", no manual-process note', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--no-service', '--json'], f.deps)).toBe(0);
+    expect(jsonDoc(f).receipt.service).toMatchObject({ target: 'none', state: 'skipped' });
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
+    const doc = jsonDoc(f);
+    expect(checkOf(doc, 'plan')?.detail).toContain('Service   none installed');
+    expect(checkOf(doc, 'service')).toMatchObject({ status: 'skipped', detail: 'none installed' });
+    expect(f.stderr.join('\n')).not.toContain('manually started server process');
   });
   test('--remove removes a service that exists even when the receipt says skipped (defensive probe)', async () => {
     const f = fakeTailnet();
@@ -1257,7 +1280,7 @@ describe('--status edges', () => {
     const g = fakeTailnet();
     expect(await runMcpExpose(['--yes'], g.deps)).toBe(0);
     g.deps.which = (n) => (n === 'systemctl' ? '/usr/bin/systemctl' : n === 'gbrain' ? '/usr/local/bin/gbrain' : null);
-    g.deps.fileExists = (p) => p !== TS && existsSync(p);
+    g.deps.fileExists = hermeticExists(g.home, () => false); // the binary vanished; no candidate answers
     g.stdout.length = 0;
     expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(1);
     expect(checkOf(jsonDoc(g), 'tailscale.publish')).toMatchObject({ status: 'fail', detail: 'tailscale binary not found' });
@@ -1269,7 +1292,7 @@ describe('--remove edges', () => {
     const f = fakeTailnet();
     expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
     f.deps.which = (n) => (n === 'systemctl' ? '/usr/bin/systemctl' : null);
-    f.deps.fileExists = (p) => p !== TS && existsSync(p);
+    f.deps.fileExists = hermeticExists(f.home, () => false); // the binary vanished; no candidate answers
     f.stdout.length = 0;
     f.calls.length = 0;
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
