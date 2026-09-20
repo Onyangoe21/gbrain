@@ -1,7 +1,7 @@
 # TODOS
 
 
-## Remote MCP over Tailscale follow-ups (filed 2026-09-17, `gbrain mcp expose` wave)
+## Remote MCP over Tailscale follow-ups (filed 2026-09-17, follow-up from v0.51.3.0, `gbrain mcp expose` wave)
 
 - [ ] **P2 — Real-tailnet e2e door for `gbrain mcp expose`.**
   **What:** the expose tests run against a fake Tailscale runner in a tmpdir; nothing in CI has issued a real MagicDNS certificate, run `tailscale serve --bg` / `funnel --bg`, or fetched `https://<name>/health` from another node. **Fix:** a `GBRAIN_TAILSCALE_E2E=1`-gated door test (skips visibly without it) that runs `gbrain mcp expose --yes --no-service` on a host already joined to a throwaway tailnet, asserts the receipt and the tailnet health probe, then `--remove` leaves the serve config clean. Record the observed Tailscale version in `docs/guides/harness-validation.md`. **Effort:** M. **Priority:** P2.
