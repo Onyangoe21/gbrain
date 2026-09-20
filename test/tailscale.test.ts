@@ -6,9 +6,9 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
-  classifyTailscaleError, findProxiedHandler, findRootHandlers, findTailscaleBinary, normalizeDnsName, parseServeStatus,
-  parseTailscaleStatus, publicUrlFromDnsName, tailscaleInstallPlan, tailscaleLoginArgv, tailscaleServeArgv, tailscaleServeOffArgv,
-  tailscaleUpArgv, TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL,
+  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, normalizeDnsName, parseServeStatus,
+  parseServeStatusStrict, parseTailscaleStatus, publicUrlFromDnsName, tailscaleInstallPlan, tailscaleLoginArgv, tailscaleServeArgv, tailscaleServeOffArgv,
+  TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL,
   TAILSCALE_FUNNEL_CAPABILITY, TAILSCALE_FUNNEL_KB_URL, type CommandRunOptions,
 } from '../src/core/tailscale.ts';
 
@@ -120,7 +120,7 @@ describe('argv builders', () => {
     const mac = tailscaleLoginArgv('darwin', 'alice-example', '/Applications/Tailscale.app/Contents/MacOS/Tailscale');
     expect(mac.setOperator).toBeUndefined();
     expect(mac.up).toEqual(['/Applications/Tailscale.app/Contents/MacOS/Tailscale', 'up']);
-    expect(tailscaleUpArgv('linux', 'alice-example')).toEqual(['sudo', 'tailscale', 'up']);
+    expect(tailscaleLoginArgv('linux', 'alice-example').up).toEqual(['sudo', 'tailscale', 'up']);
   });
   test('CommandRunOptions carries the --json stdout redirect flag', () => {
     const opts: CommandRunOptions = { inherit: true, stdoutToStderr: true, timeoutMs: 10 };
@@ -146,6 +146,21 @@ describe('parseServeStatus + handler lookup', () => {
       expect(view.https443).toBe(false);
       expect(findProxiedHandler(view, 3131)).toBeNull();
     }
+  });
+  test('parseServeStatusStrict: an empty document / {} / null is the legitimately empty view, but non-JSON, an array or a scalar is null (fail closed)', () => {
+    for (const raw of ['', '   \n', '{}', 'null', JSON.stringify({ Web: { 'h:443': {} } })]) {
+      const view = parseServeStatusStrict(raw);
+      expect(view).not.toBeNull();
+      expect(view!.handlers).toEqual([]);
+      expect(view!.https443).toBe(false);
+    }
+    for (const raw of ['not json', 'failed to connect to local Tailscale service; is Tailscale running?', '[1,2]', '"str"', '42', 'true', '{broken']) {
+      expect(parseServeStatusStrict(raw)).toBeNull();
+      // the tolerant parser still degrades the same input to an empty view
+      expect(parseServeStatus(raw).handlers).toEqual([]);
+    }
+    expect(parseServeStatusStrict(JSON.stringify(SERVE_DOC))).toEqual(parseServeStatus(JSON.stringify(SERVE_DOC)));
+    expect(findProxiedHandler(parseServeStatusStrict(JSON.stringify(SERVE_DOC))!, 3131)?.proxyPort).toBe(3131);
   });
   test('a non-root or non-443 handler is not a root handler; funnel defaults off', () => {
     const view = parseServeStatus(JSON.stringify({
@@ -229,5 +244,79 @@ describe('classifyTailscaleError', () => {
     expect(c.raw).toBe('something odd happened');
     expect(c.fix).toContain('something odd happened');
     expect(classifyTailscaleError('').fix).toContain('without output');
+  });
+});
+
+describe('defaultCommandRunner (real spawn, hermetic commands only)', () => {
+  test('pipes stdout/stderr with the exit status; a missing binary never throws; a timeout yields status null; inherit mode captures nothing', async () => {
+    expect(await defaultCommandRunner(['sh', '-c', 'printf out; printf err >&2; exit 3'])).toEqual({ status: 3, stdout: 'out', stderr: 'err' });
+    const missing = await defaultCommandRunner(['/nonexistent/definitely-not-tailscale', 'status', '--json']);
+    expect(missing.status).toBeNull();
+    expect(missing.stdout).toBe('');
+    expect(missing.stderr).toMatch(/ENOENT|no such file/i);
+    const killed = await defaultCommandRunner(['sh', '-c', 'sleep 5'], { timeoutMs: 50 });
+    expect(killed.status).toBeNull();
+    expect(killed.stderr).toContain('(timed out after 50ms)');
+    // inherit (login / installer): nothing is captured, the child's status still comes back
+    expect(await defaultCommandRunner(['sh', '-c', 'exit 7'], { inherit: true, stdoutToStderr: true })).toEqual({ status: 7, stdout: '', stderr: '' });
+  });
+});
+
+describe('parseServeStatus edges', () => {
+  test('proxy ports: scheme defaults when no port is given, out-of-range → null, a path suffix is ignored, non-proxy handlers carry null', () => {
+    const view = parseServeStatus(JSON.stringify({
+      Web: {
+        'a.ts.net:443': { Handlers: { '/': { Proxy: 'http://localhost' } } },
+        'b.ts.net:443': { Handlers: { '/': { Proxy: 'https://svc.internal' } } },
+        'c.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:99999' } } },
+        'd.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:3131/base' } } },
+        'e.ts.net:443': { Handlers: { '/': { Path: '/var/www' } } },
+      },
+    }));
+    const byHost = Object.fromEntries(view.handlers.map(h => [h.host, h]));
+    expect(byHost['a.ts.net'].proxyPort).toBe(80);
+    expect(byHost['b.ts.net'].proxyPort).toBe(443);
+    expect(byHost['c.ts.net'].proxyPort).toBeNull();
+    expect(byHost['d.ts.net'].proxyPort).toBe(3131);
+    expect(byHost['e.ts.net']).toMatchObject({ proxy: null, proxyPort: null, tcpForward: null });
+    expect(findProxiedHandler(view, 3131)?.host).toBe('d.ts.net');
+    expect(findRootHandlers(view)).toHaveLength(5);
+  });
+  test('Web keys without a port or with a non-numeric port default to 443; AllowFunnel false is not funnel; a Foreground block brings its own AllowFunnel and HTTPS flag', () => {
+    const view = parseServeStatus(JSON.stringify({
+      Web: {
+        'bare.ts.net': { Handlers: { '/': { Proxy: 'http://127.0.0.1:1' } } },
+        'odd.ts.net:abc': { Handlers: { '/': { Proxy: 'http://127.0.0.1:2' } } },
+      },
+      AllowFunnel: { 'bare.ts.net': false, 'odd.ts.net:abc': true },
+      Foreground: {
+        '7': { TCP: { '443': { HTTPS: true } }, Web: { 'fg.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:5000' } } } }, AllowFunnel: { 'FG.ts.net:443': true } },
+      },
+    }));
+    expect(view.https443).toBe(true); // only the foreground block carries TCP 443 HTTPS
+    expect(view.funnelHosts).toEqual(['odd.ts.net:abc']); // root list stays root-only (false filtered)
+    const bare = view.handlers.find(h => h.host === 'bare.ts.net')!;
+    expect(bare).toMatchObject({ port: 443, funnel: false, foreground: false });
+    const odd = view.handlers.find(h => h.host === 'odd.ts.net')!;
+    expect(odd).toMatchObject({ port: 443, funnel: true, foreground: false });
+    const fg = view.handlers.find(h => h.host === 'fg.ts.net')!;
+    expect(fg).toMatchObject({ port: 443, funnel: true, foreground: true, proxyPort: 5000 });
+    expect(findRootHandlers(view)).toHaveLength(3);
+  });
+});
+
+describe('parseTailscaleStatus tolerance + classifier defaults', () => {
+  test('non-object Self/CurrentTailnet, mixed-type arrays and non-string scalars degrade to safe defaults', () => {
+    const st = parseTailscaleStatus(JSON.stringify({ BackendState: 7, Self: 'nope', CurrentTailnet: [1], CertDomains: ['a.ts.net', 3, null], Version: 12 }))!;
+    expect(st).toEqual({ backendState: 'NoState', dnsName: null, tailscaleIps: [], magicDnsEnabled: null, certDomains: ['a.ts.net'], funnelCapable: null, version: null });
+    const ips = parseTailscaleStatus(JSON.stringify({ Self: { TailscaleIPs: ['100.64.0.1', 5, null, 'fd7a::1'], CapMap: [] }, CurrentTailnet: { MagicDNSEnabled: 'yes' } }))!;
+    expect(ips.tailscaleIps).toEqual(['100.64.0.1', 'fd7a::1']);
+    expect(ips.funnelCapable).toBeNull(); // an array-shaped CapMap is not a capability map
+    expect(ips.magicDnsEnabled).toBeNull();
+  });
+  test('classifyTailscaleError without a user falls back to $USER in the operator remedy and to the flagless up for login', () => {
+    expect(classifyTailscaleError('access denied', { platform: 'linux' }).fix).toContain('sudo tailscale set --operator=$USER');
+    expect(classifyTailscaleError('Logged out', { platform: 'linux' }).fix).toContain('`sudo tailscale up`');
+    expect(classifyTailscaleError('not logged in', { platform: 'darwin' }).fix).toContain('`tailscale up`');
   });
 });

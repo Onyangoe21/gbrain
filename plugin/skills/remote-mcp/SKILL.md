@@ -144,7 +144,10 @@ Relay every prompt the command surfaces:
 | `tailscale_needs_login` | Linux: `sudo tailscale set --operator=$USER` then `sudo tailscale up`; macOS: `tailscale up` or open the Tailscale app and sign in; then re-run |
 | `tailscale_daemon_not_running` (exit 2) | macOS `open -a Tailscale`; Linux `sudo systemctl enable --now tailscaled`; then re-run |
 | `foreign_serve_config` — "tailscale serve already proxies :443 to …" (exit 1) | Show the user what the existing handler proxies (`tailscale serve status`); only `--force` on their explicit yes. A handler owned by another terminal's foreground `tailscale serve` session cannot be taken over — it must be stopped in that terminal |
-| `foreign_listener` — "A server already listens on 127.0.0.1:<port>" (exit 1, refused BEFORE anything is published) | Stop the other process, pick another `--port`, or pass `--no-service` to publish it as-is |
+| `foreign_listener` — "Something already answers on 127.0.0.1:<port> and no expose receipt claims it" (exit 1, refused BEFORE anything is published; ANY answer counts, a 404 too) | Stop the other process, pick another `--port`, or pass `--no-service` to publish it as-is. If it is a gbrain server left by an interrupted run, `gbrain mcp expose --remove --yes` first (receipt-less recovery) |
+| `no_brain_config` (exit 1, `plan` fails) — "No brain is configured on this host (gbrain init first), so a service would only crash-loop" | Run `gbrain init` on this host first, then re-run; or pass `--no-service` to only publish a server the operator starts themselves. Never install the service around a missing brain |
+| `pglite_lock` warn — "a live process holds this PGLite brain (pid N, …)" | Tell the user which process holds the lock; the service cannot start until it exits. Stop it (or route to [postgres-adopt](../postgres-adopt/SKILL.md) for concurrent use), then `gbrain mcp expose --status` |
+| "could not read tailscale serve status" — `tailscale.publish` fails (publish: exit 1 `tailscale_<kind>`, nothing published; `--status`: exit 1; `--remove`: exit 1 `tailscale_serve_status_unreadable`, receipt + wrapper kept) | The command fails closed instead of guessing. Run `tailscale serve status --json`, apply the classified fix (operator / daemon / login), then re-run the same command |
 | `service: manual` (no supervisor: cloud sandbox, container) | Relay the printed foreground and `nohup … &` commands; this is a documented outcome, not a failure |
 | `verify.local: warn` (exit 2, `local_health_timeout`) | The service was installed but `/health` did not answer within the wait; check `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status` |
 | `verify.tailnet: pending` (exit 2, `tailnet_health_pending`) | First certificate issuance can take a minute; `gbrain mcp expose --status` later |
@@ -209,8 +212,11 @@ Host-side check at any time: `gbrain mcp expose --status`. Undo everything
 this skill installed: `gbrain mcp expose --remove` (stops and removes the
 service — also when the receipt says it was skipped but the unit exists —
 clears only gbrain's serve/funnel handler, keeps Tailscale installed and
-signed in, keeps the admin token unless `--force`). Declining the prompt exits
-2 with "Nothing changed."; a `--no-service` re-run keeps an existing service.
+signed in, keeps the admin token unless `--force`; without a receipt — an
+interrupted publish — it recovers from what is on disk: the wrapper, the
+unit and the `:443` handler for `--port`, default 3131, leaving the token).
+Declining the prompt exits 2 with "Nothing changed."; a `--no-service` re-run
+keeps an existing service.
 
 ## PGLite single-writer note
 

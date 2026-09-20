@@ -2,7 +2,7 @@
  * Tailscale CLI seam for `gbrain mcp expose`.
  *
  * Everything here is either pure (parsers, argv builders, error classifier,
- * URL constants) or goes through the injectable `TailscaleRunner` exec seam,
+ * URL constants) or goes through the injectable `CommandRunner` exec seam,
  * so the command that drives a real tailnet can be tested against a fake
  * runner in a tmpdir with no `tailscale` binary present.
  *
@@ -74,7 +74,6 @@ export interface CommandRunOptions {
  * the spawn error in `stderr`, so callers classify instead of crashing.
  */
 export type CommandRunner = (argv: string[], opts?: CommandRunOptions) => Promise<CommandResult>;
-export type TailscaleRunner = CommandRunner;
 
 export const defaultCommandRunner: CommandRunner = async (argv, opts = {}) => {
   try {
@@ -200,11 +199,6 @@ export interface TailscaleLoginArgv {
 export function tailscaleLoginArgv(platform: string, user: string, binary = 'tailscale'): TailscaleLoginArgv {
   if (platform === 'linux') return { setOperator: ['sudo', binary, 'set', `--operator=${user}`], up: ['sudo', binary, 'up'] };
   return { up: [binary, 'up'] };
-}
-
-/** The flagless `up` argv alone (`tailscaleLoginArgv(...).up`). */
-export function tailscaleUpArgv(platform: string, user: string, binary = 'tailscale'): string[] {
-  return tailscaleLoginArgv(platform, user, binary).up;
 }
 
 export function tailscaleSetOperatorCommand(user: string): string {
@@ -371,15 +365,29 @@ function collectServeHandlers(block: ServeConfigLike, foreground: boolean, funne
  * block (marked `foreground: true`).
  */
 export function parseServeStatus(stdout: string): ServeStatusView {
+  return parseServeStatusStrict(stdout) ?? EMPTY_SERVE_VIEW;
+}
+
+/**
+ * Fail-closed variant for callers that act on the answer (publish / remove /
+ * status): an empty document, `null` or `{}` from a successful exit is a
+ * legitimately empty serve config and yields the empty view, but anything
+ * that is not JSON or not a JSON object (a stderr-style error line on stdout,
+ * an array, a scalar) yields null so the caller classifies stderr instead of
+ * mistaking "could not read" for "nothing configured".
+ */
+export function parseServeStatusStrict(stdout: string): ServeStatusView | null {
   const text = stdout.trim();
   if (!text) return EMPTY_SERVE_VIEW;
   let doc: ServeConfigLike;
   try {
-    const parsed = asObject<ServeConfigLike>(JSON.parse(text));
-    if (!parsed) return EMPTY_SERVE_VIEW;
-    doc = parsed;
+    const parsed: unknown = JSON.parse(text);
+    if (parsed === null) return EMPTY_SERVE_VIEW;
+    const obj = asObject<ServeConfigLike>(parsed);
+    if (!obj) return null;
+    doc = obj;
   } catch {
-    return EMPTY_SERVE_VIEW;
+    return null;
   }
   const allow = asObject<Record<string, unknown>>(doc.AllowFunnel) ?? {};
   const funnelHosts = Object.entries(allow).filter(([, v]) => v === true).map(([k]) => k.toLowerCase());

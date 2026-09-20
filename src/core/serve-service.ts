@@ -4,8 +4,10 @@
  *
  * Mirrors the hardening of the autopilot installer (src/commands/autopilot.ts)
  * without importing it: single-quote-escaped paths in the wrapper, plist
- * normalized to 0644 (launchd rejects group-writable agents), unload-before-
- * load (launchd) / enable + restart (systemd) so a reinstall relaunches the
+ * normalized to 0644 (launchd rejects group-writable agents), domain-explicit
+ * `launchctl bootout gui/<uid>` before `bootstrap gui/<uid>` (launchd; the
+ * legacy `unload`/`load` pair only when the installed launchctl does not know
+ * the modern verbs) / enable + restart (systemd) so a reinstall relaunches the
  * job, the running bun's directory prepended to PATH (rc files bail early
  * under a supervisor), `~/.gbrain/env`
  * sourced with `set -a`, and the admin token read from its 0600 file at RUN
@@ -19,14 +21,14 @@
  * wrapper, receipt) refuses a symlink at the target path: a planted link could
  * otherwise redirect a 0600 secret or a 0755 executable somewhere else.
  */
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { gbrainPath } from './config.ts';
 import { shellQuote } from './mcp-registration.ts';
 import type { ExecutionEnvironment } from './execution-env.ts';
-import type { CommandRunner } from './tailscale.ts';
+import type { CommandResult, CommandRunner } from './tailscale.ts';
 
 export const SERVE_LAUNCHD_LABEL = 'com.gbrain.serve';
 export const SERVE_SYSTEMD_UNIT = 'gbrain-serve.service';
@@ -93,21 +95,45 @@ export function refuseSymlink(path: string, what: string): void {
 // gbrain CLI resolution for the wrapper
 // ---------------------------------------------------------------------------
 
+export interface ResolveGbrainCommandDeps {
+  which?: (name: string) => string | null;
+  execPath?: string;
+  argv1?: string;
+  /** `import.meta.url` of this module (a compiled binary reports a `/$bunfs/` path). */
+  metaUrl?: string;
+  fileExists?: (path: string) => boolean;
+}
+
+/** Bun's own runtime binary (`bun`, `bun-profile`, `bun.exe`), as opposed to a compiled gbrain. */
+const BUN_RUNTIME_RE = /(^|[\\/])bun(-[a-z0-9-]+)?(\.exe)?$/i;
+/** A compiled binary's embedded entrypoint: `/$bunfs/root/...` (POSIX) or `B:\~BUN\...` (Windows). */
+const VIRTUAL_ENTRY_RE = /\$bunfs|~BUN/;
+
 /**
  * argv prefix baked into the wrapper: `[<gbrain shim>]`, or `[<execPath>]`
- * when the running binary is a compiled gbrain, else `[<bun>, <abs cli.ts>]`.
- * The wrapper falls back to `type -P gbrain` at run time when argv[0] is gone.
+ * when the running binary is a compiled gbrain (whatever its basename — a
+ * compiled Bun binary reports its embedded sources under `/$bunfs/` and has
+ * no real script in `argv[1]`), else `[<bun>, <abs cli.ts>]` when that
+ * `cli.ts` exists on disk; without it, `[<execPath>]` again rather than a
+ * path that cannot run. The wrapper falls back to `type -P gbrain` at run
+ * time when argv[0] is gone.
  */
-export function resolveServeGbrainCommand(deps: { which?: (name: string) => string | null; execPath?: string; argv1?: string } = {}): string[] {
+export function resolveServeGbrainCommand(deps: ResolveGbrainCommandDeps = {}): string[] {
   const which = deps.which ?? ((name: string) => { try { return Bun.which(name, { PATH: process.env.PATH ?? '' }); } catch { return null; } });
   const onPath = which('gbrain');
   if (onPath) return [onPath];
   const exec = deps.execPath ?? process.execPath ?? '';
-  if (exec.endsWith('/gbrain') || exec.endsWith('\\gbrain.exe')) return [exec];
   const arg1 = deps.argv1 ?? process.argv[1] ?? '';
+  const metaUrl = deps.metaUrl ?? import.meta.url;
+  const fileExists = deps.fileExists ?? ((p: string) => { try { return existsSync(p); } catch { return false; } });
+  const compiled = VIRTUAL_ENTRY_RE.test(metaUrl) || (!!exec && !BUN_RUNTIME_RE.test(exec) && (!arg1 || VIRTUAL_ENTRY_RE.test(arg1)));
+  if (compiled && exec) return [exec];
+  if (exec.endsWith('/gbrain') || exec.endsWith('\\gbrain.exe')) return [exec];
   if (arg1.endsWith('/gbrain') || arg1.endsWith('\\gbrain.exe')) return [arg1];
-  const cliTs = resolvePath(dirname(fileURLToPath(import.meta.url)), '..', 'cli.ts');
-  return [exec || 'bun', cliTs];
+  let cliTs: string | null = null;
+  try { cliTs = resolvePath(dirname(fileURLToPath(metaUrl)), '..', 'cli.ts'); } catch { cliTs = null; }
+  if (cliTs && fileExists(cliTs)) return [exec || 'bun', cliTs];
+  return [exec || 'bun'];
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +349,8 @@ export interface InstallServiceParams {
   plistPath?: string;
   /** Override the systemd unit path (default `<home>/.config/systemd/user/<unit>`). */
   unitPath?: string;
+  /** launchd domain owner for `bootout`/`bootstrap gui/<uid>` (default: the running process's uid, else 501). */
+  uid?: number;
 }
 
 export interface InstallServiceResult {
@@ -334,6 +362,46 @@ export interface InstallServiceResult {
   notes: string[];
   /** Set when the supervisor refused the job; the caller reports a failed check. */
   error?: string;
+}
+
+/** One-line reason for a failed supervisor call: its output, or the exit status when it printed nothing. */
+function describeFailure(r: CommandResult): string {
+  return (r.stderr || r.stdout).trim() || `exit ${r.status}`;
+}
+
+/** `launchctl bootstrap/bootout` (or legacy `load/unload`), `systemctl --user enable/restart/disable` may block on a wedged manager. */
+const SUPERVISOR_CHANGE_TIMEOUT_MS = 60_000;
+/** Read-only probes and reloads: `launchctl print`, `daemon-reload`, `is-active`, `loginctl enable-linger`. */
+const SUPERVISOR_PROBE_TIMEOUT_MS = 15_000;
+
+/** The launchctl on this Mac predates the domain-explicit verbs (macOS < 10.11 era, or a stripped build). */
+const LAUNCHCTL_LEGACY_RE = /Unknown command|unrecognized|not found/i;
+
+function defaultUid(): number {
+  return typeof process.getuid === 'function' ? process.getuid() : 501;
+}
+
+/**
+ * `launchctl bootout gui/<uid> <plist>` (modern, domain-explicit), falling
+ * back to legacy `launchctl unload <plist>` ONLY when launchctl itself does
+ * not know the verb (non-zero exit whose stderr says so). A "not loaded"
+ * failure is returned as is; callers ignore it.
+ */
+async function launchctlBootout(run: CommandRunner, uid: number, plist: string): Promise<CommandResult> {
+  const r = await run(['launchctl', 'bootout', `gui/${uid}`, plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
+  if (typeof r.status === 'number' && r.status !== 0 && LAUNCHCTL_LEGACY_RE.test(r.stderr)) {
+    return run(['launchctl', 'unload', plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
+  }
+  return r;
+}
+
+/** `launchctl bootstrap gui/<uid> <plist>`, legacy `launchctl load <plist>` under the same rule as `launchctlBootout`. */
+async function launchctlBootstrap(run: CommandRunner, uid: number, plist: string): Promise<{ result: CommandResult; verb: 'bootstrap' | 'load' }> {
+  const r = await run(['launchctl', 'bootstrap', `gui/${uid}`, plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
+  if (typeof r.status === 'number' && r.status !== 0 && LAUNCHCTL_LEGACY_RE.test(r.stderr)) {
+    return { result: await run(['launchctl', 'load', plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS }), verb: 'load' };
+  }
+  return { result: r, verb: 'bootstrap' };
 }
 
 function writeExecutable(path: string, content: string, mode: number, what: string): void {
@@ -350,34 +418,36 @@ export async function installServeService(p: InstallServiceParams): Promise<Inst
     const plist = p.plistPath ?? launchdPlistPath(p.home);
     writeExecutable(plist, renderServeLaunchdPlist({ wrapperPath: p.wrapperPath, home: p.home, logPath: p.logPath, errPath: p.errPath }), 0o644, 'the launchd plist');
     result.plist_path = plist;
-    // Unload-before-load: bare `launchctl load` on a loaded agent errors, and a
+    // Bootout-before-bootstrap: `bootstrap` over a loaded agent errors, and a
     // running server must relaunch to pick up a regenerated wrapper anyway.
-    await p.run(['launchctl', 'unload', plist]);
-    const load = await p.run(['launchctl', 'load', plist]);
-    if (load.status !== 0) result.error = `launchctl load failed: ${(load.stderr || load.stdout).trim() || `exit ${load.status}`}`;
+    // The bootout failure ("not loaded" on a fresh install) is ignored.
+    const uid = p.uid ?? defaultUid();
+    await launchctlBootout(p.run, uid, plist);
+    const boot = await launchctlBootstrap(p.run, uid, plist);
+    if (boot.result.status !== 0) result.error = `launchctl ${boot.verb} failed: ${describeFailure(boot.result)}`;
     return result;
   }
   if (p.target === 'linux-systemd') {
     const unit = p.unitPath ?? systemdUnitPath(p.home);
     writeExecutable(unit, renderServeSystemdUnit({ wrapperPath: p.wrapperPath, logPath: p.logPath, errPath: p.errPath }), 0o644, 'the systemd unit');
     result.unit_path = unit;
-    const reload = await p.run(['systemctl', '--user', 'daemon-reload']);
-    if (reload.status !== 0) result.notes.push(`systemctl --user daemon-reload: ${(reload.stderr || reload.stdout).trim() || `exit ${reload.status}`}`);
-    const enable = await p.run(['systemctl', '--user', 'enable', SERVE_SYSTEMD_UNIT]);
+    const reload = await p.run(['systemctl', '--user', 'daemon-reload'], { timeoutMs: SUPERVISOR_PROBE_TIMEOUT_MS });
+    if (reload.status !== 0) result.notes.push(`systemctl --user daemon-reload: ${describeFailure(reload)}`);
+    const enable = await p.run(['systemctl', '--user', 'enable', SERVE_SYSTEMD_UNIT], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
     if (enable.status !== 0) {
-      result.error = `systemctl --user enable ${SERVE_SYSTEMD_UNIT} failed: ${(enable.stderr || enable.stdout).trim() || `exit ${enable.status}`}`;
+      result.error = `systemctl --user enable ${SERVE_SYSTEMD_UNIT} failed: ${describeFailure(enable)}`;
       return result;
     }
     // `restart` (not `enable --now`): a reinstall regenerates the wrapper and
     // the running server must relaunch to pick it up; on a fresh install
     // restart simply starts it.
-    const restart = await p.run(['systemctl', '--user', 'restart', SERVE_SYSTEMD_UNIT]);
+    const restart = await p.run(['systemctl', '--user', 'restart', SERVE_SYSTEMD_UNIT], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
     if (restart.status !== 0) {
-      result.error = `systemctl --user restart ${SERVE_SYSTEMD_UNIT} failed: ${(restart.stderr || restart.stdout).trim() || `exit ${restart.status}`}`;
+      result.error = `systemctl --user restart ${SERVE_SYSTEMD_UNIT} failed: ${describeFailure(restart)}`;
       return result;
     }
     // Without linger the user manager stops at logout and takes the server with it.
-    const linger = await p.run(['loginctl', 'enable-linger']);
+    const linger = await p.run(['loginctl', 'enable-linger'], { timeoutMs: SUPERVISOR_PROBE_TIMEOUT_MS });
     if (linger.status !== 0) result.notes.push('loginctl enable-linger failed; the server stops when you log out. Fix: sudo loginctl enable-linger "$USER"');
     return result;
   }
@@ -390,6 +460,8 @@ export interface UninstallServiceParams {
   run: CommandRunner;
   plistPath?: string | null;
   unitPath?: string | null;
+  /** launchd domain owner for `bootout gui/<uid>` (default: the running process's uid, else 501). */
+  uid?: number;
 }
 
 export interface UninstallServiceResult { removed: string[]; notes: string[] }
@@ -398,16 +470,16 @@ export async function uninstallServeService(p: UninstallServiceParams): Promise<
   const out: UninstallServiceResult = { removed: [], notes: [] };
   if (p.target === 'macos') {
     const plist = p.plistPath ?? launchdPlistPath(p.home);
-    await p.run(['launchctl', 'unload', plist]);
+    await launchctlBootout(p.run, p.uid ?? defaultUid(), plist);
     if (existsSync(plist)) { unlinkSync(plist); out.removed.push(plist); }
     return out;
   }
   if (p.target === 'linux-systemd') {
     const unit = p.unitPath ?? systemdUnitPath(p.home);
-    const disable = await p.run(['systemctl', '--user', 'disable', '--now', SERVE_SYSTEMD_UNIT]);
-    if (disable.status !== 0) out.notes.push(`systemctl --user disable --now: ${(disable.stderr || disable.stdout).trim() || `exit ${disable.status}`}`);
+    const disable = await p.run(['systemctl', '--user', 'disable', '--now', SERVE_SYSTEMD_UNIT], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
+    if (disable.status !== 0) out.notes.push(`systemctl --user disable --now: ${describeFailure(disable)}`);
     if (existsSync(unit)) { unlinkSync(unit); out.removed.push(unit); }
-    await p.run(['systemctl', '--user', 'daemon-reload']);
+    await p.run(['systemctl', '--user', 'daemon-reload'], { timeoutMs: SUPERVISOR_PROBE_TIMEOUT_MS });
     return out;
   }
   return out;
@@ -415,14 +487,14 @@ export async function uninstallServeService(p: UninstallServiceParams): Promise<
 
 export async function serveServiceState(p: { target: ServiceTarget; run: CommandRunner; uid?: number }): Promise<ServiceState> {
   if (p.target === 'macos') {
-    const uid = p.uid ?? (typeof process.getuid === 'function' ? process.getuid() : 501);
-    const r = await p.run(['launchctl', 'print', `gui/${uid}/${SERVE_LAUNCHD_LABEL}`]);
+    const uid = p.uid ?? defaultUid();
+    const r = await p.run(['launchctl', 'print', `gui/${uid}/${SERVE_LAUNCHD_LABEL}`], { timeoutMs: SUPERVISOR_PROBE_TIMEOUT_MS });
     if (r.status === null) return 'unknown';
     if (r.status !== 0) return 'not-installed';
     return /state\s*=\s*running/i.test(r.stdout) ? 'running' : 'loaded';
   }
   if (p.target === 'linux-systemd') {
-    const r = await p.run(['systemctl', '--user', 'is-active', SERVE_SYSTEMD_UNIT]);
+    const r = await p.run(['systemctl', '--user', 'is-active', SERVE_SYSTEMD_UNIT], { timeoutMs: SUPERVISOR_PROBE_TIMEOUT_MS });
     if (r.status === null) return 'unknown';
     const word = r.stdout.trim().split(/\s+/)[0] ?? '';
     if (word === 'active' || word === 'activating' || word === 'reloading') return 'running';
@@ -455,14 +527,37 @@ export interface ExposeReceipt {
   engine: 'pglite' | 'postgres' | 'unknown';
 }
 
-/** Malformed or missing → null; a symlink at `path` throws (never follow a planted link). */
+const RECEIPT_MODES: readonly string[] = ['tailnet', 'funnel'];
+const RECEIPT_TARGETS: readonly string[] = ['macos', 'linux-systemd', 'none'];
+
+const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+const isStringOrNull = (v: unknown): v is string | null => v === null || typeof v === 'string';
+
+/**
+ * Structural guard for a parsed receipt. Every field `--status` / `--remove`
+ * dereference without a null check must be present with the right type;
+ * anything less is treated as "no receipt" rather than crashing mid-command.
+ */
+function isExposeReceipt(v: unknown): v is ExposeReceipt {
+  if (!isRecord(v)) return false;
+  if (v.version !== 1 || typeof v.port !== 'number' || typeof v.public_url !== 'string') return false;
+  if (typeof v.mcp_url !== 'string' || typeof v.admin_url !== 'string' || typeof v.admin_token_file !== 'string') return false;
+  if (typeof v.mode !== 'string' || !RECEIPT_MODES.includes(v.mode)) return false;
+  const service = v.service;
+  if (!isRecord(service) || typeof service.wrapper_path !== 'string' || typeof service.state !== 'string') return false;
+  if (typeof service.target !== 'string' || !RECEIPT_TARGETS.includes(service.target)) return false;
+  const tailscale = v.tailscale;
+  if (!isRecord(tailscale) || !isStringOrNull(tailscale.binary) || !isStringOrNull(tailscale.dns_name)) return false;
+  return true;
+}
+
+/** Malformed, partial or missing → null; a symlink at `path` throws (never follow a planted link). */
 export function readExposeReceipt(path: string): ExposeReceipt | null {
   refuseSymlink(path, 'the expose receipt');
   try {
     if (!existsSync(path)) return null;
-    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<ExposeReceipt>;
-    if (!parsed || parsed.version !== 1 || typeof parsed.port !== 'number' || typeof parsed.public_url !== 'string') return null;
-    return parsed as ExposeReceipt;
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    return isExposeReceipt(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -473,8 +568,4 @@ export function writeExposeReceipt(path: string, receipt: ExposeReceipt): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
-}
-
-export function fileMode(path: string): number | null {
-  try { return statSync(path).mode & 0o777; } catch { return null; }
 }
