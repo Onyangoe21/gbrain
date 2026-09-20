@@ -51,7 +51,9 @@ This HTTP path uses the live database connection; do not open a second PGLite
 process, delete its lock, or start another server to obtain administration.
 
 - **Login:** `login-link` returns a sensitive, single-use URL for private delivery
-  to the requesting owner. Do not GET/fetch/open it for verification. If the
+  to the requesting owner. Explain in the handoff that the plain `/admin/` URL
+  requires an authenticated owner session; the owner signs in by opening the
+  returned login link. Do not GET/fetch/open it for verification. If the
   pending OAuth browser URL carries `oauth_request`, pass that ID through
   `login-link --oauth-request ID`. The native client retains its PKCE verifier.
 - **Inspect:** `clients` includes revoked registrations; `client ID` gives live
@@ -65,18 +67,26 @@ process, delete its lock, or start another server to obtain administration.
   delivery/recovery requires `--credentials-out PRIVATE_FILE`.
 - **Permissions:** `mcp grant NAME --client ID --if-version N --dry-run` previews
   before/after. Omitted restrictions remain unchanged. Repeat without dry-run
-  when the reviewed action is within the user's authorization.
+  when the reviewed action is within the user's authorization. In the receipt,
+  explain both consequences: removed authority applies immediately; expanded
+  scopes require fresh native authorization or a newly issued machine token.
+  Refresh cannot expand the original scope grant.
 - **End access:** `invalidate-tokens ID`, `revoke ID`, and `delete ID` preview
   consequences by default; apply an authorized reviewed action with
-  `--yes --if-version N`. Invalidation retains the active client and allows new
-  machine tokens; revocation disables access; deletion removes its registration
-  while audit history remains. Never substitute one for another silently.
+  `--yes --if-version N`. Explain that invalidation removes access/refresh tokens
+  and authorization codes and invalidates pending approvals; it retains the
+  active client and secret, so machine credentials can obtain new tokens.
+  Revocation disables access; deletion removes its registration while audit
+  history remains. Never substitute one for another silently.
 
 A failed transport after a mutation was sent can mean **unknown outcome**.
 Inspect the existing client before retrying. Recover a committed secret delivery
 instead of creating a duplicate. Journal recovery is preferred to secret
 rotation. The legacy local `agent register --reissue` path has specific limits;
 consult ADMIN.md rather than inventing a remote rotation command.
+When handing recovered native setup back to a client, include both remaining
+connection steps: the native client starts PKCE authorization and the owner
+reviews and approves consent. Secret recovery alone establishes neither step.
 
 ## Native OAuth connection
 
@@ -84,6 +94,13 @@ The client initiates authorization and owns its verifier. Public PKCE uses
 `token_endpoint_auth_method: none` and has no secret. Confidential PKCE uses the
 client's actual POST/Basic method and a protected secret delivery. An
 `OAuthClientSetup` file is not a machine handoff for `gbrain connect`.
+
+Verify the connection with an authenticated call from the native harness, such
+as reading `gbrain://capabilities`. For an authorized memory round trip, follow
+the hosted guide and inspect the advertised tool schemas. Remote `recall` and
+`forget` operate on `world`-visible facts within the client's source grant: use
+only a harmless synthetic fixture with `visibility: "world"`, retain its returned
+ID for cleanup, and never change real private facts' visibility to pass a test.
 
 Owner login leads to a separate consent review. An expired request or server
 restart requires restarting the connection **in the native client**; a new

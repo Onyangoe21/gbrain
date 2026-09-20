@@ -769,6 +769,16 @@ It checks transport, authentication, effective permissions, reading, a randomize
 
 Now ask the actual agent to remember a unique harmless fact, with provenance, and note the observed GBrain call and returned ID. Start a new conversation and ask for it without repeating the fact. Observe `recall`. Correct it, read it back, then withdraw it and check active recall again. Keep the result in your private setup receipt. The harness must identify uncertainty if it cannot load the tool or retrieve the record.
 
+For native OAuth, make these calls through the harness's authenticated MCP
+connection; the private-handoff verifier above is for machine credentials.
+Inspect the advertised tool schemas before proposing arguments. Remote `recall`
+and `forget` operate on facts marked `visibility: "world"`, still restricted by
+the client's source grant. Use that explicit visibility only for the nonsensitive
+synthetic test fact and keep its returned ID for cleanup. A private test fact
+cannot be recalled or withdrawn through these remote operations. Never change
+real private facts' visibility to make verification pass. With read-only access,
+verify an authenticated capabilities/read call without adding write authority.
+
 `forget` withdraws a fact from active memory. History, source material, and backup copies may remain; it is not a promise of physical erasure. Verifier cleanup uses the same withdrawal semantics. Failed cleanup stays visible with the fixture identifier.
 
 ## Delegation is a separate capability
