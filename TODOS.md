@@ -1,6 +1,18 @@
 # TODOS
 
 
+## Remote MCP over Tailscale follow-ups (filed 2026-09-17, `gbrain mcp expose` wave)
+
+- [ ] **P2 — Real-tailnet e2e door for `gbrain mcp expose`.**
+  **What:** the expose tests run against a fake Tailscale runner in a tmpdir; nothing in CI has issued a real MagicDNS certificate, run `tailscale serve --bg` / `funnel --bg`, or fetched `https://<name>/health` from another node. **Fix:** a `GBRAIN_TAILSCALE_E2E=1`-gated door test (skips visibly without it) that runs `gbrain mcp expose --yes --no-service` on a host already joined to a throwaway tailnet, asserts the receipt and the tailnet health probe, then `--remove` leaves the serve config clean. Record the observed Tailscale version in `docs/guides/harness-validation.md`. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Verify the macOS app-bundle CLI for `up` and `serve`.**
+  **What:** on macOS `expose` installs `brew install --cask tailscale-app` and drives `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; the spec assumes that CLI accepts `up` (fallback message: open the app and sign in) and `serve --bg`. Neither has been observed on a real Mac in this wave. **Fix:** run the happy path and the not-logged-in path on macOS, pin any divergent stderr in `classifyTailscaleError`, and note the outcome in the harness-validation row. **Effort:** S. **Priority:** P2.
+- [ ] **P3 — Userspace-`tailscaled` recipe for joining a Grok Bot / Muse runtime to the tailnet.**
+  **What:** the decision table lists "cloud agent whose runtime you can join to your tailnet" as advanced and unverified; the guides say so. A recipe (ephemeral auth key, `tailscaled --tun=userspace-networking`, SOCKS/HTTP proxy for the thin CLI, what survives a runtime replacement) would let those users avoid Funnel. Must respect Sentinel / Bot egress policy and stay honest about persistence. **Effort:** M. **Priority:** P3.
+- [ ] **P2 — `gbrain connect --agent grok`** — already filed under the grok wave follow-ups ("P2 — `gbrain connect --agent grok`" in the GROK-CLI-PIN block below); the remote-mcp guide's local-agent hand-off would gain a Grok Build line once it lands. Do not duplicate; track there.
+- [ ] **P3 — Automatic pre-mint for `bootstrap harness` on PGLite when `expose` manages the service.**
+  **What:** `gbrain bootstrap harness --yes --port 3131` against an expose-managed PGLite server refuses to mint (`liveServeRefusal` in `src/core/bootstrap/harness.ts` — the database is held by the live serve); today the operator must pre-mint with `gbrain auth create <name> --scopes read,write` while the serve is stopped (or before `gbrain mcp expose`) and pass `--token <value>`; bootstrap has no admin-API mint path. The running server's `POST /admin/api/api-keys` can mint, but only full-access legacy bearers (no scopes), so it cannot serve the harness lane's least-privilege default — see the "PGLite admin-lane scoped minting" TODO in the bootstrap block. **Fix:** once that admin route carries scopes, when `~/.gbrain/serve/expose.json` exists read `admin_token_file` from the receipt and mint through the server automatically (consent line names the file; never print the token). Until then the scoped alternative is `gbrain mcp grant … --url http://127.0.0.1:3131/mcp --admin-token-file ~/.gbrain/serve/admin-token` + `gbrain connect … --install` (MCP wiring only, no per-turn hooks). **Effort:** S once unblocked. **Priority:** P3.
+
 ## Security fix wave follow-ups (filed 2026-09-15, follow-up from v0.50.5.0)
 
 - [ ] **P2 — cwd-`.env` quarantine: decide the remaining `GBRAIN_*` variables.**
