@@ -108,7 +108,7 @@ gbrain mcp expose --remove [--yes] [--json]
 | `--no-tailscale` | Skip Tailscale entirely: install the service on loopback only, publish nothing. Exclusive with `--funnel`. |
 | `--no-service` | Do not create a user service; only publish a server you run yourself. Also the way to publish from a host with no brain config (`no_brain_config`). |
 | `--no-install` | Never install Tailscale; print the install plan and exit 1 when it is missing. |
-| `--force` | Replace a `/` handler on `:443` that already proxies another local port. |
+| `--force` | Replace a `/` handler on `:443` that already proxies another local port. With `--remove`: also delete the admin token file, and — without a receipt — turn off a `:443` handler for `--port` that no wrapper, unit or service of gbrain's corroborates. |
 | `--dry-run` | Print the plan and stop (exit 0). Exclusive with `--status`. |
 | `--yes` | Skip the consent prompt (required for non-interactive runs). |
 | `--json` | One JSON document on stdout: `{ status, receipt, checks: [{name, status, detail}], next_actions, reason?, message? }`; prose goes to stderr. |
@@ -151,7 +151,11 @@ is on disk. It looks for the wrapper, the launchd plist / systemd unit (or a
 loaded service) and a `/` handler on `:443` that proxies to `--port` (default
 3131 — pass the port you published with), prints a "Recovering without a
 receipt" plan, asks for consent as usual, and removes exactly those artifacts
-(Funnel off first when it was on). The admin token file is left alone. When
+(Funnel off first when it was on). The handler is turned off only when
+something else of gbrain's corroborates it — the wrapper, the unit/plist, or
+the supervisor reporting the service — because another tool may proxy `:443`
+to the same port; a handler standing alone is reported and left in place
+(exit 0) until you pass `--force`. The admin token file is left alone. When
 nothing of gbrain's is found the answer stays "not exposed — nothing to
 remove", exit 0.
 
@@ -259,7 +263,7 @@ check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
 | `no_brain_config` (exit 1, `plan` fails) — "No brain is configured on this host (gbrain init first), so a service would only crash-loop; pass --no-service to publish a server you run yourself." | This host has no `gbrain` config (or it cannot be read), so `gbrain serve` would have nothing to open and the supervisor would restart it forever. Run `gbrain init` on this host first, then re-run; or pass `--no-service` to only publish a server you start yourself. `--dry-run` still shows the plan. |
 | `pglite_lock` warn — "a live process holds this PGLite brain (pid N, …): the service cannot start until it exits" | PGLite is single-writer and a process other than gbrain's own running service holds the lock, so the freshly installed service will crash-loop until it exits. Stop that process (or let it finish), then `gbrain mcp expose --status`; for concurrent local use move to Postgres ([ENGINES.md](../ENGINES.md)). The publish itself still completes. |
 | "could not read tailscale serve status" — `tailscale.publish` fails during publish (exit 1, reason `tailscale_<kind>`), `--status` (exit 1) or `--remove` (exit 1, `tailscale_serve_status_unreadable`; receipt and wrapper kept) | `tailscale serve status --json` exited non-zero, was killed, or printed something that is not JSON. The command fails closed rather than guess: nothing is published over, removed from, or reported about a config it could not read. Run `tailscale serve status --json` by hand and apply the classified fix (operator, daemon, login), then re-run the same command. |
-| An interrupted `gbrain mcp expose` (no receipt, but a handler / service / wrapper is left behind) | `gbrain mcp expose --remove --yes` (add `--port N` if you published a non-default port) recovers without a receipt: it removes the service, the wrapper and the `:443` handler proxying that port, and leaves the admin token. See [`--remove`](#--remove). |
+| An interrupted `gbrain mcp expose` (no receipt, but a handler / service / wrapper is left behind) | `gbrain mcp expose --remove --yes` (add `--port N` if you published a non-default port) recovers without a receipt: it removes the service, the wrapper and the `:443` handler proxying that port, and leaves the admin token. A handler with no wrapper, unit or service next to it is left in place until you add `--force`. See [`--remove`](#--remove). |
 | `foreign_serve_config` — "tailscale serve already proxies :443 to <target>. Re-run with --force to take it over, or pick another local port for that service." | A `/` handler on `:443` (a background config, another terminal's foreground `tailscale serve` session, or a raw TCP forward) already points somewhere else. Inspect it with `tailscale serve status` (the suggested next action), move that service, or — for a background handler only — re-run with `--force`; a foreground session must be stopped in its own terminal. |
 | `verify.local` warn / `local_health_timeout` (exit 2) | The service was installed but `http://127.0.0.1:<port>/health` did not answer within 20s; `verify.tailnet` is skipped. Read `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status`. |
 | `service: manual` (cloud sandbox, ephemeral container, no user bus) | There is no supervisor to keep the server alive. Run the printed foreground command, or the `nohup ~/.gbrain/serve/gbrain-serve.sh &` line, and re-run `--status`. On Linux without a user bus, `loginctl enable-linger $USER` may enable one. |

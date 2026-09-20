@@ -327,7 +327,7 @@ describe('receipt', () => {
     writeFileSync(path, 'nope');
     expect(readExposeReceipt(path)).toBeNull();
   });
-  test('a partial receipt (version/port/public_url only, or a wrong mode/target/tailscale shape) is treated as absent', () => {
+  test('a partial receipt (version/port/public_url only, or a wrong mode/target/tailscale/unit-path shape) is treated as absent', () => {
     const path = receiptPath(join(temp(), 'serve'));
     mkdirSync(join(path, '..'), { recursive: true });
     const cases: unknown[] = [
@@ -336,6 +336,8 @@ describe('receipt', () => {
       { ...receipt, mode: 'public' },
       { ...receipt, service: { ...receipt.service, target: 'windows' } },
       { ...receipt, service: { ...receipt.service, wrapper_path: null } },
+      { ...receipt, service: { ...receipt.service, unit_path: 7 } },
+      { ...receipt, service: { ...receipt.service, plist_path: undefined } },
       { ...receipt, service: 'linux-systemd' },
       { ...receipt, tailscale: { binary: 7, dns_name: null } },
       { ...receipt, tailscale: null },

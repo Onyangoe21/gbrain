@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
-  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, normalizeDnsName, parseServeStatus,
+  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, normalizeDnsName,
   parseServeStatusStrict, parseTailscaleStatus, publicUrlFromDnsName, tailscaleInstallPlan, tailscaleLoginArgv, tailscaleServeArgv, tailscaleServeOffArgv,
   TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL,
   TAILSCALE_FUNNEL_CAPABILITY, TAILSCALE_FUNNEL_KB_URL, type CommandRunOptions,
@@ -128,9 +128,9 @@ describe('argv builders', () => {
   });
 });
 
-describe('parseServeStatus + handler lookup', () => {
+describe('parseServeStatusStrict + handler lookup', () => {
   test('full ServeConfig → https443, one root handler proxying 3131 with funnel on', () => {
-    const view = parseServeStatus(JSON.stringify(SERVE_DOC));
+    const view = parseServeStatusStrict(JSON.stringify(SERVE_DOC))!;
     expect(view.https443).toBe(true);
     expect(view.handlers).toHaveLength(1);
     expect(view.handlers[0]).toMatchObject({ host: 'your-machine.your-tailnet.ts.net', port: 443, path: '/', proxy: 'http://127.0.0.1:3131', proxyPort: 3131, funnel: true, foreground: false, tcpForward: null });
@@ -139,36 +139,25 @@ describe('parseServeStatus + handler lookup', () => {
     expect(findProxiedHandler(view, 8080)).toBeNull();
     expect(findRootHandlers(view)).toHaveLength(1);
   });
-  test('absent fields, empty output and non-JSON all yield an empty view', () => {
-    for (const raw of ['', '   ', 'null', '{}', 'not json', JSON.stringify({ Web: { 'h:443': {} } })]) {
-      const view = parseServeStatus(raw);
-      expect(view.handlers).toEqual([]);
-      expect(view.https443).toBe(false);
-      expect(findProxiedHandler(view, 3131)).toBeNull();
-    }
-  });
-  test('parseServeStatusStrict: an empty document / {} / null is the legitimately empty view, but non-JSON, an array or a scalar is null (fail closed)', () => {
+  test('an empty document / {} / null / absent fields is the legitimately empty view, but non-JSON, an array or a scalar is null (fail closed)', () => {
     for (const raw of ['', '   \n', '{}', 'null', JSON.stringify({ Web: { 'h:443': {} } })]) {
       const view = parseServeStatusStrict(raw);
       expect(view).not.toBeNull();
       expect(view!.handlers).toEqual([]);
       expect(view!.https443).toBe(false);
+      expect(findProxiedHandler(view!, 3131)).toBeNull();
     }
     for (const raw of ['not json', 'failed to connect to local Tailscale service; is Tailscale running?', '[1,2]', '"str"', '42', 'true', '{broken']) {
       expect(parseServeStatusStrict(raw)).toBeNull();
-      // the tolerant parser still degrades the same input to an empty view
-      expect(parseServeStatus(raw).handlers).toEqual([]);
     }
-    expect(parseServeStatusStrict(JSON.stringify(SERVE_DOC))).toEqual(parseServeStatus(JSON.stringify(SERVE_DOC)));
-    expect(findProxiedHandler(parseServeStatusStrict(JSON.stringify(SERVE_DOC))!, 3131)?.proxyPort).toBe(3131);
   });
   test('a non-root or non-443 handler is not a root handler; funnel defaults off', () => {
-    const view = parseServeStatus(JSON.stringify({
+    const view = parseServeStatusStrict(JSON.stringify({
       Web: {
         'h.ts.net:443': { Handlers: { '/api': { Proxy: 'http://127.0.0.1:9000' } } },
         'h.ts.net:8443': { Handlers: { '/': { Proxy: 'http://localhost:3131' } } },
       },
-    }));
+    }))!;
     expect(view.handlers).toHaveLength(2);
     expect(findRootHandlers(view)).toEqual([]);
     expect(findProxiedHandler(view, 3131)).toBeNull();
@@ -176,13 +165,13 @@ describe('parseServeStatus + handler lookup', () => {
     expect(view.handlers.find(h => h.port === 8443)?.proxyPort).toBe(3131);
   });
   test('Foreground sessions fold in as foreground root handlers (another terminal owns them)', () => {
-    const view = parseServeStatus(JSON.stringify({
+    const view = parseServeStatusStrict(JSON.stringify({
       ...SERVE_DOC,
       Foreground: {
         '1234567890': { TCP: { '443': { HTTPS: true } }, Web: { 'your-machine.your-tailnet.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:9000' } } } } },
         'not-an-object': null,
       },
-    }));
+    }))!;
     expect(view.handlers).toHaveLength(2);
     const fg = view.handlers.find(h => h.proxyPort === 9000)!;
     // Same node, same host:443 — the root AllowFunnel entry applies to it too.
@@ -192,7 +181,7 @@ describe('parseServeStatus + handler lookup', () => {
     expect(findProxiedHandler(view, 9000)?.foreground).toBe(true);
   });
   test("TCP['443'].TCPForward surfaces as a non-proxy root handler on :443", () => {
-    const view = parseServeStatus(JSON.stringify({ TCP: { '443': { TCPForward: '127.0.0.1:5432' } } }));
+    const view = parseServeStatusStrict(JSON.stringify({ TCP: { '443': { TCPForward: '127.0.0.1:5432' } } }))!;
     expect(view.https443).toBe(false);
     expect(view.handlers).toHaveLength(1);
     expect(view.handlers[0]).toMatchObject({ port: 443, path: '/', proxy: null, proxyPort: null, tcpForward: '127.0.0.1:5432', foreground: false });
@@ -248,6 +237,18 @@ describe('classifyTailscaleError', () => {
 });
 
 describe('defaultCommandRunner (real spawn, hermetic commands only)', () => {
+  test('a child that ignores SIGTERM is SIGKILLed after the grace period: the runner returns (status null) instead of hanging', async () => {
+    // `trap "" TERM` then `exec` keeps the ignored disposition across exec, so the
+    // single `sleep` process survives the SIGTERM at 100ms and only the SIGKILL
+    // escalation (3s later) ends it — well before the 30s it would otherwise run.
+    const started = Date.now();
+    const r = await defaultCommandRunner(['bash', '-c', 'trap "" TERM; exec sleep 30'], { timeoutMs: 100 });
+    const elapsed = Date.now() - started;
+    expect(r.status).toBeNull();
+    expect(r.stderr).toContain('(timed out after 100ms)');
+    expect(elapsed).toBeGreaterThanOrEqual(3_000);
+    expect(elapsed).toBeLessThan(10_000);
+  }, 15_000);
   test('pipes stdout/stderr with the exit status; a missing binary never throws; a timeout yields status null; inherit mode captures nothing', async () => {
     expect(await defaultCommandRunner(['sh', '-c', 'printf out; printf err >&2; exit 3'])).toEqual({ status: 3, stdout: 'out', stderr: 'err' });
     const missing = await defaultCommandRunner(['/nonexistent/definitely-not-tailscale', 'status', '--json']);
@@ -262,9 +263,9 @@ describe('defaultCommandRunner (real spawn, hermetic commands only)', () => {
   });
 });
 
-describe('parseServeStatus edges', () => {
+describe('parseServeStatusStrict edges', () => {
   test('proxy ports: scheme defaults when no port is given, out-of-range → null, a path suffix is ignored, non-proxy handlers carry null', () => {
-    const view = parseServeStatus(JSON.stringify({
+    const view = parseServeStatusStrict(JSON.stringify({
       Web: {
         'a.ts.net:443': { Handlers: { '/': { Proxy: 'http://localhost' } } },
         'b.ts.net:443': { Handlers: { '/': { Proxy: 'https://svc.internal' } } },
@@ -272,7 +273,7 @@ describe('parseServeStatus edges', () => {
         'd.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:3131/base' } } },
         'e.ts.net:443': { Handlers: { '/': { Path: '/var/www' } } },
       },
-    }));
+    }))!;
     const byHost = Object.fromEntries(view.handlers.map(h => [h.host, h]));
     expect(byHost['a.ts.net'].proxyPort).toBe(80);
     expect(byHost['b.ts.net'].proxyPort).toBe(443);
@@ -283,7 +284,7 @@ describe('parseServeStatus edges', () => {
     expect(findRootHandlers(view)).toHaveLength(5);
   });
   test('Web keys without a port or with a non-numeric port default to 443; AllowFunnel false is not funnel; a Foreground block brings its own AllowFunnel and HTTPS flag', () => {
-    const view = parseServeStatus(JSON.stringify({
+    const view = parseServeStatusStrict(JSON.stringify({
       Web: {
         'bare.ts.net': { Handlers: { '/': { Proxy: 'http://127.0.0.1:1' } } },
         'odd.ts.net:abc': { Handlers: { '/': { Proxy: 'http://127.0.0.1:2' } } },
@@ -292,7 +293,7 @@ describe('parseServeStatus edges', () => {
       Foreground: {
         '7': { TCP: { '443': { HTTPS: true } }, Web: { 'fg.ts.net:443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:5000' } } } }, AllowFunnel: { 'FG.ts.net:443': true } },
       },
-    }));
+    }))!;
     expect(view.https443).toBe(true); // only the foreground block carries TCP 443 HTTPS
     expect(view.funnelHosts).toEqual(['odd.ts.net:abc']); // root list stays root-only (false filtered)
     const bare = view.handlers.find(h => h.host === 'bare.ts.net')!;

@@ -214,7 +214,9 @@ service — also when the receipt says it was skipped but the unit exists —
 clears only gbrain's serve/funnel handler, keeps Tailscale installed and
 signed in, keeps the admin token unless `--force`; without a receipt — an
 interrupted publish — it recovers from what is on disk: the wrapper, the
-unit and the `:443` handler for `--port`, default 3131, leaving the token).
+unit and the `:443` handler for `--port`, default 3131, leaving the token;
+the handler is turned off only when the wrapper, unit or service corroborates
+it — a handler standing alone is reported and left until `--force`).
 Declining the prompt exits 2 with "Nothing changed."; a `--no-service` re-run
 keeps an existing service.
 

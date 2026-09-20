@@ -61,13 +61,15 @@ node attribute) enabled — otherwise exit 2 with the admin URL to fix it.
 --no-service      Publish only; do not install or start the user service
 --no-install      Never install Tailscale; exit 1 with the install plan when it is missing
 --force           Take over a foreign tailscale serve handler on :443; with --remove also
-                  delete the admin token file
+                  delete the admin token file, and (without a receipt) turn off a :443 handler
+                  for --port that no wrapper, unit or service of gbrain's corroborates
 --dry-run         Print the plan and stop (exit 0, no changes)
 --yes             Skip the confirmation prompt (required when not on a TTY)
 --status          Re-probe the published server, the service and both health URLs
 --remove          Stop the service, clear our serve/funnel handler, delete wrapper + receipt.
                   Without a receipt (an interrupted run) it recovers from what is on disk:
-                  the wrapper, the launchd/systemd unit and the :443 handler for --port.
+                  the wrapper, the launchd/systemd unit and the :443 handler for --port (the
+                  handler only when the wrapper, unit or service corroborates it, or --force).
 --json            One JSON document on stdout; prose moves to stderr
 
 A host with no brain config is refused (no_brain_config) unless --no-service: a service there
@@ -89,6 +91,13 @@ export const MCP_EXPOSE_ARGUMENTS = {
 export const DEFAULT_EXPOSE_PORT = 3131;
 /** `tailscale serve|funnel --bg` is killed after this long — it blocks (waiting for an enablement step) rather than failing. */
 const PUBLISH_TIMEOUT_MS = 60_000;
+/** `tailscale serve|funnel --https=443 off`. */
+const SERVE_OFF_TIMEOUT_MS = 30_000;
+/** `tailscale status --json` and `tailscale serve status --json` (read-only). */
+const STATUS_READ_TIMEOUT_MS = 15_000;
+/** After `open -a Tailscale` on a fresh brew install: poll `status --json` this many times, this far apart, until the app's daemon answers. */
+const APP_DAEMON_POLL_ATTEMPTS = 20;
+const APP_DAEMON_POLL_INTERVAL_MS = 1_000;
 const SURFACES = ['verbs', 'starter', 'full'] as const;
 type Surface = (typeof SURFACES)[number];
 
@@ -300,14 +309,18 @@ function engineKind(cfg: GBrainConfig | null): ExposeReceipt['engine'] {
   return 'unknown';
 }
 
+/** One bounded fetch: the response (whatever its status), or null when it rejected (connection refused / timeout). */
+async function tryFetch(d: Resolved, url: string, timeoutMs: number): Promise<{ ok: boolean } | null> {
+  try {
+    return await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+  } catch {
+    return null;
+  }
+}
+
 /** Health: the fetch resolved AND answered 2xx (`res.ok`). Used by `verify.*` and `--status`. */
 async function probeHealth(d: Resolved, url: string, timeoutMs = 1_500): Promise<boolean> {
-  try {
-    const res = await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  return (await tryFetch(d, url, timeoutMs))?.ok === true;
 }
 
 /**
@@ -318,12 +331,7 @@ async function probeHealth(d: Resolved, url: string, timeoutMs = 1_500): Promise
  * listen" logic use this, never `probeHealth`.
  */
 async function probeOccupied(d: Resolved, url: string, timeoutMs = 1_500): Promise<boolean> {
-  try {
-    await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
-    return true;
-  } catch {
-    return false;
-  }
+  return (await tryFetch(d, url, timeoutMs)) !== null;
 }
 
 /**
@@ -360,20 +368,20 @@ interface ServeRead {
  * An empty document / `{}` / `null` from exit 0 is the legitimately empty view.
  */
 async function readServeView(d: Resolved, binary: string): Promise<ServeRead> {
-  const r = await d.run([binary, ...TAILSCALE_SERVE_STATUS_ARGV], { timeoutMs: 15_000 });
+  const r = await d.run([binary, ...TAILSCALE_SERVE_STATUS_ARGV], { timeoutMs: STATUS_READ_TIMEOUT_MS });
   const view = r.status === 0 ? parseServeStatusStrict(r.stdout) : null;
   return { view, stderr: r.stderr || (r.status !== 0 ? r.stdout : ''), status: r.status };
 }
 
-/** One line for a failed serve-status read: the classified stderr plus the exit status. */
-function describeServeReadFailure(d: Resolved, r: ServeRead): { kind: string; detail: string } {
+/** A failed serve-status read, classified: the error kind, one detail line (kind + raw stderr + exit status) and the operator fix. */
+function describeServeReadFailure(d: Resolved, r: ServeRead): { kind: string; detail: string; fix: string } {
   const cls = classifyTailscaleError(r.stderr, { platform: d.platform, user: d.user });
   const why = r.status === null ? 'killed or not spawned' : r.status === 0 ? 'exit 0 but stdout was not a JSON object' : `exit ${r.status}`;
-  return { kind: cls.kind, detail: `could not read tailscale serve status (${why}): ${cls.kind}${cls.raw ? `: ${cls.raw}` : ''}` };
+  return { kind: cls.kind, detail: `could not read tailscale serve status (${why}): ${cls.kind}${cls.raw ? `: ${cls.raw}` : ''}`, fix: cls.fix };
 }
 
 async function readStatus(d: Resolved, binary: string): Promise<{ status: TailscaleStatus | null; stderr: string; exit: number | null }> {
-  const r = await d.run([binary, ...TAILSCALE_STATUS_ARGV], { timeoutMs: 15_000 });
+  const r = await d.run([binary, ...TAILSCALE_STATUS_ARGV], { timeoutMs: STATUS_READ_TIMEOUT_MS });
   return { status: parseTailscaleStatus(r.stdout), stderr: r.stderr, exit: r.status };
 }
 
@@ -390,10 +398,16 @@ function tildify(path: string, home: string): string {
   return home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
+/** A supervisor reports our service as present when it is running or loaded (installed but not up yet). */
+const isLiveService = (s: ServiceState | 'skipped' | null | undefined) => s === 'running' || s === 'loaded';
+
+function serviceKindLabel(target: ServiceTarget): string {
+  return target === 'macos' ? `launchd ${SERVE_LAUNCHD_LABEL}` : target === 'linux-systemd' ? `systemd (user) ${SERVE_SYSTEMD_UNIT}` : 'manual wrapper';
+}
+
 function serviceLabel(target: ServiceTarget, state: ServiceState | 'skipped', d: Resolved): string {
-  if (target === 'macos') return `launchd ${SERVE_LAUNCHD_LABEL}, ${state}   (log: ${tildify(serveLogPath(d.serveDir), d.home)})`;
-  if (target === 'linux-systemd') return `systemd (user) ${SERVE_SYSTEMD_UNIT}, ${state}   (log: ${tildify(serveLogPath(d.serveDir), d.home)})`;
-  return `manual (no supervisor here) — wrapper: ${tildify(wrapperPathFor(d.serveDir), d.home)}`;
+  if (target === 'none') return `manual (no supervisor here) — wrapper: ${tildify(wrapperPathFor(d.serveDir), d.home)}`;
+  return `${serviceKindLabel(target)}, ${state}   (log: ${tildify(serveLogPath(d.serveDir), d.home)})`;
 }
 
 function manualCommands(d: Resolved, wrapper: string): { foreground: string; background: string } {
@@ -499,7 +513,7 @@ interface PublishedThisRun { binary: string; hadHandlerBefore: boolean }
  * disk (`receiptWritten`), nothing is torn down: `--remove` can find it all.
  * Returns the error to re-throw, its message naming the handler state.
  */
-async function rollbackAfterThrow(d: Resolved, s: Session, opts: ExposeOptions, published: PublishedThisRun | null, error: unknown, receiptWritten = false): Promise<Error> {
+async function rollbackAfterThrow(d: Resolved, s: Session, opts: ExposeOptions, published: PublishedThisRun | null, error: unknown, receiptWritten: boolean): Promise<Error> {
   const message = error instanceof Error ? error.message : String(error);
   if (receiptWritten) {
     // The early receipt is on disk: the handler and service are findable, so
@@ -516,7 +530,7 @@ async function rollbackAfterThrow(d: Resolved, s: Session, opts: ExposeOptions, 
   const offArgv = tailscaleServeOffArgv({ funnel: opts.funnel });
   let outcome: string;
   try {
-    const off = await d.run([published.binary, ...offArgv], { timeoutMs: 30_000 });
+    const off = await d.run([published.binary, ...offArgv], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
     outcome = off.status === 0 ? 'turned off again' : `NOT turned off (exit ${off.status ?? 'null'}; run \`tailscale serve status\`)`;
     s.check('rollback', off.status === 0 ? 'ok' : 'warn', `tailscale ${offArgv.join(' ')}: ${outcome}; no receipt written`);
   } catch (offError) {
@@ -602,7 +616,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
   // keeps the service from starting. A warning, not a stop — the operator may
   // be about to stop that process.
   const lockHolder = engine === 'pglite' && cfg?.database_path ? d.pgliteHolder(cfg.database_path) : null;
-  const ownService = existing !== null && (existing.service.state === 'running' || existing.service.state === 'loaded');
+  const ownService = existing !== null && isLiveService(existing.service.state);
   const lockWarning = lockHolder && !ownService
     ? `a live process holds this PGLite brain (pid ${lockHolder.pid}, ${lockHolder.command ?? (lockHolder.serve ? 'gbrain serve' : 'gbrain')}): the service cannot start until it exits — stop it, or move to Postgres`
     : null;
@@ -670,9 +684,14 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
       }
       if (installPlan.kind === 'brew-cask') {
         // The app bundle's CLI talks to the app's daemon, which only runs once
-        // the app has been opened. Best effort; give it a moment to come up.
+        // the app has been opened. Best effort: poll until `status --json`
+        // answers; if the budget runs out the login step below reports the
+        // daemon as not running.
         await d.run(['open', '-a', 'Tailscale'], { inherit: true, stdoutToStderr: opts.json, timeoutMs: 30_000 });
-        await d.sleep(5_000);
+        for (let attempt = 0; attempt < APP_DAEMON_POLL_ATTEMPTS; attempt++) {
+          await d.sleep(APP_DAEMON_POLL_INTERVAL_MS);
+          if ((await readStatus(d, binary)).status) break;
+        }
       }
       s.check('tailscale.binary', 'ok', `installed: ${binary}`);
     } else {
@@ -745,10 +764,9 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     if (!beforeRead.view) {
       // Fail closed: never publish over a serve config that could not be read.
       const failure = describeServeReadFailure(d, beforeRead);
-      const cls = classifyTailscaleError(beforeRead.stderr, { platform: d.platform, user: d.user });
       s.check('tailscale.publish', 'fail', failure.detail);
-      s.nextActions.push('tailscale serve status --json', cls.fix);
-      return s.finish('error', 1, { reason: `tailscale_${failure.kind}`, message: `Could not read the current \`tailscale serve status\`, so nothing was published. ${cls.fix}` });
+      s.nextActions.push('tailscale serve status --json', failure.fix);
+      return s.finish('error', 1, { reason: `tailscale_${failure.kind}`, message: `Could not read the current \`tailscale serve status\`, so nothing was published. ${failure.fix}` });
     }
     const before = beforeRead.view;
     const ours = findProxiedHandler(before, opts.port);
@@ -766,7 +784,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     }
     if (ours && ours.funnel !== opts.funnel) {
       // Switching tailnet <-> funnel for our own handler: turn the old shape off first.
-      await d.run([binary, ...tailscaleServeOffArgv({ funnel: ours.funnel })], { timeoutMs: 30_000 });
+      await d.run([binary, ...tailscaleServeOffArgv({ funnel: ours.funnel })], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
     }
     const publishArgv = tailscaleServeArgv(opts.port, { funnel: opts.funnel });
     const pub = await d.run([binary, ...publishArgv], { timeoutMs: PUBLISH_TIMEOUT_MS });
@@ -791,7 +809,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
       const why = afterRead.view ? `serve status shows no / handler for port ${opts.port}` : describeServeReadFailure(d, afterRead).detail;
       s.check('tailscale.publish', 'fail', `tailscale ${publishArgv.join(' ')} exited 0 but ${why}`);
       s.nextActions.push('tailscale serve status', 'gbrain mcp expose --remove --yes');
-      return s.finish('error', 1, { reason: 'tailscale_publish_unconfirmed', message: `Tailscale accepted the command but ${afterRead.view ? 'does not show the handler' : 'its serve status could not be read afterwards'}. Run \`tailscale serve status\` to inspect; \`gbrain mcp expose --remove --yes\` clears a handler for port ${opts.port} without a receipt.` });
+      return s.finish('error', 1, { reason: 'tailscale_publish_unconfirmed', message: `Tailscale accepted the command but ${afterRead.view ? 'does not show the handler' : 'its serve status could not be read afterwards'}. Run \`tailscale serve status\` to inspect; \`gbrain mcp expose --remove --yes\` clears a handler for port ${opts.port} without a receipt (add --force when no wrapper or service of gbrain's is on this host yet).` });
     }
     if (confirmed.funnel !== opts.funnel) {
       s.check('tailscale.publish', 'warn', `handler present but funnel=${confirmed.funnel} (wanted ${opts.funnel})`);
@@ -876,7 +894,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
         s.nextActions.push(cmds.foreground);
       } else {
         serviceReceipt.state = await serveServiceState({ target, run: d.run, uid: d.uid });
-        s.check('service', serviceReceipt.state === 'running' || serviceReceipt.state === 'loaded' ? 'ok' : 'warn', serviceLabel(target, serviceReceipt.state, d));
+        s.check('service', isLiveService(serviceReceipt.state) ? 'ok' : 'warn', serviceLabel(target, serviceReceipt.state, d));
       }
     }
 
@@ -903,7 +921,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
       s.check('verify.tailnet', 'skipped', opts.noTailscale ? '--no-tailscale' : 'local server not confirmed yet');
     }
   } catch (error) {
-    throw await rollbackAfterThrow(d, s, opts, receiptWritten ? null : published, error, receiptWritten);
+    throw await rollbackAfterThrow(d, s, opts, published, error, receiptWritten);
   }
 
   // 10. receipt — the settled state (created_at kept; a supervisor that was
@@ -1011,7 +1029,7 @@ async function runStatus(d: Resolved, s: Session): Promise<number> {
   }
   // service
   if (receipt.service.state !== 'skipped') {
-    const good = state === 'running' || state === 'loaded' || state === 'manual';
+    const good = isLiveService(state) || state === 'manual';
     if (!good) allOk = false;
     s.check('service', good ? 'ok' : 'fail', serviceLabel(receipt.service.target, state, d));
   } else {
@@ -1057,7 +1075,7 @@ interface HandlerOffOutcome {
 async function turnOffOurHandler(d: Resolved, binary: string, port: number, ours: ServeHandler, funnelFirst: boolean): Promise<HandlerOffOutcome> {
   const results: string[] = [];
   if (funnelFirst || ours.funnel) {
-    const off = await d.run([binary, ...tailscaleServeOffArgv({ funnel: true })], { timeoutMs: 30_000 });
+    const off = await d.run([binary, ...tailscaleServeOffArgv({ funnel: true })], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
     results.push(`funnel off: exit ${off.status ?? 'null'}`);
   }
   let stillThere: ServeHandler | 'unknown' | null = ours;
@@ -1066,7 +1084,7 @@ async function turnOffOurHandler(d: Resolved, binary: string, port: number, ours
     stillThere = re.view ? findProxiedHandler(re.view, port) : 'unknown';
   }
   if (stillThere) {
-    const off = await d.run([binary, ...tailscaleServeOffArgv({ funnel: false })], { timeoutMs: 30_000 });
+    const off = await d.run([binary, ...tailscaleServeOffArgv({ funnel: false })], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
     results.push(`serve off: exit ${off.status ?? 'null'}`);
     const re = await readServeView(d, binary);
     return { results, remaining: re.view ? findProxiedHandler(re.view, port) : 'unknown' };
@@ -1085,20 +1103,22 @@ function recordHandlerOff(s: Session, outcome: HandlerOffOutcome, left: string[]
   if (remaining) left.push('the tailscale serve handler');
 }
 
-/** Only files INSIDE the serve directory are ever unlinked: a path in a receipt is data, never a licence to delete elsewhere. */
+/**
+ * A path in a receipt is data, never a licence to delete elsewhere: the
+ * wrapper, receipt and admin token are unlinked only inside the serve
+ * directory; the plist and unit are only ever the computed paths
+ * (`d.plistPath` / `d.unitPath`), whatever the receipt recorded.
+ */
 function serveDirGuard(d: Resolved): (p: string) => boolean {
   const serveDir = resolvePath(d.serveDir);
   return (p: string) => dirname(resolvePath(p)) === serveDir;
 }
 
 const OUTSIDE_NOTE = 'outside the serve directory; not touched';
+const RECORDED_ELSEWHERE_NOTE = 'recorded in the receipt but not the expected location; not touched';
 
 function unlinkQuietly(s: Session, p: string, removed: string[]): void {
   try { if (existsSync(p)) { unlinkSync(p); removed.push(p); } } catch (error) { s.say(`Note: could not delete ${p}: ${error instanceof Error ? error.message : String(error)}`); }
-}
-
-function serviceKindLabel(target: ServiceTarget): string {
-  return target === 'macos' ? `launchd ${SERVE_LAUNCHD_LABEL}` : target === 'linux-systemd' ? `systemd (user) ${SERVE_SYSTEMD_UNIT}` : 'manual wrapper';
 }
 
 async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<number> {
@@ -1133,12 +1153,18 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
     if (serviceTarget !== 'none') {
       const unitFile = serviceTarget === 'macos' ? d.plistPath : d.unitPath;
       const state = await serveServiceState({ target: serviceTarget, run: d.run, uid: d.uid });
-      serviceKnown = state === 'running' || state === 'loaded' || existsSync(unitFile);
+      serviceKnown = isLiveService(state) || existsSync(unitFile);
       if (serviceKnown) s.say(`Note: the receipt says no service was installed, but a ${serviceLabel(serviceTarget, state, d)} exists — removing it too.`);
     }
   }
+  // The plist / unit paths the receipt recorded are never handed to the
+  // supervisor step: only the computed paths are touched, and a recorded path
+  // that differs is named as left in place.
+  for (const [recorded, computed] of [[receipt.service.plist_path, d.plistPath], [receipt.service.unit_path, d.unitPath]] as const) {
+    if (recorded !== null && recorded !== computed) left.push(`${tildify(recorded, d.home)} (${RECORDED_ELSEWHERE_NOTE})`);
+  }
   if (serviceKnown && serviceTarget !== 'none') {
-    const r = await uninstallServeService({ target: serviceTarget, home: d.home, run: d.run, uid: d.uid, plistPath: receipt.service.plist_path ?? d.plistPath, unitPath: receipt.service.unit_path ?? d.unitPath });
+    const r = await uninstallServeService({ target: serviceTarget, home: d.home, run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath });
     for (const note of r.notes) s.say(`Note: ${note}`);
     s.check('service', 'ok', r.removed.length ? `removed ${r.removed.join(', ')}` : 'stopped (no unit file to delete)');
   } else {
@@ -1183,7 +1209,7 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
   if (!inServeDir(tokenFile)) {
     left.push(`${tildify(tokenFile, d.home)} (admin token ${OUTSIDE_NOTE})`);
   } else if (opts.force) {
-    try { if (existsSync(tokenFile)) { unlinkSync(tokenFile); removed.push(tokenFile); } } catch { /* best effort */ }
+    unlinkQuietly(s, tokenFile, removed);
   } else if (existsSync(tokenFile)) {
     left.push(`${tildify(tokenFile, d.home)} (admin token; pass --force to delete)`);
   }
@@ -1200,34 +1226,44 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
  * between `tailscale serve --bg` and the receipt write) can leave the
  * wrapper, a launchd/systemd unit and a `:443` handler behind. Recover from
  * what is on disk: remove exactly those artifacts (for `--port`, default
- * 3131), leave the admin token, and say so. Nothing of ours found → today's
- * "not exposed — nothing to remove", exit 0.
+ * 3131), leave the admin token, and say so. A `:443` handler proxying the
+ * port is turned off only when something else of gbrain's corroborates it
+ * (the wrapper, our unit/plist, or the supervisor reporting our service) —
+ * another tool may proxy the same port — or with `--force`. Nothing of ours
+ * found → today's "not exposed — nothing to remove", exit 0.
  */
 async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOptions): Promise<number> {
   const wrapper = wrapperPathFor(d.serveDir);
   const wrapperExists = existsSync(wrapper);
-  const target = await probeServiceTarget(d);
-  const unitFile = target === 'macos' ? d.plistPath : target === 'linux-systemd' ? d.unitPath : null;
-  let serviceState: ServiceState | null = null;
-  if (target !== 'none') serviceState = await serveServiceState({ target, run: d.run, uid: d.uid });
-  const serviceFound = target !== 'none' && ((unitFile !== null && existsSync(unitFile)) || serviceState === 'running' || serviceState === 'loaded');
   const binary = findTailscaleBinary({ which: d.which, fileExists: d.fileExists });
-  let handler: ServeHandler | null = null;
-  let serveUnreadable: ServeRead | null = null;
-  if (binary) {
-    const read = await readServeView(d, binary);
-    if (read.view) handler = findProxiedHandler(read.view, opts.port);
-    else serveUnreadable = read;
-  }
-  if (!wrapperExists && !serviceFound && !handler) {
+  // The supervisor chain and the serve-status read are independent probes.
+  const [[target, serviceState], read] = await Promise.all([
+    probeServiceTarget(d).then(async (t): Promise<[ServiceTarget, ServiceState | null]> => [t, t !== 'none' ? await serveServiceState({ target: t, run: d.run, uid: d.uid }) : null]),
+    binary ? readServeView(d, binary) : Promise.resolve<ServeRead | null>(null),
+  ]);
+  const unitFile = target === 'macos' ? d.plistPath : target === 'linux-systemd' ? d.unitPath : null;
+  const serviceFound = target !== 'none' && ((unitFile !== null && existsSync(unitFile)) || isLiveService(serviceState));
+  const handler = read?.view ? findProxiedHandler(read.view, opts.port) : null;
+  const serveUnreadable = read && !read.view ? read : null;
+  const evidence = wrapperExists || serviceFound;
+  /** The handler we will turn off: only with corroborating evidence or `--force`. */
+  const handlerOff = handler && (evidence || opts.force) ? handler : null;
+  const forceRerun = `gbrain mcp expose --remove --yes --force${opts.port !== DEFAULT_EXPOSE_PORT ? ` --port ${opts.port}` : ''}`;
+  if (!evidence && !handlerOff) {
     s.check('receipt', 'skipped', 'no expose receipt; nothing to remove');
     if (serveUnreadable) s.check('tailscale.publish', 'warn', `${describeServeReadFailure(d, serveUnreadable).detail}; a handler for port ${opts.port} could not be checked`);
+    if (handler) {
+      const note = `a :443 handler proxies ${handler.proxy} but nothing else of gbrain's is here (no wrapper, unit or service), so it is not proven to be ours; left as is — pass --force to turn it off`;
+      s.check('tailscale.publish', 'warn', note);
+      s.nextActions.push(forceRerun);
+      s.say(`Note: ${note}`);
+    }
     s.say('not exposed — nothing to remove');
     return s.finish('not_exposed', 0, { reason: 'not_exposed' });
   }
   const plan = [
     serviceFound ? `Service   stop + remove ${serviceKindLabel(target)}${serviceState ? ` (${serviceState})` : ''}` : 'Service   none found',
-    handler ? `Tailscale turn off the :443 handler proxying ${handler.proxy}${handler.funnel ? ' (funnel first)' : ''} — Tailscale stays installed and signed in` : serveUnreadable ? `Tailscale could not read serve status; a handler for port ${opts.port} is left as is` : `Tailscale no :443 handler proxies to port ${opts.port}`,
+    handlerOff ? `Tailscale turn off the :443 handler proxying ${handlerOff.proxy}${handlerOff.funnel ? ' (funnel first)' : ''}${evidence ? '' : ' (--force: no wrapper, unit or service corroborates it)'} — Tailscale stays installed and signed in` : serveUnreadable ? `Tailscale could not read serve status; a handler for port ${opts.port} is left as is` : `Tailscale no :443 handler proxies to port ${opts.port}`,
     wrapperExists ? `Files     delete ${tildify(wrapper, d.home)}` : 'Files     no wrapper found',
     `Token     leave ${tildify(adminTokenPathFor(d.serveDir), d.home)} (no receipt names it)`,
   ];
@@ -1235,7 +1271,7 @@ async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOpti
   s.check('plan', 'ok', plan.join(' | '));
   s.say(`Recovering without a receipt (an interrupted \`gbrain mcp expose\` left these behind; port ${opts.port}):`);
   for (const line of plan) s.say(`  ${line}`);
-  const consent = await confirmOrFinish(d, s, 'Remove these leftovers? [y/N] ', { yes: opts.yes, receipt: null, confirmationMessage: 'Pass --yes to confirm the removal.', nextAction: `gbrain mcp expose --remove --yes${opts.port !== DEFAULT_EXPOSE_PORT ? ` --port ${opts.port}` : ''}` });
+  const consent = await confirmOrFinish(d, s, 'Remove these leftovers? [y/N] ', { yes: opts.yes, receipt: null, confirmationMessage: 'Pass --yes to confirm the removal.', nextAction: `gbrain mcp expose --remove --yes${opts.force ? ' --force' : ''}${opts.port !== DEFAULT_EXPOSE_PORT ? ` --port ${opts.port}` : ''}` });
   if (consent !== null) return consent;
   const left: string[] = [];
   if (serviceFound) {
@@ -1245,8 +1281,8 @@ async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOpti
   } else {
     s.check('service', 'skipped', 'none found');
   }
-  if (handler && binary) {
-    recordHandlerOff(s, await turnOffOurHandler(d, binary, opts.port, handler, handler.funnel), left);
+  if (handlerOff && binary) {
+    recordHandlerOff(s, await turnOffOurHandler(d, binary, opts.port, handlerOff, handlerOff.funnel), left);
     left.push('Tailscale itself (installed and signed in)');
   } else if (serveUnreadable) {
     s.check('tailscale.publish', 'warn', `${describeServeReadFailure(d, serveUnreadable).detail}; handler left as is`);

@@ -381,27 +381,21 @@ function defaultUid(): number {
   return typeof process.getuid === 'function' ? process.getuid() : 501;
 }
 
-/**
- * `launchctl bootout gui/<uid> <plist>` (modern, domain-explicit), falling
- * back to legacy `launchctl unload <plist>` ONLY when launchctl itself does
- * not know the verb (non-zero exit whose stderr says so). A "not loaded"
- * failure is returned as is; callers ignore it.
- */
-async function launchctlBootout(run: CommandRunner, uid: number, plist: string): Promise<CommandResult> {
-  const r = await run(['launchctl', 'bootout', `gui/${uid}`, plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
-  if (typeof r.status === 'number' && r.status !== 0 && LAUNCHCTL_LEGACY_RE.test(r.stderr)) {
-    return run(['launchctl', 'unload', plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
-  }
-  return r;
-}
+interface LaunchctlVerbs { modern: 'bootout' | 'bootstrap'; legacy: 'unload' | 'load' }
 
-/** `launchctl bootstrap gui/<uid> <plist>`, legacy `launchctl load <plist>` under the same rule as `launchctlBootout`. */
-async function launchctlBootstrap(run: CommandRunner, uid: number, plist: string): Promise<{ result: CommandResult; verb: 'bootstrap' | 'load' }> {
-  const r = await run(['launchctl', 'bootstrap', `gui/${uid}`, plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
+/**
+ * `launchctl <modern> gui/<uid> <plist>` (domain-explicit), falling back to
+ * the legacy `launchctl <legacy> <plist>` ONLY when launchctl itself does not
+ * know the verb (non-zero exit whose stderr says so). `verb` names the call
+ * whose result is returned. A "not loaded" bootout failure is returned as
+ * is; callers ignore it.
+ */
+async function launchctl(run: CommandRunner, uid: number, plist: string, verbs: LaunchctlVerbs): Promise<{ result: CommandResult; verb: LaunchctlVerbs['modern'] | LaunchctlVerbs['legacy'] }> {
+  const r = await run(['launchctl', verbs.modern, `gui/${uid}`, plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS });
   if (typeof r.status === 'number' && r.status !== 0 && LAUNCHCTL_LEGACY_RE.test(r.stderr)) {
-    return { result: await run(['launchctl', 'load', plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS }), verb: 'load' };
+    return { result: await run(['launchctl', verbs.legacy, plist], { timeoutMs: SUPERVISOR_CHANGE_TIMEOUT_MS }), verb: verbs.legacy };
   }
-  return { result: r, verb: 'bootstrap' };
+  return { result: r, verb: verbs.modern };
 }
 
 function writeExecutable(path: string, content: string, mode: number, what: string): void {
@@ -422,8 +416,8 @@ export async function installServeService(p: InstallServiceParams): Promise<Inst
     // running server must relaunch to pick up a regenerated wrapper anyway.
     // The bootout failure ("not loaded" on a fresh install) is ignored.
     const uid = p.uid ?? defaultUid();
-    await launchctlBootout(p.run, uid, plist);
-    const boot = await launchctlBootstrap(p.run, uid, plist);
+    await launchctl(p.run, uid, plist, { modern: 'bootout', legacy: 'unload' });
+    const boot = await launchctl(p.run, uid, plist, { modern: 'bootstrap', legacy: 'load' });
     if (boot.result.status !== 0) result.error = `launchctl ${boot.verb} failed: ${describeFailure(boot.result)}`;
     return result;
   }
@@ -470,7 +464,7 @@ export async function uninstallServeService(p: UninstallServiceParams): Promise<
   const out: UninstallServiceResult = { removed: [], notes: [] };
   if (p.target === 'macos') {
     const plist = p.plistPath ?? launchdPlistPath(p.home);
-    await launchctlBootout(p.run, p.uid ?? defaultUid(), plist);
+    await launchctl(p.run, p.uid ?? defaultUid(), plist, { modern: 'bootout', legacy: 'unload' });
     if (existsSync(plist)) { unlinkSync(plist); out.removed.push(plist); }
     return out;
   }
@@ -546,6 +540,7 @@ function isExposeReceipt(v: unknown): v is ExposeReceipt {
   const service = v.service;
   if (!isRecord(service) || typeof service.wrapper_path !== 'string' || typeof service.state !== 'string') return false;
   if (typeof service.target !== 'string' || !RECEIPT_TARGETS.includes(service.target)) return false;
+  if (!isStringOrNull(service.plist_path) || !isStringOrNull(service.unit_path)) return false;
   const tailscale = v.tailscale;
   if (!isRecord(tailscale) || !isStringOrNull(tailscale.binary) || !isStringOrNull(tailscale.dns_name)) return false;
   return true;

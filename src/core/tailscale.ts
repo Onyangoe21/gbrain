@@ -75,7 +75,12 @@ export interface CommandRunOptions {
  */
 export type CommandRunner = (argv: string[], opts?: CommandRunOptions) => Promise<CommandResult>;
 
+/** After the SIGTERM at `timeoutMs`, a child that is still alive this much later is SIGKILLed so the caller never hangs on it. */
+const SIGKILL_GRACE_MS = 3_000;
+
 export const defaultCommandRunner: CommandRunner = async (argv, opts = {}) => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
   try {
     const proc = Bun.spawn(argv, {
       stdin: opts.inherit ? 'inherit' : 'ignore',
@@ -83,20 +88,28 @@ export const defaultCommandRunner: CommandRunner = async (argv, opts = {}) => {
       stderr: opts.inherit ? 'inherit' : 'pipe',
       env: process.env,
     });
-    let timer: ReturnType<typeof setTimeout> | null = null;
     let timedOut = false;
     if (opts.timeoutMs && opts.timeoutMs > 0) {
-      timer = setTimeout(() => { timedOut = true; try { proc.kill(); } catch { /* already gone */ } }, opts.timeoutMs);
+      timer = setTimeout(() => {
+        timedOut = true;
+        try { proc.kill(); } catch { /* already gone */ }
+        killTimer = setTimeout(() => {
+          // `exited` has not settled: the child ignored (or is still handling) SIGTERM.
+          if (proc.exitCode === null && proc.signalCode === null) { try { proc.kill('SIGKILL'); } catch { /* already gone */ } }
+        }, SIGKILL_GRACE_MS);
+      }, opts.timeoutMs);
     }
     const [stdout, stderr, status] = await Promise.all([
       opts.inherit ? Promise.resolve('') : new Response(proc.stdout as ReadableStream).text(),
       opts.inherit ? Promise.resolve('') : new Response(proc.stderr as ReadableStream).text(),
       proc.exited,
     ]);
-    if (timer) clearTimeout(timer);
     return { status: timedOut ? null : status, stdout, stderr: timedOut ? `${stderr}\n(timed out after ${opts.timeoutMs}ms)` : stderr };
   } catch (error) {
     return { status: null, stdout: '', stderr: error instanceof Error ? error.message : String(error) };
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
   }
 };
 
@@ -360,21 +373,14 @@ function collectServeHandlers(block: ServeConfigLike, foreground: boolean, funne
 }
 
 /**
- * Tolerant: an empty document, `null`, or non-JSON output yields an empty
- * view. Background handlers come first, then every `Foreground[<session>]`
- * block (marked `foreground: true`).
- */
-export function parseServeStatus(stdout: string): ServeStatusView {
-  return parseServeStatusStrict(stdout) ?? EMPTY_SERVE_VIEW;
-}
-
-/**
- * Fail-closed variant for callers that act on the answer (publish / remove /
+ * Fail-closed, for callers that act on the answer (publish / remove /
  * status): an empty document, `null` or `{}` from a successful exit is a
  * legitimately empty serve config and yields the empty view, but anything
  * that is not JSON or not a JSON object (a stderr-style error line on stdout,
  * an array, a scalar) yields null so the caller classifies stderr instead of
- * mistaking "could not read" for "nothing configured".
+ * mistaking "could not read" for "nothing configured". Background handlers
+ * come first, then every `Foreground[<session>]` block (marked
+ * `foreground: true`).
  */
 export function parseServeStatusStrict(stdout: string): ServeStatusView | null {
   const text = stdout.trim();
