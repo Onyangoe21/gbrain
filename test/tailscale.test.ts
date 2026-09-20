@@ -6,9 +6,9 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
-  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, normalizeDnsName,
-  parseServeStatusStrict, parseTailscaleStatus, publicUrlFromDnsName, tailscaleInstallPlan, tailscaleLoginArgv, tailscaleServeArgv, tailscaleServeOffArgv,
-  TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL,
+  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, isSystemTailscaleBinary, normalizeDnsName,
+  parseServeStatusStrict, parseTailscaleStatus, publicUrlFromDnsName, tailscaleInstallPlan, tailscaleLoginArgv, tailscaleManualLoginCommand, tailscaleServeArgv, tailscaleServeOffArgv,
+  TAILSCALE_ACCEPT_DNS_COMMAND, TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL,
   TAILSCALE_FUNNEL_CAPABILITY, TAILSCALE_FUNNEL_KB_URL, type CommandRunOptions,
 } from '../src/core/tailscale.ts';
 
@@ -79,6 +79,14 @@ describe('findTailscaleBinary', () => {
   test('nothing found → null', () => {
     expect(findTailscaleBinary({ which: () => null, fileExists: () => false })).toBeNull();
   });
+  test('isSystemTailscaleBinary: a candidate path, or a path whose realpath is one, qualifies for sudo; anything else (or an unresolvable path) does not', () => {
+    expect(isSystemTailscaleBinary('/usr/bin/tailscale', () => { throw new Error('must not be consulted for a literal candidate'); })).toBe(true);
+    expect(isSystemTailscaleBinary('/usr/local/bin/ts-link', p => (p === '/usr/local/bin/ts-link' ? '/usr/bin/tailscale' : p))).toBe(true);
+    expect(isSystemTailscaleBinary('/home/alice-example/.local/bin/tailscale', p => p)).toBe(false);
+    expect(isSystemTailscaleBinary('/home/alice-example/.local/bin/tailscale', () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); })).toBe(false);
+    // the default realpath never throws out of the helper for a missing file
+    expect(isSystemTailscaleBinary('/nonexistent/definitely-not-tailscale')).toBe(false);
+  });
 });
 
 describe('tailscaleInstallPlan', () => {
@@ -104,11 +112,12 @@ describe('tailscaleInstallPlan', () => {
 });
 
 describe('argv builders', () => {
-  test('serve / funnel publish and off (never reset)', () => {
+  test('serve / funnel publish and off (scoped to the / mount with --set-path=/; never reset)', () => {
     expect(tailscaleServeArgv(3131)).toEqual(['serve', '--bg', '3131']);
     expect(tailscaleServeArgv(4000, { funnel: true })).toEqual(['funnel', '--bg', '4000']);
-    expect(tailscaleServeOffArgv()).toEqual(['serve', '--https=443', 'off']);
-    expect(tailscaleServeOffArgv({ funnel: true })).toEqual(['funnel', '--https=443', 'off']);
+    // Without --set-path=/ the CLI removes EVERY mount under :443 and prompts when more than one exists.
+    expect(tailscaleServeOffArgv()).toEqual(['serve', '--https=443', '--set-path=/', 'off']);
+    expect(tailscaleServeOffArgv({ funnel: true })).toEqual(['funnel', '--https=443', '--set-path=/', 'off']);
     expect(tailscaleServeOffArgv().join(' ')).not.toContain('reset');
   });
   test('login: linux sets the operator first, then a FLAGLESS sudo up; macOS is a plain up', () => {
@@ -121,6 +130,9 @@ describe('argv builders', () => {
     expect(mac.setOperator).toBeUndefined();
     expect(mac.up).toEqual(['/Applications/Tailscale.app/Contents/MacOS/Tailscale', 'up']);
     expect(tailscaleLoginArgv('linux', 'alice-example').up).toEqual(['sudo', 'tailscale', 'up']);
+    // the copy-pasteable operator forms (owned here so the flag-registry scan of mcp-expose.ts never sees tailscale's flags)
+    expect(tailscaleManualLoginCommand()).toBe('sudo tailscale set --operator=$USER && sudo tailscale up');
+    expect(TAILSCALE_ACCEPT_DNS_COMMAND).toBe('tailscale set --accept-dns=true');
   });
   test('CommandRunOptions carries the --json stdout redirect flag', () => {
     const opts: CommandRunOptions = { inherit: true, stdoutToStderr: true, timeoutMs: 10 };

@@ -15,6 +15,7 @@
  * tmpdir. Never mutate process.env here — read it through `deps.env`.
  */
 import { existsSync, unlinkSync } from 'node:fs';
+import { createConnection } from 'node:net';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { promptLineStderr } from '../core/cli-util.ts';
@@ -23,19 +24,19 @@ import { detectExecutionEnvironment, type ExecutionEnvironment } from '../core/e
 import { validateHarnessArguments } from '../core/harness/arguments.ts';
 import { probeLivePgliteHolder } from '../core/bootstrap/uninstall.ts';
 import {
-  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary,
+  classifyTailscaleError, defaultCommandRunner, findProxiedHandler, findRootHandlers, findTailscaleBinary, isSystemTailscaleBinary,
   parseServeStatusStrict, parseTailscaleStatus, publicUrlFromDnsName, tailscaleDaemonStartHint, tailscaleInstallPlan,
-  tailscaleLoginArgv, tailscaleServeArgv, tailscaleServeOffArgv, tailscaleSetOperatorCommand, TAILSCALE_ADMIN_ACL_URL,
-  TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL, TAILSCALE_FUNNEL_KB_URL, TAILSCALE_SERVE_STATUS_ARGV,
-  TAILSCALE_STATUS_ARGV,
-  type CommandRunner, type ServeHandler, type ServeStatusView, type TailscaleStatus,
+  tailscaleLoginArgv, tailscaleManualLoginCommand, tailscaleServeArgv, tailscaleServeOffArgv, tailscaleSetOperatorCommand, TAILSCALE_ACCEPT_DNS_COMMAND,
+  TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_DOWNLOAD_URL, TAILSCALE_FUNNEL_KB_URL,
+  TAILSCALE_SERVE_STATUS_ARGV, TAILSCALE_STATUS_ARGV,
+  type CommandResult, type CommandRunner, type ServeHandler, type ServeStatusView, type TailscaleStatus,
 } from '../core/tailscale.ts';
 import {
-  adminTokenPath as adminTokenPathFor, detectServiceTarget, ensureAdminToken, installServeService, launchdPlistPath,
+  adminTokenPath as adminTokenPathFor, detectServiceTarget, ensureAdminToken, installServeService, launchdBootoutFailed, launchdPlistPath,
   readExposeReceipt, receiptPath as receiptPathFor, renderServeWrapper, resolveServeGbrainCommand, serveCommandArgv,
   serveDir as defaultServeDir, serveErrPath, serveLogPath, serveServiceState, systemdUnitPath, SYSTEMCTL_USER_BUS_PROBE_ARGV,
   SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT, uninstallServeService, wrapperPath as wrapperPathFor, writeExposeReceipt,
-  type ExposeReceipt, type ServiceState, type ServiceTarget,
+  type ExposeReceipt, type ServiceState, type ServiceTarget, type UninstallServiceResult,
 } from '../core/serve-service.ts';
 import { shellQuote } from '../core/mcp-registration.ts';
 
@@ -65,7 +66,8 @@ node attribute) enabled — otherwise exit 2 with the admin URL to fix it.
                   for --port that no wrapper, unit or service of gbrain's corroborates
 --dry-run         Print the plan and stop (exit 0, no changes)
 --yes             Skip the confirmation prompt (required when not on a TTY)
---status          Re-probe the published server, the service and both health URLs
+--status          Re-probe the published server, the service and both health URLs. Without a
+                  receipt it looks for leftovers of an interrupted run (exit 1 when any are found)
 --remove          Stop the service, clear our serve/funnel handler, delete wrapper + receipt.
                   Without a receipt (an interrupted run) it recovers from what is on disk:
                   the wrapper, the launchd/systemd unit and the :443 handler for --port (the
@@ -73,7 +75,9 @@ node attribute) enabled — otherwise exit 2 with the admin URL to fix it.
 --json            One JSON document on stdout; prose moves to stderr
 
 A host with no brain config is refused (no_brain_config) unless --no-service: a service there
-would only crash-loop. Anything answering on 127.0.0.1:<port> counts as occupied.
+would only crash-loop. Anything listening on 127.0.0.1:<port> — a TCP connect that is accepted,
+or any HTTP answer — counts as occupied. --no-tailscale is refused while a receipt says the brain
+is published on the tailnet (tailscale_receipt_present): --remove first.
 
 Exit codes: 0 done · 1 failed · 2 confirmation needed or a step is pending (re-run).
 Env: GBRAIN_TAILSCALE_LOGIN_TIMEOUT_MS bounds the wait for \`tailscale up\` (default 300000).
@@ -91,7 +95,7 @@ export const MCP_EXPOSE_ARGUMENTS = {
 export const DEFAULT_EXPOSE_PORT = 3131;
 /** `tailscale serve|funnel --bg` is killed after this long — it blocks (waiting for an enablement step) rather than failing. */
 const PUBLISH_TIMEOUT_MS = 60_000;
-/** `tailscale serve|funnel --https=443 off`. */
+/** `tailscale serve|funnel --https=443 --set-path=/ off`. */
 const SERVE_OFF_TIMEOUT_MS = 30_000;
 /** `tailscale status --json` and `tailscale serve status --json` (read-only). */
 const STATUS_READ_TIMEOUT_MS = 15_000;
@@ -100,6 +104,8 @@ const APP_DAEMON_POLL_ATTEMPTS = 20;
 const APP_DAEMON_POLL_INTERVAL_MS = 1_000;
 const SURFACES = ['verbs', 'starter', 'full'] as const;
 type Surface = (typeof SURFACES)[number];
+/** A fetch rejection that means THIS host cannot resolve the name (MagicDNS off here), not that the server is down. */
+const NAME_RESOLUTION_RE = /ENOTFOUND|getaddrinfo|EAI_AGAIN|failed to resolve|Unable to connect.*resolve/i;
 
 // ---------------------------------------------------------------------------
 // Deps
@@ -122,6 +128,8 @@ export interface McpExposeDeps {
   which?: (name: string) => string | null;
   fileExists?: (path: string) => boolean;
   fetch?: (url: string, init?: { signal?: AbortSignal; redirect?: 'manual' | 'error' | 'follow' }) => Promise<{ ok: boolean; status: number }>;
+  /** Bounded TCP connect to `host:port` (true on connect, false on refusal / timeout); default `node:net`. Tests inject a fake. */
+  tcpProbe?: (host: string, port: number, timeoutMs: number) => Promise<boolean>;
   isTTY?: boolean;
   prompt?: (question: string) => Promise<string | null>;
   stdout?: (line: string) => void;
@@ -162,6 +170,7 @@ interface Resolved {
   which: (name: string) => string | null;
   fileExists: (path: string) => boolean;
   fetch: NonNullable<McpExposeDeps['fetch']>;
+  tcpProbe: NonNullable<McpExposeDeps['tcpProbe']>;
   isTTY: boolean;
   prompt: (question: string) => Promise<string | null>;
   out: (line: string) => void;
@@ -178,6 +187,18 @@ interface Resolved {
   healthIntervalMs: number;
   loginTimeoutMs: number;
   pgliteHolder: PgliteHolderProbe;
+}
+
+/** Default `tcpProbe`: one connect attempt, the socket destroyed on every outcome. Any listener — HTTP or not — accepts the connect. */
+export function defaultTcpProbe(host: string, port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise(resolve => {
+    let settled = false;
+    const sock = createConnection({ host, port });
+    const done = (v: boolean) => { if (settled) return; settled = true; sock.destroy(); resolve(v); };
+    sock.setTimeout(Math.max(1, timeoutMs), () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
 }
 
 function resolveDeps(deps: McpExposeDeps): Resolved {
@@ -199,6 +220,7 @@ function resolveDeps(deps: McpExposeDeps): Resolved {
     which,
     fileExists: deps.fileExists ?? existsSync,
     fetch: deps.fetch ?? ((url, init) => fetch(url, init as RequestInit)),
+    tcpProbe: deps.tcpProbe ?? defaultTcpProbe,
     isTTY: deps.isTTY ?? (process.stdin.isTTY === true && process.stderr.isTTY === true),
     prompt: deps.prompt ?? ((q: string) => promptLineStderr(q)),
     out: deps.stdout ?? ((line: string) => { process.stdout.write(`${line}\n`); }),
@@ -309,29 +331,41 @@ function engineKind(cfg: GBrainConfig | null): ExposeReceipt['engine'] {
   return 'unknown';
 }
 
-/** One bounded fetch: the response (whatever its status), or null when it rejected (connection refused / timeout). */
-async function tryFetch(d: Resolved, url: string, timeoutMs: number): Promise<{ ok: boolean } | null> {
+interface FetchOutcome {
+  /** The response (whatever its status), or null when the fetch rejected (connection refused / timeout / unresolved name). */
+  res: { ok: boolean } | null;
+  /** The rejection was a name-resolution failure: this host cannot resolve the name, which says nothing about the server. */
+  unresolved: boolean;
+}
+
+/** One bounded fetch, never throws. */
+async function tryFetch(d: Resolved, url: string, timeoutMs: number): Promise<FetchOutcome> {
   try {
-    return await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
-  } catch {
-    return null;
+    return { res: await d.fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' }), unresolved: false };
+  } catch (error) {
+    return { res: null, unresolved: NAME_RESOLUTION_RE.test(error instanceof Error ? error.message : String(error)) };
   }
 }
 
 /** Health: the fetch resolved AND answered 2xx (`res.ok`). Used by `verify.*` and `--status`. */
 async function probeHealth(d: Resolved, url: string, timeoutMs = 1_500): Promise<boolean> {
-  return (await tryFetch(d, url, timeoutMs))?.ok === true;
+  return (await tryFetch(d, url, timeoutMs)).res?.ok === true;
 }
 
 /**
- * Occupancy: does ANYTHING answer on the port? True when the fetch resolves
- * with any status (2xx, 404, 500 …), false only when it rejects (connection
- * refused / timeout). A foreign server that 404s `/health` still owns the
+ * Occupancy: does ANYTHING listen on the port? True when a TCP connect to
+ * `127.0.0.1:<port>` is accepted OR the fetch resolves with any status (2xx,
+ * 404, 500 …); false only when both are refused / time out. A foreign server
+ * that 404s `/health`, or one that does not speak HTTP at all, still owns the
  * port, so the foreign-listener guard and the `--no-service` "does something
  * listen" logic use this, never `probeHealth`.
  */
-async function probeOccupied(d: Resolved, url: string, timeoutMs = 1_500): Promise<boolean> {
-  return (await tryFetch(d, url, timeoutMs)) !== null;
+async function probeOccupied(d: Resolved, port: number, url: string, timeoutMs = 1_500): Promise<boolean> {
+  const [tcp, http] = await Promise.all([
+    d.tcpProbe('127.0.0.1', port, timeoutMs).catch(() => false),
+    tryFetch(d, url, timeoutMs),
+  ]);
+  return tcp || http.res !== null;
 }
 
 /**
@@ -339,19 +373,29 @@ async function probeOccupied(d: Resolved, url: string, timeoutMs = 1_500): Promi
  * probe's timeout is sized to `min(1500, remaining)` so the last attempt never
  * overruns the budget. Always probes at least once. The attempt cap is a
  * backstop for a clock that does not advance (tests inject a frozen `now`).
+ * `unresolved` carries the LAST probe's name-resolution verdict so the caller
+ * can tell "this host cannot resolve the name" from "still pending".
  */
-async function pollHealth(d: Resolved, url: string, budgetMs: number): Promise<boolean> {
+async function pollHealth(d: Resolved, url: string, budgetMs: number): Promise<{ ok: boolean; unresolved: boolean }> {
   const deadline = d.now().getTime() + Math.max(0, budgetMs);
   const maxAttempts = Math.max(1, Math.ceil(budgetMs / Math.max(1, d.healthIntervalMs)));
+  let unresolved = false;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const remaining = deadline - d.now().getTime();
-    if (attempt > 0 && remaining <= 0) return false;
-    if (await probeHealth(d, url, Math.max(1, Math.min(1_500, remaining)))) return true;
+    if (attempt > 0 && remaining <= 0) break;
+    const probe = await tryFetch(d, url, Math.max(1, Math.min(1_500, remaining)));
+    if (probe.res?.ok === true) return { ok: true, unresolved: false };
+    unresolved = probe.unresolved;
     const left = deadline - d.now().getTime();
-    if (left <= 0) return false;
+    if (left <= 0) break;
     await d.sleep(Math.min(d.healthIntervalMs, left));
   }
-  return false;
+  return { ok: false, unresolved };
+}
+
+/** `verify.tailnet` / `--status` detail when this host cannot resolve the MagicDNS name — a warn, never `pending`. */
+function unresolvedDetail(dnsName: string): string {
+  return `this host cannot resolve ${dnsName} (MagicDNS may be off here: \`${TAILSCALE_ACCEPT_DNS_COMMAND}\`); devices that do resolve it may already reach the server`;
 }
 
 interface ServeRead {
@@ -531,8 +575,14 @@ async function rollbackAfterThrow(d: Resolved, s: Session, opts: ExposeOptions, 
   let outcome: string;
   try {
     const off = await d.run([published.binary, ...offArgv], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
-    outcome = off.status === 0 ? 'turned off again' : `NOT turned off (exit ${off.status ?? 'null'}; run \`tailscale serve status\`)`;
-    s.check('rollback', off.status === 0 ? 'ok' : 'warn', `tailscale ${offArgv.join(' ')}: ${outcome}; no receipt written`);
+    // "turned off again" is claimed only when a re-read no longer shows our
+    // port: an `off` that exits 0 can still leave the mount in place.
+    const re = off.status === 0 ? await readServeView(d, published.binary) : null;
+    outcome = off.status !== 0 ? `NOT turned off (exit ${off.status ?? 'null'}; run \`tailscale serve status\`)`
+      : !re?.view ? 'state unknown (off exited 0 but tailscale serve status could not be re-read; run `tailscale serve status`)'
+        : findProxiedHandler(re.view, opts.port) ? 'NOT turned off (off exited 0 but the handler is still present; run `tailscale serve status`)'
+          : 'turned off again';
+    s.check('rollback', outcome === 'turned off again' ? 'ok' : 'warn', `tailscale ${offArgv.join(' ')}: ${outcome}; no receipt written`);
   } catch (offError) {
     outcome = `NOT turned off (${offError instanceof Error ? offError.message : String(offError)}; run \`tailscale serve status\`)`;
     s.check('rollback', 'warn', `tailscale ${offArgv.join(' ')}: ${outcome}; no receipt written`);
@@ -559,7 +609,7 @@ export async function runMcpExpose(args: string[], deps: McpExposeDeps = {}): Pr
   if (opts.help) { d.out(MCP_EXPOSE_HELP); return 0; }
   const s = new Session(d, opts.json);
   try {
-    if (opts.status) return await runStatus(d, s);
+    if (opts.status) return await runStatus(d, s, opts);
     if (opts.remove) return await runRemove(d, s, opts);
     return await runPublish(d, s, opts);
   } catch (error) {
@@ -593,9 +643,14 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
   // untouched (the wrapper is not rewritten either).
   const keptService = opts.noService && existing && existing.service.state !== 'skipped' ? existing.service : null;
   const localHealthUrl = `http://127.0.0.1:${opts.port}/health`;
+  // `--no-tailscale` over a receipt that says the brain is published on the
+  // tailnet would rewrite the receipt to loopback while the Serve/Funnel
+  // mapping stays live and unfindable. Refused before consent; `--remove` first.
+  const tailscaleReceipt = opts.noTailscale && existing?.tailscale.dns_name ? existing : null;
   const plan: string[] = [];
   plan.push(`Server    gbrain serve (HTTP) on 127.0.0.1:${opts.port} (surface ${opts.surface}${opts.enableDcr ? ', DCR on' : ''}); engine ${engine}`);
-  if (opts.noTailscale) plan.push('Tailscale skipped (--no-tailscale): you publish the port yourself');
+  if (tailscaleReceipt) plan.push(`Tailscale ${opts.dryRun ? 'WOULD BE REFUSED' : 'REFUSED'} (--no-tailscale): this brain is already published on your tailnet at ${tailscaleReceipt.public_url} — run \`gbrain mcp expose --remove --yes\` first, or re-run without --no-tailscale`);
+  else if (opts.noTailscale) plan.push('Tailscale skipped (--no-tailscale): you publish the port yourself');
   else if (tailscaleBinary) plan.push(`Tailscale ${tailscaleBinary} — sign in if needed, then \`tailscale ${tailscaleServeArgv(opts.port, { funnel: opts.funnel }).join(' ')}\``);
   else if (opts.noInstall) plan.push(`Tailscale NOT installed and --no-install set — would stop with: ${installPlan.command}`);
   else plan.push(`Tailscale not installed — would run: ${installPlan.command}`);
@@ -621,7 +676,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     ? `a live process holds this PGLite brain (pid ${lockHolder.pid}, ${lockHolder.command ?? (lockHolder.serve ? 'gbrain serve' : 'gbrain')}): the service cannot start until it exits — stop it, or move to Postgres`
     : null;
   if (lockWarning) plan.push(`Lock      ${lockWarning}`);
-  s.check('plan', opts.dryRun ? 'planned' : noBrain ? 'fail' : 'ok', plan.join(' | '));
+  s.check('plan', opts.dryRun ? 'planned' : noBrain || tailscaleReceipt ? 'fail' : 'ok', plan.join(' | '));
   if (lockWarning) s.check('pglite_lock', 'warn', lockWarning);
   s.say('Plan');
   for (const line of plan) s.say(`  ${line}`);
@@ -634,13 +689,18 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     s.nextActions.push('gbrain init', rerunCommand(opts, ' --no-service'));
     return s.finish('error', 1, { receipt: existing, reason: 'no_brain_config', message: 'No brain is configured on this host (gbrain init first), so a service would only crash-loop; pass --no-service to publish a server you run yourself.' });
   }
+  if (tailscaleReceipt) {
+    s.nextActions.push('gbrain mcp expose --remove --yes', rerunCommand({ ...opts, noTailscale: false }));
+    return s.finish('error', 1, { receipt: existing, reason: 'tailscale_receipt_present', message: `This brain is already published on your tailnet at ${tailscaleReceipt.public_url}; run \`gbrain mcp expose --remove --yes\` first, or re-run without --no-tailscale.` });
+  }
   // Probe the local port NOW so a foreign listener is refused before anything
-  // is published or installed (never after `tailscale serve --bg`). ANY answer
-  // counts as occupied (a 404 or 500 still owns the port). A receipt for the
-  // same port claims the listener (it is our own server).
-  const listeningBefore = await probeOccupied(d, localHealthUrl);
+  // is published or installed (never after `tailscale serve --bg`). ANY
+  // listener counts as occupied — an accepted TCP connect (a non-HTTP
+  // service too) or an HTTP answer of any status (a 404 or 500 still owns the
+  // port). A receipt for the same port claims the listener (it is our own server).
+  const listeningBefore = await probeOccupied(d, opts.port, localHealthUrl);
   if (listeningBefore && !opts.noService && (!existing || existing.port !== opts.port)) {
-    s.check('service', 'fail', `something already answers on 127.0.0.1:${opts.port} (probed ${localHealthUrl}) and no expose receipt claims it`);
+    s.check('service', 'fail', `something already answers on 127.0.0.1:${opts.port} (a TCP connect was accepted or ${localHealthUrl} answered) and no expose receipt claims it`);
     s.nextActions.push('gbrain mcp expose --remove --yes', rerunCommand(opts, ' --no-service'));
     return s.finish('error', 1, {
       reason: 'foreign_listener',
@@ -712,6 +772,15 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     }
     if (st.status.backendState !== 'Running') {
       const login = tailscaleLoginArgv(d.platform, d.user, binary);
+      if (login.setOperator && !isSystemTailscaleBinary(binary)) {
+        // Linux login runs `sudo <binary> …`: never hand root to a binary
+        // outside the system install locations (a user-writable PATH entry).
+        const rerun = rerunCommand(opts);
+        const manual = tailscaleManualLoginCommand();
+        s.check('tailscale.login', 'pending', `${st.status.backendState}; ${binary} is not a system install, so gbrain will not run it with sudo — sign in yourself`);
+        s.nextActions.push(manual, rerun);
+        return s.finish('pending', 2, { reason: 'tailscale_login_manual', message: `tailscale at ${binary} is not a system install, so gbrain will not run it with sudo. Sign in yourself: \`${manual}\`, then re-run: ${rerun}` });
+      }
       if (login.setOperator) {
         // Set the operator FIRST (so `serve` works without sudo later); a
         // failure is a note, not a stop — `up --operator=` is avoided because
@@ -782,23 +851,37 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
         : `tailscale serve already proxies :443 to ${desc}. Re-run with --force to take it over, or pick another local port for that service.`;
       return s.finish('error', 1, { reason: 'foreign_serve_config', message });
     }
-    if (ours && ours.funnel !== opts.funnel) {
-      // Switching tailnet <-> funnel for our own handler: turn the old shape off first.
-      await d.run([binary, ...tailscaleServeOffArgv({ funnel: ours.funnel })], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
-    }
+    // Switching our own handler funnel -> tailnet needs Funnel turned off
+    // first (`serve --bg` over a Funnel mount keeps AllowFunnel); the other
+    // direction is one atomic `funnel --bg`, so nothing is pre-cleared there.
+    const preOff = ours !== null && ours.funnel && !opts.funnel;
+    if (preOff) await d.run([binary, ...tailscaleServeOffArgv({ funnel: true })], { timeoutMs: SERVE_OFF_TIMEOUT_MS });
+    /** After a failed publish that followed the pre-off: best-effort re-publish of the previous (funnel) shape so the switch never strands the handler. Returns the detail suffix. */
+    const restorePrevious = async (): Promise<string> => {
+      if (!preOff) return '';
+      const argv = tailscaleServeArgv(opts.port, { funnel: true });
+      let r: CommandResult | null = null;
+      try { r = await d.run([binary!, ...argv], { timeoutMs: PUBLISH_TIMEOUT_MS }); } catch { r = null; }
+      const re = r?.status === 0 ? await readServeView(d, binary!) : null;
+      const restored = re?.view ? findProxiedHandler(re.view, opts.port)?.funnel === true : false;
+      return restored
+        ? `; the previous funnel handler was restored (tailscale ${argv.join(' ')}) and the existing receipt kept`
+        : `; the previous funnel handler could NOT be restored (tailscale ${argv.join(' ')}: ${r ? `exit ${r.status ?? 'null'}` : 'runner threw'}) — run \`tailscale serve status\`; the existing receipt was kept`;
+    };
     const publishArgv = tailscaleServeArgv(opts.port, { funnel: opts.funnel });
     const pub = await d.run([binary, ...publishArgv], { timeoutMs: PUBLISH_TIMEOUT_MS });
     if (pub.status !== 0) {
+      const restored = await restorePrevious();
       if (pub.status === null) {
         // Killed at the deadline: most likely the CLI was waiting for an
         // enablement step the pre-checks could not see. Say so, never guess.
         const hint = `\`tailscale ${publishArgv.join(' ')}\` did not finish within ${PUBLISH_TIMEOUT_MS / 1000}s (it may be waiting for you to enable a feature). Run it by hand to see what it prints, then re-run: ${rerun}`;
-        s.check('tailscale.publish', 'fail', `unknown: timed out after ${PUBLISH_TIMEOUT_MS / 1000}s`);
+        s.check('tailscale.publish', 'fail', `unknown: timed out after ${PUBLISH_TIMEOUT_MS / 1000}s${restored}`);
         s.nextActions.push(`tailscale ${publishArgv.join(' ')}`);
         return s.finish('error', 1, { reason: 'tailscale_unknown', message: hint });
       }
       const cls = classifyTailscaleError(pub.stderr || pub.stdout, { platform: d.platform, user: d.user });
-      s.check('tailscale.publish', 'fail', `${cls.kind}: ${cls.raw || `exit ${pub.status}`}`);
+      s.check('tailscale.publish', 'fail', `${cls.kind}: ${cls.raw || `exit ${pub.status}`}${restored}`);
       s.nextActions.push(cls.fix);
       return s.finish('error', 1, { reason: `tailscale_${cls.kind}`, message: cls.fix });
     }
@@ -807,7 +890,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     const confirmed = afterRead.view ? findProxiedHandler(afterRead.view, opts.port) : null;
     if (!confirmed) {
       const why = afterRead.view ? `serve status shows no / handler for port ${opts.port}` : describeServeReadFailure(d, afterRead).detail;
-      s.check('tailscale.publish', 'fail', `tailscale ${publishArgv.join(' ')} exited 0 but ${why}`);
+      s.check('tailscale.publish', 'fail', `tailscale ${publishArgv.join(' ')} exited 0 but ${why}${await restorePrevious()}`);
       s.nextActions.push('tailscale serve status', 'gbrain mcp expose --remove --yes');
       return s.finish('error', 1, { reason: 'tailscale_publish_unconfirmed', message: `Tailscale accepted the command but ${afterRead.view ? 'does not show the handler' : 'its serve status could not be read afterwards'}. Run \`tailscale serve status\` to inspect; \`gbrain mcp expose --remove --yes\` clears a handler for port ${opts.port} without a receipt (add --force when no wrapper or service of gbrain's is on this host yet).` });
     }
@@ -845,7 +928,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     };
   };
   let localHealth: 'ok' | 'timeout' | 'skipped' = 'skipped';
-  let tailnetHealth: 'ok' | 'pending' | 'skipped' = 'skipped';
+  let tailnetHealth: 'ok' | 'pending' | 'unresolved' | 'skipped' = 'skipped';
   /** Set once the early receipt (right after the service step) is on disk: from then on `--remove` can find everything. */
   let receiptWritten = false;
   try {
@@ -868,7 +951,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
       });
       const installed = await installServeService({
         target, wrapperPath: wrapper, wrapperContent: content, home: d.home, logPath: serveLogPath(d.serveDir), errPath: serveErrPath(d.serveDir),
-        run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath,
+        run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath, sleep: d.sleep,
       });
       serviceReceipt.plist_path = installed.plist_path;
       serviceReceipt.unit_path = installed.unit_path;
@@ -911,12 +994,16 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
     } else if (target === 'none' && !opts.noService && !listeningBefore) {
       s.check('verify.local', 'skipped', 'manual service: start the wrapper, then run --status');
     } else {
-      localHealth = (await pollHealth(d, localHealthUrl, d.localHealthMs)) ? 'ok' : 'timeout';
+      localHealth = (await pollHealth(d, localHealthUrl, d.localHealthMs)).ok ? 'ok' : 'timeout';
       s.check('verify.local', localHealth === 'ok' ? 'ok' : 'warn', `${localHealthUrl}: ${localHealth}`);
     }
     if (!opts.noTailscale && localHealth === 'ok') {
-      tailnetHealth = (await pollHealth(d, `${publicUrl}/health`, d.tailnetHealthMs)) ? 'ok' : 'pending';
-      s.check('verify.tailnet', tailnetHealth === 'ok' ? 'ok' : 'pending', `${publicUrl}/health: ${tailnetHealth}${tailnetHealth === 'pending' ? ' (first certificate issuance can take a minute)' : ''}`);
+      const tn = await pollHealth(d, `${publicUrl}/health`, d.tailnetHealthMs);
+      tailnetHealth = tn.ok ? 'ok' : tn.unresolved ? 'unresolved' : 'pending';
+      // A name this host cannot resolve is a warn (MagicDNS off HERE), never
+      // `pending`: the server may already be reachable from devices that do.
+      if (tailnetHealth === 'unresolved') s.check('verify.tailnet', 'warn', `${publicUrl}/health: ${unresolvedDetail(tsStatus!.dnsName!)}`);
+      else s.check('verify.tailnet', tailnetHealth === 'ok' ? 'ok' : 'pending', `${publicUrl}/health: ${tailnetHealth}${tailnetHealth === 'pending' ? ' (first certificate issuance can take a minute)' : ''}`);
     } else {
       s.check('verify.tailnet', 'skipped', opts.noTailscale ? '--no-tailscale' : 'local server not confirmed yet');
     }
@@ -950,6 +1037,7 @@ async function runPublish(d: Resolved, s: Session, opts: ExposeOptions): Promise
   }
   if (localHealth === 'timeout') s.say(`  Health    local ${localHealthUrl} did not answer within ${Math.round(d.localHealthMs / 1000)}s — check ${tildify(serveErrPath(d.serveDir), d.home)}`);
   if (tailnetHealth === 'pending') s.say(`  Health    ${publicUrl}/health still pending — re-run \`gbrain mcp expose --status\` in a minute.`);
+  if (tailnetHealth === 'unresolved') s.say(`  Health    ${publicUrl}/health: ${unresolvedDetail(tsStatus!.dnsName!)}`);
   s.say('');
   s.say('Next');
   s.say(`  Grant a client   gbrain mcp grant <name> --harness <id> --profile memory-writer --source default \\`);
@@ -986,14 +1074,9 @@ function args2(opts: ExposeOptions): string {
 // --status
 // ---------------------------------------------------------------------------
 
-async function runStatus(d: Resolved, s: Session): Promise<number> {
+async function runStatus(d: Resolved, s: Session, opts: ExposeOptions): Promise<number> {
   const receipt = readExposeReceipt(receiptPathFor(d.serveDir));
-  if (!receipt) {
-    s.check('receipt', 'skipped', 'no expose receipt');
-    s.say('not exposed — run: gbrain mcp expose');
-    s.nextActions.push('gbrain mcp expose');
-    return s.finish('not_exposed', s.json ? 2 : 0, { reason: 'not_exposed' });
-  }
+  if (!receipt) return runStatusWithoutReceipt(d, s, opts);
   s.check('receipt', 'ok', `${receipt.mode} on port ${receipt.port} since ${receipt.created_at}`);
   let allOk = true;
   let pending = false;
@@ -1003,11 +1086,11 @@ async function runStatus(d: Resolved, s: Session): Promise<number> {
   const binary = viaTailscale ? resolveReceiptBinary(d, receipt) : null;
   const localUrl = `http://127.0.0.1:${receipt.port}/health`;
   const tailnetUrl = receipt.public_url.startsWith('https://') ? `${receipt.public_url}/health` : null;
-  const [serveRead, state, localOk, tailnetOk] = await Promise.all([
+  const [serveRead, state, localOk, tailnet] = await Promise.all([
     binary ? readServeView(d, binary) : Promise.resolve<ServeRead | null>(null),
     receipt.service.state !== 'skipped' ? serveServiceState({ target: receipt.service.target, run: d.run, uid: d.uid }) : Promise.resolve<ServiceState | 'skipped'>('skipped'),
     probeHealth(d, localUrl, 3_000),
-    tailnetUrl ? probeHealth(d, tailnetUrl, 8_000) : Promise.resolve<boolean | null>(null),
+    tailnetUrl ? tryFetch(d, tailnetUrl, 8_000) : Promise.resolve<FetchOutcome | null>(null),
   ]);
   // tailscale
   if (!viaTailscale) {
@@ -1038,9 +1121,10 @@ async function runStatus(d: Resolved, s: Session): Promise<number> {
   // health
   if (!localOk) allOk = false;
   s.check('verify.local', localOk ? 'ok' : 'fail', `${localUrl}: ${localOk ? 'ok' : 'no answer'}`);
-  if (tailnetUrl) {
-    if (!tailnetOk) pending = true;
-    s.check('verify.tailnet', tailnetOk ? 'ok' : 'pending', `${tailnetUrl}: ${tailnetOk ? 'ok' : 'pending'}`);
+  if (tailnetUrl && tailnet) {
+    if (tailnet.res?.ok) s.check('verify.tailnet', 'ok', `${tailnetUrl}: ok`);
+    else if (tailnet.unresolved) s.check('verify.tailnet', 'warn', `${tailnetUrl}: ${unresolvedDetail(receipt.tailscale.dns_name ?? receipt.public_url.slice('https://'.length))}`);
+    else { pending = true; s.check('verify.tailnet', 'pending', `${tailnetUrl}: pending`); }
   } else {
     s.check('verify.tailnet', 'skipped', 'no https public URL');
   }
@@ -1053,6 +1137,80 @@ async function runStatus(d: Resolved, s: Session): Promise<number> {
   // "wait a minute" from "broken", but it is still a non-zero exit.
   if (pending) { s.nextActions.push('gbrain mcp expose --status'); return s.finish('pending', 1, { receipt, reason: 'tailnet_health_pending', message: 'tailnet health still pending (first certificate issuance can take a minute) — re-run --status shortly.' }); }
   return s.finish('exposed', 0, { receipt });
+}
+
+interface Leftovers {
+  wrapper: string;
+  wrapperExists: boolean;
+  binary: string | null;
+  target: ServiceTarget;
+  serviceState: ServiceState | null;
+  /** The launchd plist / systemd unit is present, or the supervisor reports our service live. */
+  serviceFound: boolean;
+  /** The `/` handler on `:443` proxying `port`, when the serve config could be read. */
+  handler: ServeHandler | null;
+  /** The serve-status read that FAILED (null view), for the caveat line. */
+  serveUnreadable: ServeRead | null;
+  /** Something of gbrain's besides a handler: the wrapper or the service. */
+  evidence: boolean;
+}
+
+/**
+ * What an interrupted `gbrain mcp expose` (no receipt) can leave behind:
+ * `wrapperPath(serveDir)`, the launchd plist / systemd unit or a live
+ * service, and a `/` handler on `:443` proxying `port`. Read-only; shared by
+ * `--status` and `--remove` without a receipt. The supervisor chain and the
+ * serve-status read are independent probes.
+ */
+async function probeLeftovers(d: Resolved, port: number): Promise<Leftovers> {
+  const wrapper = wrapperPathFor(d.serveDir);
+  const binary = findTailscaleBinary({ which: d.which, fileExists: d.fileExists });
+  const [[target, serviceState], read] = await Promise.all([
+    probeServiceTarget(d).then(async (t): Promise<[ServiceTarget, ServiceState | null]> => [t, t !== 'none' ? await serveServiceState({ target: t, run: d.run, uid: d.uid }) : null]),
+    binary ? readServeView(d, binary) : Promise.resolve<ServeRead | null>(null),
+  ]);
+  const unitFile = target === 'macos' ? d.plistPath : target === 'linux-systemd' ? d.unitPath : null;
+  const wrapperExists = existsSync(wrapper);
+  const serviceFound = target !== 'none' && ((unitFile !== null && existsSync(unitFile)) || isLiveService(serviceState));
+  return {
+    wrapper, wrapperExists, binary, target, serviceState, serviceFound,
+    handler: read?.view ? findProxiedHandler(read.view, port) : null,
+    serveUnreadable: read && !read.view ? read : null,
+    evidence: wrapperExists || serviceFound,
+  };
+}
+
+/** `--remove --yes [--force] [--port N]` for the receipt-less recovery. */
+function recoveryCommand(port: number, force: boolean): string {
+  return `gbrain mcp expose --remove --yes${force ? ' --force' : ''}${port !== DEFAULT_EXPOSE_PORT ? ` --port ${port}` : ''}`;
+}
+
+/**
+ * `--status` with NO receipt: not simply "not exposed" — an interrupted run
+ * may have left the wrapper, the unit / service or a `:443` handler behind.
+ * Any of them found → one warn check per artifact, the recovery command in
+ * `next_actions` (`--force` when only a handler stands, since nothing else of
+ * gbrain's corroborates it), reason `leftovers_without_receipt`, exit 1.
+ */
+async function runStatusWithoutReceipt(d: Resolved, s: Session, opts: ExposeOptions): Promise<number> {
+  const lo = await probeLeftovers(d, opts.port);
+  const found: string[] = [];
+  if (lo.wrapperExists || lo.serviceFound || lo.handler) s.check('receipt', 'warn', `no expose receipt, but leftovers of an interrupted publish are on this host (port ${opts.port})`);
+  else s.check('receipt', 'skipped', 'no expose receipt');
+  if (lo.serviceFound) { s.check('service', 'warn', `${serviceKindLabel(lo.target)} is installed${lo.serviceState ? ` (${lo.serviceState})` : ''} without a receipt`); found.push(`the ${serviceKindLabel(lo.target)} service`); }
+  if (lo.handler) { s.check('tailscale.publish', 'warn', `a :443 handler proxies ${lo.handler.proxy}${lo.handler.funnel ? ' (funnel)' : ''} without a receipt`); found.push(`the :443 handler proxying ${lo.handler.proxy}`); }
+  else if (lo.serveUnreadable) s.check('tailscale.publish', 'warn', `${describeServeReadFailure(d, lo.serveUnreadable).detail}; a handler for port ${opts.port} could not be checked`);
+  if (lo.wrapperExists) { s.check('files', 'warn', `wrapper ${tildify(lo.wrapper, d.home)} exists without a receipt`); found.push(`the wrapper ${tildify(lo.wrapper, d.home)}`); }
+  if (found.length === 0) {
+    s.say('not exposed — run: gbrain mcp expose');
+    s.nextActions.push('gbrain mcp expose');
+    return s.finish('not_exposed', s.json ? 2 : 0, { reason: 'not_exposed' });
+  }
+  const rerun = recoveryCommand(opts.port, !lo.evidence);
+  s.say(`not exposed, but an interrupted \`gbrain mcp expose\` left these behind (port ${opts.port}): ${found.join('; ')}`);
+  s.say(`  Clean up: ${rerun}`);
+  s.nextActions.push(rerun);
+  return s.finish('error', 1, { reason: 'leftovers_without_receipt', message: `leftovers without a receipt: ${found.join('; ')} — run ${rerun}` });
 }
 
 // ---------------------------------------------------------------------------
@@ -1099,8 +1257,41 @@ function recordHandlerOff(s: Session, outcome: HandlerOffOutcome, left: string[]
     left.push('the tailscale serve handler (state unknown: serve status could not be re-read)');
     return;
   }
-  s.check('tailscale.publish', remaining ? 'warn' : 'ok', `${results.join(', ')}${remaining ? ' — handler still present; run `tailscale serve status`' : ''}`);
+  s.check('tailscale.publish', remaining ? 'fail' : 'ok', `${results.join(', ')}${remaining ? ' — handler still present; run `tailscale serve status`' : ''}`);
   if (remaining) left.push('the tailscale serve handler');
+}
+
+/**
+ * `--remove` never reports success while our handler survives: when the off
+ * attempt leaves it present (or its state unreadable) the receipt and the
+ * wrapper are kept — exactly as on an unreadable serve status — so a re-run
+ * finds everything again, and the exit is 1 / `handler_not_removed`. The
+ * service was already uninstalled by then; `serviceNote` says so.
+ */
+function finishHandlerNotRemoved(s: Session, p: { receipt: ExposeReceipt | null; port: number; remaining: ServeHandler | 'unknown'; serviceNote: string; kept: string; rerun: string }): number {
+  const why = p.remaining === 'unknown' ? 'could not be confirmed gone (tailscale serve status could not be re-read)' : 'is still present';
+  s.check(p.receipt ? 'receipt' : 'files', 'skipped', `kept: ${p.kept} — the :443 handler for port ${p.port} ${why}; re-run --remove once it can be turned off`);
+  s.nextActions.push('tailscale serve status', p.rerun);
+  s.say('');
+  s.say(`Stopped here: ${p.serviceNote}, but the tailscale handler for port ${p.port} ${why}. Left in place: ${p.kept}. Run \`tailscale serve status\`, then re-run \`${p.rerun}\`.`);
+  return s.finish('error', 1, { receipt: p.receipt, reason: 'handler_not_removed', message: `the tailscale handler for port ${p.port} ${why}; left in place: ${p.kept}` });
+}
+
+/**
+ * The `service` check after `uninstallServeService`: notes as prose; a launchd
+ * bootout that failed for a non-benign reason is a warn and the job is named
+ * as left. Returns the one-line summary `finishHandlerNotRemoved` quotes.
+ */
+function recordServiceUninstall(s: Session, r: UninstallServiceResult, left: string[]): string {
+  for (const note of r.notes) s.say(`Note: ${note}`);
+  const files = r.removed.length ? `removed ${r.removed.join(', ')}` : 'no unit file to delete';
+  if (launchdBootoutFailed(r)) {
+    left.push('the launchd job (bootout failed)');
+    s.check('service', 'warn', `${files}; launchctl bootout failed, so the job may still be loaded — check \`launchctl print gui/$(id -u)/${SERVE_LAUNCHD_LABEL}\``);
+    return 'the service files were removed but the launchd bootout failed';
+  }
+  s.check('service', 'ok', r.removed.length ? files : 'stopped (no unit file to delete)');
+  return 'the service was stopped and removed';
 }
 
 /**
@@ -1163,10 +1354,9 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
   for (const [recorded, computed] of [[receipt.service.plist_path, d.plistPath], [receipt.service.unit_path, d.unitPath]] as const) {
     if (recorded !== null && recorded !== computed) left.push(`${tildify(recorded, d.home)} (${RECORDED_ELSEWHERE_NOTE})`);
   }
+  let serviceNote = 'there was no service to stop';
   if (serviceKnown && serviceTarget !== 'none') {
-    const r = await uninstallServeService({ target: serviceTarget, home: d.home, run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath });
-    for (const note of r.notes) s.say(`Note: ${note}`);
-    s.check('service', 'ok', r.removed.length ? `removed ${r.removed.join(', ')}` : 'stopped (no unit file to delete)');
+    serviceNote = recordServiceUninstall(s, await uninstallServeService({ target: serviceTarget, home: d.home, run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath }), left);
   } else {
     const manualLeft = receipt.service.target === 'none' && receipt.service.state !== 'skipped';
     s.check('service', 'skipped', manualLeft ? 'manual service: stop the wrapper process yourself if it is running' : 'none installed');
@@ -1194,7 +1384,11 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
       if (!ours) {
         s.check('tailscale.publish', 'ok', `no :443 handler proxies to port ${receipt.port}; nothing to turn off`);
       } else {
-        recordHandlerOff(s, await turnOffOurHandler(d, binary, receipt.port, ours, receipt.mode === 'funnel'), left);
+        const outcome = await turnOffOurHandler(d, binary, receipt.port, ours, receipt.mode === 'funnel');
+        recordHandlerOff(s, outcome, left);
+        if (outcome.remaining !== null) {
+          return finishHandlerNotRemoved(s, { receipt, port: receipt.port, remaining: outcome.remaining, kept: 'the wrapper and the receipt', rerun: 'gbrain mcp expose --remove --yes', serviceNote });
+        }
       }
     }
     left.push('Tailscale itself (installed and signed in)');
@@ -1234,22 +1428,10 @@ async function runRemove(d: Resolved, s: Session, opts: ExposeOptions): Promise<
  * found → today's "not exposed — nothing to remove", exit 0.
  */
 async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOptions): Promise<number> {
-  const wrapper = wrapperPathFor(d.serveDir);
-  const wrapperExists = existsSync(wrapper);
-  const binary = findTailscaleBinary({ which: d.which, fileExists: d.fileExists });
-  // The supervisor chain and the serve-status read are independent probes.
-  const [[target, serviceState], read] = await Promise.all([
-    probeServiceTarget(d).then(async (t): Promise<[ServiceTarget, ServiceState | null]> => [t, t !== 'none' ? await serveServiceState({ target: t, run: d.run, uid: d.uid }) : null]),
-    binary ? readServeView(d, binary) : Promise.resolve<ServeRead | null>(null),
-  ]);
-  const unitFile = target === 'macos' ? d.plistPath : target === 'linux-systemd' ? d.unitPath : null;
-  const serviceFound = target !== 'none' && ((unitFile !== null && existsSync(unitFile)) || isLiveService(serviceState));
-  const handler = read?.view ? findProxiedHandler(read.view, opts.port) : null;
-  const serveUnreadable = read && !read.view ? read : null;
-  const evidence = wrapperExists || serviceFound;
+  const { wrapper, wrapperExists, binary, target, serviceState, serviceFound, handler, serveUnreadable, evidence } = await probeLeftovers(d, opts.port);
   /** The handler we will turn off: only with corroborating evidence or `--force`. */
   const handlerOff = handler && (evidence || opts.force) ? handler : null;
-  const forceRerun = `gbrain mcp expose --remove --yes --force${opts.port !== DEFAULT_EXPOSE_PORT ? ` --port ${opts.port}` : ''}`;
+  const forceRerun = recoveryCommand(opts.port, true);
   if (!evidence && !handlerOff) {
     s.check('receipt', 'skipped', 'no expose receipt; nothing to remove');
     if (serveUnreadable) s.check('tailscale.publish', 'warn', `${describeServeReadFailure(d, serveUnreadable).detail}; a handler for port ${opts.port} could not be checked`);
@@ -1272,18 +1454,24 @@ async function runRemoveWithoutReceipt(d: Resolved, s: Session, opts: ExposeOpti
   s.check('plan', 'ok', plan.join(' | '));
   s.say(`Recovering without a receipt (an interrupted \`gbrain mcp expose\` left these behind; port ${opts.port}):`);
   for (const line of plan) s.say(`  ${line}`);
-  const consent = await confirmOrFinish(d, s, 'Remove these leftovers? [y/N] ', { yes: opts.yes, receipt: null, confirmationMessage: 'Pass --yes to confirm the removal.', nextAction: `gbrain mcp expose --remove --yes${opts.force ? ' --force' : ''}${opts.port !== DEFAULT_EXPOSE_PORT ? ` --port ${opts.port}` : ''}` });
+  const rerun = recoveryCommand(opts.port, opts.force);
+  const consent = await confirmOrFinish(d, s, 'Remove these leftovers? [y/N] ', { yes: opts.yes, receipt: null, confirmationMessage: 'Pass --yes to confirm the removal.', nextAction: rerun });
   if (consent !== null) return consent;
   const left: string[] = [];
+  let serviceNote = 'no service was found';
   if (serviceFound) {
-    const r = await uninstallServeService({ target, home: d.home, run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath });
-    for (const note of r.notes) s.say(`Note: ${note}`);
-    s.check('service', 'ok', r.removed.length ? `removed ${r.removed.join(', ')}` : 'stopped (no unit file to delete)');
+    serviceNote = recordServiceUninstall(s, await uninstallServeService({ target, home: d.home, run: d.run, uid: d.uid, plistPath: d.plistPath, unitPath: d.unitPath }), left);
   } else {
     s.check('service', 'skipped', 'none found');
   }
   if (handlerOff && binary) {
-    recordHandlerOff(s, await turnOffOurHandler(d, binary, opts.port, handlerOff, handlerOff.funnel), left);
+    const outcome = await turnOffOurHandler(d, binary, opts.port, handlerOff, handlerOff.funnel);
+    recordHandlerOff(s, outcome, left);
+    // The wrapper stays as corroborating evidence for the re-run (without it
+    // a handler standing alone would need `--force`).
+    if (outcome.remaining !== null) {
+      return finishHandlerNotRemoved(s, { receipt: null, port: opts.port, remaining: outcome.remaining, kept: wrapperExists ? 'the wrapper' : 'nothing (no wrapper was found)', rerun: recoveryCommand(opts.port, opts.force || !wrapperExists), serviceNote });
+    }
     left.push('Tailscale itself (installed and signed in)');
   } else if (serveUnreadable) {
     s.check('tailscale.publish', 'warn', `${describeServeReadFailure(d, serveUnreadable).detail}; handler left as is`);

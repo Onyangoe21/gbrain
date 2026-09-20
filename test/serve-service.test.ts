@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CommandResult, CommandRunner, CommandRunOptions } from '../src/core/tailscale.ts';
 import {
-  ADMIN_TOKEN_SHAPE, adminTokenPath, detectServiceTarget, ensureAdminToken, installServeService, launchdPlistPath,
+  ADMIN_TOKEN_SHAPE, adminTokenPath, detectServiceTarget, ensureAdminToken, installServeService, launchdBootoutFailed, launchdPlistPath,
   readExposeReceipt, receiptPath, refuseSymlink, renderServeLaunchdPlist, renderServeSystemdUnit, renderServeWrapper,
   resolveServeGbrainCommand, serveCommandArgv, serveErrPath, serveLogPath, serveServiceState, SERVE_LAUNCHD_LABEL, SERVE_SYSTEMD_UNIT, systemdUnitPath,
   uninstallServeService, wrapperPath, writeExposeReceipt, type ExposeReceipt,
@@ -34,6 +34,8 @@ function makeRunner(rules: Rule[] = []): { run: CommandRunner; calls: string[][]
 }
 
 const TOKEN = 'a'.repeat(64);
+/** launchd settle retries pause 1s each; every test that provokes a bootstrap failure injects this so it never waits. */
+const noSleep = async (): Promise<void> => {};
 
 describe('paths + target detection', () => {
   test('path helpers hang off the serve dir', () => {
@@ -57,9 +59,9 @@ describe('paths + target detection', () => {
   test('resolveServeGbrainCommand: shim > compiled execPath > bun + cli.ts', () => {
     expect(resolveServeGbrainCommand({ which: () => '/usr/local/bin/gbrain' })).toEqual(['/usr/local/bin/gbrain']);
     expect(resolveServeGbrainCommand({ which: () => null, execPath: '/opt/gbrain/bin/gbrain', argv1: '' })).toEqual(['/opt/gbrain/bin/gbrain']);
-    const viaBun = resolveServeGbrainCommand({ which: () => null, execPath: '/home/u/.bun/bin/bun', argv1: '/repo/src/cli.ts' });
+    const viaBun = resolveServeGbrainCommand({ which: () => null, execPath: '/home/u/.bun/bin/bun', argv1: '/repo/src/cli.ts', metaUrl: 'file:///repo/src/core/serve-service.ts', fileExists: p => p === '/repo/src/cli.ts' });
     expect(viaBun[0]).toBe('/home/u/.bun/bin/bun');
-    expect(viaBun[1]).toMatch(/\/src\/cli\.ts$/);
+    expect(viaBun[1]).toBe('/repo/src/cli.ts');
   });
   test('resolveServeGbrainCommand: a compiled binary is [execPath] whatever its basename; dev mode needs cli.ts on disk, else [execPath]', () => {
     const devMeta = 'file:///repo/src/core/serve-service.ts';
@@ -242,8 +244,8 @@ describe('install / uninstall / state', () => {
     expect(calls.map(c => c.join(' '))).toEqual([`launchctl bootout gui/501 ${plist}`, `launchctl bootstrap gui/501 ${plist}`]);
     expect(calls.some(c => c[1] === 'load' || c[1] === 'unload')).toBe(false);
     const bad = makeRunner([{ key: 'launchctl bootstrap', status: 5, stderr: 'Bootstrap failed: 5: Input/output error' }]);
-    const r2 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: bad.run, plistPath: plist, uid: 501 });
-    expect(r2.error).toBe('launchctl bootstrap failed: Bootstrap failed: 5: Input/output error');
+    const r2 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: bad.run, plistPath: plist, uid: 501, sleep: noSleep });
+    expect(r2.error).toBe('launchctl bootstrap failed: Bootstrap failed: 5: Input/output error (after 5 settle retries)');
     expect(bad.calls.some(c => c[1] === 'load')).toBe(false);
     const off = await uninstallServeService({ target: 'macos', home, run, plistPath: plist, uid: 501 });
     expect(off.removed).toEqual([plist]);
@@ -272,11 +274,11 @@ describe('install / uninstall / state', () => {
       { key: 'launchctl bootstrap', status: 1, stderr: 'launchctl: unrecognized subcommand' },
       { key: 'launchctl load', status: 5, stderr: 'load failed: 5: Input/output error' },
     ]);
-    const r2 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: legacyBad.run, plistPath: plist, uid: 501 });
-    expect(r2.error).toBe('launchctl load failed: load failed: 5: Input/output error');
+    const r2 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: legacyBad.run, plistPath: plist, uid: 501, sleep: noSleep });
+    expect(r2.error).toBe('launchctl load failed: load failed: 5: Input/output error (after 5 settle retries)');
     // a GENUINE bootstrap failure (or a killed call) never falls back to load
     const genuine = makeRunner([{ key: 'launchctl bootstrap', status: 5, stderr: 'Bootstrap failed: 5: Input/output error' }]);
-    await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: genuine.run, plistPath: plist, uid: 501 });
+    await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: genuine.run, plistPath: plist, uid: 501, sleep: noSleep });
     expect(genuine.calls.some(c => c[1] === 'load')).toBe(false);
     const killed = makeRunner([{ key: 'launchctl bootstrap', status: null, stderr: 'Unknown command (timed out)' }]);
     const r3 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: killed.run, plistPath: plist, uid: 501 });
@@ -286,6 +288,73 @@ describe('install / uninstall / state', () => {
     const off = makeRunner([{ key: 'launchctl bootout', status: 1, stderr: 'Unknown command: bootout' }]);
     await uninstallServeService({ target: 'macos', home, run: off.run, plistPath: plist, uid: 501 });
     expect(off.calls.map(c => c.join(' '))).toEqual([`launchctl bootout gui/501 ${plist}`, `launchctl unload ${plist}`]);
+  });
+  test('macos uninstall: a bootout that fails for a reason other than "not loaded" is a note (the job may still be loaded); the benign not-loaded answers are silent', async () => {
+    const home = temp();
+    const plist = join(home, 'LaunchAgents', 'com.gbrain.serve.plist');
+    mkdirSync(join(home, 'LaunchAgents'), { recursive: true });
+    for (const stderr of ['Boot-out failed: 3: No such process', 'Could not find service "com.gbrain.serve" in domain for uid: 501', 'not find service', 'Unload failed: not loaded']) {
+      writeFileSync(plist, '<plist/>');
+      const benign = makeRunner([{ key: 'launchctl bootout', status: 3, stderr }]);
+      const r = await uninstallServeService({ target: 'macos', home, run: benign.run, plistPath: plist, uid: 501 });
+      expect(r).toEqual({ removed: [plist], notes: [] });
+      expect(launchdBootoutFailed(r)).toBe(false);
+    }
+    writeFileSync(plist, '<plist/>');
+    const bad = makeRunner([{ key: 'launchctl bootout', status: 1, stderr: 'Boot-out failed: 1: Operation not permitted' }]);
+    const r = await uninstallServeService({ target: 'macos', home, run: bad.run, plistPath: plist, uid: 501 });
+    expect(r.removed).toEqual([plist]);
+    expect(r.notes).toEqual(['launchctl bootout failed: Boot-out failed: 1: Operation not permitted']);
+    expect(launchdBootoutFailed(r)).toBe(true);
+    // killed (status null) is a failure too; a silent failure reports the exit status
+    const killed = makeRunner([{ key: 'launchctl bootout', status: null, stderr: '\n(timed out after 60000ms)' }]);
+    expect(launchdBootoutFailed(await uninstallServeService({ target: 'macos', home, run: killed.run, plistPath: plist, uid: 501 }))).toBe(true);
+    const silent = makeRunner([{ key: 'launchctl bootout', status: 5 }]);
+    expect((await uninstallServeService({ target: 'macos', home, run: silent.run, plistPath: plist, uid: 501 })).notes).toEqual(['launchctl bootout failed: exit 5']);
+    // the legacy verb is reported under its own name
+    const legacy = makeRunner([{ key: 'launchctl bootout', status: 1, stderr: 'Unknown command: bootout' }, { key: 'launchctl unload', status: 1, stderr: 'Unload failed: 1: Operation not permitted' }]);
+    const lr = await uninstallServeService({ target: 'macos', home, run: legacy.run, plistPath: plist, uid: 501 });
+    expect(lr.notes).toEqual(['launchctl unload failed: Unload failed: 1: Operation not permitted']);
+    expect(launchdBootoutFailed(lr)).toBe(true);
+    // systemd notes never look like a launchd bootout failure
+    expect(launchdBootoutFailed({ removed: [], notes: ['systemctl --user disable --now: exit null'] })).toBe(false);
+  });
+  test('macos install: a bootstrap that fails while launchd is still unloading the previous job (I/O error / already in progress / 5 / 37) is retried up to 5 times, 1s apart, through the injected sleep', async () => {
+    const home = temp();
+    const plist = join(home, 'LaunchAgents', 'com.gbrain.serve.plist');
+    const settle = (failures: number, stderr: string) => {
+      let bootstraps = 0;
+      const slept: number[] = [];
+      const run: CommandRunner = async (argv) => {
+        if (argv[1] === 'bootstrap') { bootstraps++; if (bootstraps <= failures) return { status: 5, stdout: '', stderr }; }
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      return { run, slept, sleep: async (ms: number) => { slept.push(ms); }, bootstraps: () => bootstraps };
+    };
+    // fails twice, then succeeds: three bootstrap calls, two 1s pauses, no error, a note names the retries
+    const twice = settle(2, 'Bootstrap failed: 5: Input/output error');
+    const r = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: twice.run, plistPath: plist, uid: 501, sleep: twice.sleep });
+    expect(r.error).toBeUndefined();
+    expect(twice.bootstraps()).toBe(3);
+    expect(twice.slept).toEqual([1000, 1000]);
+    expect(r.notes).toEqual(['launchctl bootstrap succeeded after 2 settle retries (launchd was still unloading the previous job)']);
+    // "already in progress" (37) is transient too; one retry reads as singular
+    const once = settle(1, 'Bootstrap failed: 37: Operation already in progress');
+    const r1 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: once.run, plistPath: plist, uid: 501, sleep: once.sleep });
+    expect(r1.error).toBeUndefined();
+    expect(r1.notes).toEqual(['launchctl bootstrap succeeded after 1 settle retry (launchd was still unloading the previous job)']);
+    // exhausted: 1 + 5 attempts, 5 pauses, then the error names the retries
+    const never = settle(Number.POSITIVE_INFINITY, 'Bootstrap failed: 5: Input/output error');
+    const r2 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: never.run, plistPath: plist, uid: 501, sleep: never.sleep });
+    expect(r2.error).toBe('launchctl bootstrap failed: Bootstrap failed: 5: Input/output error (after 5 settle retries)');
+    expect(never.bootstraps()).toBe(6);
+    expect(never.slept).toEqual(Array(5).fill(1000));
+    // a failure that is not a settle symptom is never retried
+    const other = settle(Number.POSITIVE_INFINITY, 'Bootstrap failed: 125: Domain does not support specified action');
+    const r3 = await installServeService({ target: 'macos', wrapperPath: join(home, 'w.sh'), wrapperContent: '#!/bin/bash\n', home, logPath: '/l', errPath: '/e', run: other.run, plistPath: plist, uid: 501, sleep: other.sleep });
+    expect(r3.error).toBe('launchctl bootstrap failed: Bootstrap failed: 125: Domain does not support specified action');
+    expect(other.bootstraps()).toBe(1);
+    expect(other.slept).toEqual([]);
   });
   test('target none: only the wrapper is written, no exec', async () => {
     const home = temp();

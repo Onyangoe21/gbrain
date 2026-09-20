@@ -7,7 +7,9 @@
  * normalized to 0644 (launchd rejects group-writable agents), domain-explicit
  * `launchctl bootout gui/<uid>` before `bootstrap gui/<uid>` (launchd; the
  * legacy `unload`/`load` pair only when the installed launchctl does not know
- * the modern verbs) / enable + restart (systemd) so a reinstall relaunches the
+ * the modern verbs; a bootstrap that fails while launchd is still unloading
+ * the old job is retried with a pause) / enable + restart (systemd) so a
+ * reinstall relaunches the
  * job, the running bun's directory prepended to PATH (rc files bail early
  * under a supervisor), `~/.gbrain/env`
  * sourced with `set -a`, and the admin token read from its 0600 file at RUN
@@ -351,6 +353,8 @@ export interface InstallServiceParams {
   unitPath?: string;
   /** launchd domain owner for `bootout`/`bootstrap gui/<uid>` (default: the running process's uid, else 501). */
   uid?: number;
+  /** Wait between launchd bootstrap settle retries (default `setTimeout`; tests inject a no-op). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface InstallServiceResult {
@@ -376,6 +380,16 @@ const SUPERVISOR_PROBE_TIMEOUT_MS = 15_000;
 
 /** The launchctl on this Mac predates the domain-explicit verbs (macOS < 10.11 era, or a stripped build). */
 const LAUNCHCTL_LEGACY_RE = /Unknown command|unrecognized|not found/i;
+/**
+ * `bootstrap` right after `bootout` can fail while launchd is still tearing
+ * the old job down: "Bootstrap failed: 5: Input/output error", "37: Operation
+ * already in progress". Transient — retried with a pause.
+ */
+const LAUNCHCTL_SETTLE_RE = /Input\/output error|already in progress|\b5\b|\b37\b/;
+const LAUNCHCTL_SETTLE_RETRIES = 5;
+const LAUNCHCTL_SETTLE_MS = 1_000;
+/** A `bootout` of a job that is not loaded — expected on a fresh install or after a manual removal, never reported. */
+const LAUNCHCTL_NOT_LOADED_RE = /No such process|not loaded|Could not find|not find service/i;
 
 function defaultUid(): number {
   return typeof process.getuid === 'function' ? process.getuid() : 501;
@@ -416,9 +430,17 @@ export async function installServeService(p: InstallServiceParams): Promise<Inst
     // running server must relaunch to pick up a regenerated wrapper anyway.
     // The bootout failure ("not loaded" on a fresh install) is ignored.
     const uid = p.uid ?? defaultUid();
+    const sleep = p.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
     await launchctl(p.run, uid, plist, { modern: 'bootout', legacy: 'unload' });
-    const boot = await launchctl(p.run, uid, plist, { modern: 'bootstrap', legacy: 'load' });
-    if (boot.result.status !== 0) result.error = `launchctl ${boot.verb} failed: ${describeFailure(boot.result)}`;
+    let boot = await launchctl(p.run, uid, plist, { modern: 'bootstrap', legacy: 'load' });
+    let retries = 0;
+    while (boot.result.status !== 0 && retries < LAUNCHCTL_SETTLE_RETRIES && LAUNCHCTL_SETTLE_RE.test(boot.result.stderr)) {
+      retries++;
+      await sleep(LAUNCHCTL_SETTLE_MS);
+      boot = await launchctl(p.run, uid, plist, { modern: 'bootstrap', legacy: 'load' });
+    }
+    if (boot.result.status !== 0) result.error = `launchctl ${boot.verb} failed: ${describeFailure(boot.result)}${retries ? ` (after ${retries} settle ${retries === 1 ? 'retry' : 'retries'})` : ''}`;
+    else if (retries) result.notes.push(`launchctl ${boot.verb} succeeded after ${retries} settle ${retries === 1 ? 'retry' : 'retries'} (launchd was still unloading the previous job)`);
     return result;
   }
   if (p.target === 'linux-systemd') {
@@ -458,13 +480,25 @@ export interface UninstallServiceParams {
   uid?: number;
 }
 
-export interface UninstallServiceResult { removed: string[]; notes: string[] }
+export interface UninstallServiceResult {
+  removed: string[];
+  /** Non-fatal notes; a `launchctl bootout failed: …` / `launchctl unload failed: …` line means the launchd job may still be loaded. */
+  notes: string[];
+}
+
+/** True when `uninstallServeService` could not boot the launchd job out for a reason other than "not loaded". */
+export function launchdBootoutFailed(r: UninstallServiceResult): boolean {
+  return r.notes.some(n => /^launchctl (bootout|unload) failed:/.test(n));
+}
 
 export async function uninstallServeService(p: UninstallServiceParams): Promise<UninstallServiceResult> {
   const out: UninstallServiceResult = { removed: [], notes: [] };
   if (p.target === 'macos') {
     const plist = p.plistPath ?? launchdPlistPath(p.home);
-    await launchctl(p.run, p.uid ?? defaultUid(), plist, { modern: 'bootout', legacy: 'unload' });
+    const boot = await launchctl(p.run, p.uid ?? defaultUid(), plist, { modern: 'bootout', legacy: 'unload' });
+    // A job that was not loaded is the expected answer; anything else means
+    // the job may still be running and the caller has to say so.
+    if (boot.result.status !== 0 && !LAUNCHCTL_NOT_LOADED_RE.test(boot.result.stderr)) out.notes.push(`launchctl ${boot.verb} failed: ${describeFailure(boot.result)}`);
     if (existsSync(plist)) { unlinkSync(plist); out.removed.push(plist); }
     return out;
   }

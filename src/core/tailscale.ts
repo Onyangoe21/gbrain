@@ -28,16 +28,22 @@
  *     do not fail: the CLI prints an enablement URL and WAITS for the operator
  *     (interactive), so the caller pre-checks `CertDomains` / `funnelCapable`
  *     and never starts them blind. Turn OUR handler off with
- *     `tailscale serve --https=443 off` / `tailscale funnel --https=443 off`.
- *     Never `serve reset` (it wipes every handler on the node, not just ours).
+ *     `tailscale serve --https=443 --set-path=/ off` /
+ *     `tailscale funnel --https=443 --set-path=/ off` — the `--set-path=/`
+ *     scopes `off` to the one mount; without it the CLI removes every mount
+ *     under :443 and, when more than one exists, prompts interactively (with
+ *     stdin ignored the prompt reads EOF and the command exits 0 having
+ *     removed nothing). Never `serve reset` (it wipes every handler on the
+ *     node, not just ours).
  *   - Login: Linux `sudo tailscale set --operator=<user>` (non-fatal; so the
  *     user can run `serve` without root afterwards) then a flagless
  *     `sudo tailscale up` — `up --operator=` trips the CLI's accidental-
  *     settings-revert check on a node with non-default prefs; macOS
- *     `tailscale up`.
+ *     `tailscale up`. `sudo` is only ever put in front of a binary at one of
+ *     the system install locations (`isSystemTailscaleBinary`).
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 
 export const TAILSCALE_ADMIN_DNS_URL = 'https://login.tailscale.com/admin/dns';
 export const TAILSCALE_ADMIN_ACL_URL = 'https://login.tailscale.com/admin/acls';
@@ -139,6 +145,17 @@ export function findTailscaleBinary(deps: BinaryProbeDeps = {}): string | null {
   return null;
 }
 
+/**
+ * Whether `binary` is (or resolves through symlinks to) one of the system
+ * install locations. The login step puts `sudo` in front of the binary ONLY
+ * when this holds — a user-writable `~/.local/bin/tailscale` found on PATH
+ * must never be run as root.
+ */
+export function isSystemTailscaleBinary(binary: string, realpath: (p: string) => string = realpathSync): boolean {
+  if (TAILSCALE_BINARY_CANDIDATES.includes(binary)) return true;
+  try { return TAILSCALE_BINARY_CANDIDATES.includes(realpath(binary)); } catch { return false; }
+}
+
 export type TailscaleInstallKind = 'brew-cask' | 'linux-script' | 'unsupported';
 
 export interface TailscaleInstallPlan {
@@ -187,9 +204,9 @@ export function tailscaleServeArgv(port: number, opts: { funnel?: boolean } = {}
   return [opts.funnel ? 'funnel' : 'serve', '--bg', String(port)];
 }
 
-/** Turn OUR `:443` handler off (never `serve reset`). */
+/** Turn OUR `/` mount on `:443` off — `--set-path=/` scopes `off` to that one mount (never `serve reset`). */
 export function tailscaleServeOffArgv(opts: { funnel?: boolean } = {}): string[] {
-  return [opts.funnel ? 'funnel' : 'serve', '--https=443', 'off'];
+  return [opts.funnel ? 'funnel' : 'serve', '--https=443', '--set-path=/', 'off'];
 }
 
 export const TAILSCALE_STATUS_ARGV: readonly string[] = ['status', '--json'];
@@ -217,6 +234,14 @@ export function tailscaleLoginArgv(platform: string, user: string, binary = 'tai
 export function tailscaleSetOperatorCommand(user: string): string {
   return `sudo tailscale set --operator=${user}`;
 }
+
+/** What the operator runs themselves when gbrain refuses to `sudo` a non-system binary (`$USER` expands in their shell). */
+export function tailscaleManualLoginCommand(): string {
+  return `${tailscaleSetOperatorCommand('$USER')} && ${tailscaleLoginArgv('linux', '$USER').up.join(' ')}`;
+}
+
+/** Turns MagicDNS resolution on for THIS node — the fix when the host cannot resolve its own `*.ts.net` name. */
+export const TAILSCALE_ACCEPT_DNS_COMMAND = 'tailscale set --accept-dns=true';
 
 export function tailscaleDaemonStartHint(platform: string): string {
   return platform === 'darwin' ? 'open -a Tailscale' : 'sudo systemctl enable --now tailscaled';

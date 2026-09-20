@@ -41,21 +41,26 @@ PGLite brain's single-writer lock. Every step is reported as a named check
 
 | Step | What happens |
 | --- | --- |
-| `plan` | Resolves options; detects platform, execution environment and engine kind (PGLite vs Postgres); prints what will be installed or changed. A host with **no brain config** (no `gbrain init` yet, or an unreadable config) is refused here with `no_brain_config` — a service there would only crash-loop — unless you pass `--no-service` to publish a server you run yourself (`--dry-run` still prints the plan, with the refusal marked, and exits 0). On a PGLite brain it also reads the lock file: a live process that is not gbrain's own running service adds a `Lock` line and a `pglite_lock` **warning** (the service cannot start until that process exits — stop it, or move to Postgres); the run proceeds. Then it probes `http://127.0.0.1:<port>/health`: **any process that answers there** (a 404 or 500 counts — the port is occupied) with no receipt claiming that port stops the run with `foreign_listener` ("Something already answers on 127.0.0.1:<port> and no expose receipt claims it. Stop it, pick another --port, or pass --no-service to only publish it. If this is a gbrain server left behind by an interrupted `gbrain mcp expose`, run `gbrain mcp expose --remove --yes` first.") **before** anything is published. `--dry-run` stops here. |
+| `plan` | Resolves options; detects platform, execution environment and engine kind (PGLite vs Postgres); prints what will be installed or changed. A host with **no brain config** (no `gbrain init` yet, or an unreadable config) is refused here with `no_brain_config` — a service there would only crash-loop — unless you pass `--no-service` to publish a server you run yourself (`--dry-run` still prints the plan, with the refusal marked, and exits 0). On a PGLite brain it also reads the lock file: a live process that is not gbrain's own running service adds a `Lock` line and a `pglite_lock` **warning** (the service cannot start until that process exits — stop it, or move to Postgres); the run proceeds. `--no-tailscale` while the receipt says the brain is published on the tailnet (it records a MagicDNS name) is refused with `tailscale_receipt_present` — rewriting the receipt to loopback would leave the live Serve/Funnel mapping unfindable; run `gbrain mcp expose --remove --yes` first, or drop the flag. Then it probes `127.0.0.1:<port>`: **anything listening there** — a TCP connect that is accepted (a non-HTTP service too) or an HTTP answer of any status on `/health` (a 404 or 500 counts — the port is occupied) — with no receipt claiming that port stops the run with `foreign_listener` ("Something already answers on 127.0.0.1:<port> and no expose receipt claims it. Stop it, pick another --port, or pass --no-service to only publish it. If this is a gbrain server left behind by an interrupted `gbrain mcp expose`, run `gbrain mcp expose --remove --yes` first.") **before** anything is published. `--dry-run` stops here. |
 | `consent` | Installing Tailscale, running `tailscale up`, writing the serve/funnel config and creating a user service change system state. Interactive: one y/N prompt; declining is `pending` / exit 2 with "Nothing changed. Re-run with --yes to confirm." Non-interactive without `--yes`: prints the plan plus "pass --yes to confirm" and exits 2. |
 | `tailscale.binary` | Finds `tailscale` on PATH or in the usual macOS/Homebrew/Linux locations. Missing: macOS installs `brew install --cask tailscale-app`; Linux runs the official `curl -fsSL https://tailscale.com/install.sh \| sh` installer (it prompts for sudo itself). `--no-install` prints the plan and exits 1 instead. Other platforms: exit 1 with https://tailscale.com/download. |
-| `tailscale.login` | Reads `tailscale status --json`. Not logged in: Linux runs `sudo tailscale set --operator=$USER` first (so you can run `serve` without root afterwards; a failure is noted, not fatal) and then a flagless `sudo tailscale up`; macOS runs the app CLI's `tailscale up` (after a fresh `brew` install it opens the app and gives it a moment first). Shows the login URL. Waits up to five minutes; still not running: exit 2 with the exact re-run command. |
+| `tailscale.login` | Reads `tailscale status --json`. Not logged in: Linux runs `sudo tailscale set --operator=$USER` first (so you can run `serve` without root afterwards; a failure is noted, not fatal) and then a flagless `sudo tailscale up`; macOS runs the app CLI's `tailscale up` (after a fresh `brew` install it opens the app and gives it a moment first). Linux puts `sudo` in front of the binary **only when it is a system install** (`/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, or a symlink resolving there); a `tailscale` found elsewhere on `PATH` (say `~/.local/bin`) is never run as root — the step stops with `tailscale_login_manual` (exit 2) and asks you to run `sudo tailscale set --operator=$USER && sudo tailscale up` yourself, then re-run. Shows the login URL. Waits up to five minutes; still not running: exit 2 with the exact re-run command. |
 | `tailscale.identity` | Takes your MagicDNS name → `https://your-machine.your-tailnet.ts.net`, then pre-checks the tailnet features `serve`/`funnel` need — the Tailscale CLI does not fail when they are missing, it prints an enablement URL and waits for you interactively, so `expose` never starts it blind. `CertDomains` empty (HTTPS certificates not enabled) → `pending`, exit 2, reason `tailscale_https_not_enabled`, with https://login.tailscale.com/admin/dns and the re-run command. `--funnel` on a node without the Funnel capability → `pending`, exit 2, reason `tailscale_funnel_not_enabled`, with https://login.tailscale.com/admin/acls and the [Funnel docs](https://tailscale.com/kb/1223/funnel). In both cases nothing has been published yet. |
-| `tailscale.publish` | Reads `tailscale serve status --json` — including other terminals' foreground serve sessions and a raw TCP forward on `:443` — and refuses to overwrite a `/` handler that already proxies a different local port unless `--force` (`foreign_serve_config`; a foreground session has to be stopped in its own terminal, `--force` cannot replace it). That read **fails closed**: a non-zero or killed exit, or output that is not a JSON object, is never treated as "nothing configured" — the run stops with the classified reason (`tailscale_needs_operator`, `tailscale_daemon_not_running`, `tailscale_unknown`, …) and nothing is published; only an empty document from a clean exit is an empty config. Then `tailscale serve --bg <port>` (or `tailscale funnel --bg <port>`) with a 60s timeout; a hang is reported as `unknown` with the command to run by hand. Stderr failures are classified as a second line of defense (see [Troubleshooting](#troubleshooting)). Re-reads the status to confirm the port is proxied. |
+| `tailscale.publish` | Reads `tailscale serve status --json` — including other terminals' foreground serve sessions and a raw TCP forward on `:443` — and refuses to overwrite a `/` handler that already proxies a different local port unless `--force` (`foreign_serve_config`; a foreground session has to be stopped in its own terminal, `--force` cannot replace it). That read **fails closed**: a non-zero or killed exit, or output that is not a JSON object, is never treated as "nothing configured" — the run stops with the classified reason (`tailscale_needs_operator`, `tailscale_daemon_not_running`, `tailscale_unknown`, …) and nothing is published; only an empty document from a clean exit is an empty config. Then `tailscale serve --bg <port>` (or `tailscale funnel --bg <port>`) with a 60s timeout; a hang is reported as `unknown` with the command to run by hand. Stderr failures are classified as a second line of defense (see [Troubleshooting](#troubleshooting)). Re-reads the status to confirm the port is proxied. Switching your own handler from Funnel back to tailnet-only turns Funnel off first (`tailscale funnel --https=443 --set-path=/ off` — `--set-path=/` scopes `off` to gbrain's one mount; without it the CLI removes every mount under `:443` and prompts when several exist); if the following `serve --bg` then fails, times out or cannot be confirmed, the previous Funnel handler is re-published and the check says whether that restore worked, and the existing receipt is kept. The other direction is one atomic `funnel --bg`. |
 | `admin_token` | Ensures `~/.gbrain/serve/admin-token` (0600, 64 hex chars). Reused on later runs; never printed. The running server reads it as `GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, so the admin dashboard and `gbrain mcp grant --admin-token-file` work headlessly. |
-| `service` | Writes the wrapper `~/.gbrain/serve/gbrain-serve.sh`, then installs a **launchd user agent** (`com.gbrain.serve`; `launchctl bootout gui/$(id -u)` then `launchctl bootstrap gui/$(id -u)`, so a re-run relaunches the regenerated wrapper — the legacy `unload`/`load` pair is used only when that launchctl does not know the modern verbs) on macOS or a **systemd user unit** (`gbrain-serve.service`) on Linux with a user bus (`daemon-reload` → `enable` → `restart`, so a re-run's regenerated wrapper takes effect) and starts it. The receipt is written **right after this step** (before verify), so an interrupted run always leaves something `--status` / `--remove` can find. No supervisor (cloud sandbox, ephemeral container): `service: manual` — the wrapper is written and the exact foreground and `nohup … &` commands are printed. `--no-service` only publishes an already-running server; on a re-run it keeps the service block of the existing receipt and leaves the wrapper alone. If the install fails (`service_install_failed`, exit 1) the receipt is still written with `service.state: stopped` so `--status` and `--remove` can see and clean up the published handler. |
-| `verify.local` / `verify.tailnet` | `verify.local` polls `http://127.0.0.1:<port>/health` (20s wall clock; a timeout is a `warn` and exit 2 with `verify.tailnet` skipped). `verify.tailnet` polls `https://<your name>/health` (30s); `pending` is exit 2 (first certificate issuance can take a while), never a hard failure. |
+| `service` | Writes the wrapper `~/.gbrain/serve/gbrain-serve.sh`, then installs a **launchd user agent** (`com.gbrain.serve`; `launchctl bootout gui/$(id -u)` then `launchctl bootstrap gui/$(id -u)`, so a re-run relaunches the regenerated wrapper — a bootstrap that fails while launchd is still unloading the previous job ("Input/output error", "already in progress") is retried up to five times a second apart; the legacy `unload`/`load` pair is used only when that launchctl does not know the modern verbs) on macOS or a **systemd user unit** (`gbrain-serve.service`) on Linux with a user bus (`daemon-reload` → `enable` → `restart`, so a re-run's regenerated wrapper takes effect) and starts it. The receipt is written **right after this step** (before verify), so an interrupted run always leaves something `--status` / `--remove` can find. No supervisor (cloud sandbox, ephemeral container): `service: manual` — the wrapper is written and the exact foreground and `nohup … &` commands are printed. `--no-service` only publishes an already-running server; on a re-run it keeps the service block of the existing receipt and leaves the wrapper alone. If the install fails (`service_install_failed`, exit 1) the receipt is still written with `service.state: stopped` so `--status` and `--remove` can see and clean up the published handler. |
+| `verify.local` / `verify.tailnet` | `verify.local` polls `http://127.0.0.1:<port>/health` (20s wall clock; a timeout is a `warn` and exit 2 with `verify.tailnet` skipped). `verify.tailnet` polls `https://<your name>/health` (30s); `pending` is exit 2 (first certificate issuance can take a while), never a hard failure. When **this host cannot resolve its own MagicDNS name** (`ENOTFOUND` / `getaddrinfo` / `EAI_AGAIN`) the check is a `warn`, not `pending`, and the run exits 0: MagicDNS is probably off on this machine (`tailscale set --accept-dns=true`), and devices that do resolve the name may already reach the server. |
 | `receipt` | Rewrites `~/.gbrain/serve/expose.json` (0600) with the settled service state (the early copy from the `service` step is updated; `created_at` is kept): port, URLs, mode, surface, service target and paths, engine kind. No secrets. |
 
 Exit codes: `0` done, `1` failed, `2` needs confirmation (`--yes`, or you
 declined the prompt) or a step is still pending (a tailnet feature to enable,
 Tailscale login, certificate issuance). Nothing is published before the
-pre-checks pass, so an exit 2 leaves your Tailscale config as it was.
+pre-checks pass, so an exit 2 adds no serve/funnel handler — but the login
+step may already have changed node state on the way there: on Linux
+`sudo tailscale set --operator=$USER` records a persistent preference (your
+user may configure `serve` without root from then on; `--remove` does not
+revoke it — `sudo tailscale set --operator=` resets it) and `sudo tailscale up`
+may have joined the machine to your tailnet.
 
 The wrapper reads the admin token from its file at run time, sources your
 shell profile and `~/.gbrain/env`, prepends the Bun directory to `PATH`, and
@@ -101,7 +106,7 @@ gbrain mcp expose --remove [--yes] [--json]
 
 | Flag | Meaning |
 | --- | --- |
-| `--port N` | Local port for `gbrain serve --http` (default `3131`). Tailscale proxies `:443` on your MagicDNS name to it. With `--remove` and no receipt, the port whose `:443` handler is cleaned up. |
+| `--port N` | Local port for `gbrain serve --http` (default `3131`). Tailscale proxies `:443` on your MagicDNS name to it. With `--status` or `--remove` and no receipt, the port whose leftover `:443` handler is looked for and cleaned up. |
 | `--funnel` | Public HTTPS via Tailscale Funnel instead of tailnet-only Serve. Required for cloud agents. |
 | `--surface verbs\|starter\|full` | Tool surface of the served MCP server (default `full`, same as `serve --http`). |
 | `--enable-dcr` | Turn on self-service client registration on the served server (off by default; every self-registered connection still stops for your approval in the admin dashboard). |
@@ -119,13 +124,24 @@ supervisor exists.
 
 ### `--status`
 
-Reads the receipt (absent: "not exposed", exit 0 — with `--json` exit 2 so
-scripts can tell), re-probes the Tailscale serve/funnel config, the service
+Reads the receipt, re-probes the Tailscale serve/funnel config, the service
 state (`launchctl print gui/$(id -u)/com.gbrain.serve` or `systemctl --user
 is-active gbrain-serve.service`) and the local and tailnet health endpoints.
 Exit 0 when everything verifies, 1 otherwise. A `tailscale serve status` that
 cannot be read (non-zero exit, killed, or non-JSON output) is a **failed**
-`tailscale.publish` check, never "handler present".
+`tailscale.publish` check, never "handler present". A tailnet `/health` that
+fails only because this host cannot resolve the name is a `warn`, not
+`pending`, and still exits 0 (see `verify.tailnet` above).
+
+**No receipt:** `--status` does not just say "not exposed" — it looks for the
+leftovers an interrupted run can leave behind (the wrapper, a
+`com.gbrain.serve` / `gbrain-serve.service` unit or live service, a `:443`
+handler proxying `--port`, default 3131). Anything found is one `warn` check
+per artifact, the recovery command goes into `next_actions`
+(`gbrain mcp expose --remove --yes`, plus `--force` when only a handler stands
+and nothing else of gbrain's corroborates it), and the exit is 1 with reason
+`leftovers_without_receipt` (also under `--json`). Nothing found: "not
+exposed", exit 0 — with `--json` exit 2 so scripts can tell.
 
 ### `--remove`
 
@@ -133,17 +149,29 @@ Asks for consent (or `--yes`; declining is `pending` / exit 2, nothing
 changed), then stops and removes the user service (it probes the supervisor
 and removes a `com.gbrain.serve` / `gbrain-serve.service` that exists even
 when the receipt says the service was skipped), clears **only gbrain's own**
-serve/funnel handler (the one whose proxied port
-matches the receipt; Funnel is switched off first when it was on), and
-deletes the wrapper and receipt. It never runs `tailscale serve reset`,
-never uninstalls Tailscale and never logs you out. The admin token file is
-kept unless you pass `--force` (a dashboard session may still be using it).
-It prints what was left in place.
+serve/funnel handler (the one whose proxied port matches the receipt; Funnel
+is switched off first when it was on) with
+`tailscale serve --https=443 --set-path=/ off` — the `--set-path=/` scopes the
+command to gbrain's one mount, so other mounts under `:443` are never touched
+and the CLI never falls into its several-mounts prompt — and deletes the
+wrapper and receipt. It never runs `tailscale serve reset`, never uninstalls
+Tailscale and never logs you out; the Linux operator preference the login step
+set stays as well (`sudo tailscale set --operator=` resets it). The admin
+token file is kept unless you pass `--force` (a dashboard session may still be
+using it). It prints what was left in place. On macOS a `launchctl bootout`
+that fails for a reason other than "not loaded" is a `service` **warn** and
+"the launchd job (bootout failed)" is named as left in place — check
+`launchctl print gui/$(id -u)/com.gbrain.serve`.
 
 If `tailscale serve status` cannot be read, `--remove` **fails closed**: the
 `tailscale.publish` check fails with "could not read tailscale serve status;
 handler left as is", the receipt and the wrapper are kept so a re-run can
-finish the job, and the exit code is 1.
+finish the job, and the exit code is 1. The same holds after the `off`
+attempt: `--remove` never reports success while gbrain's handler survives.
+When the re-read still shows the handler (or cannot be read at all), the
+service is already uninstalled but the receipt and the wrapper are kept, the
+exit is 1 with reason `handler_not_removed`, and the message tells you to run
+`tailscale serve status` and re-run `gbrain mcp expose --remove --yes`.
 
 **No receipt** (an interrupted `gbrain mcp expose` — killed between
 `tailscale serve --bg` and the receipt write): `--remove` recovers from what
@@ -155,7 +183,9 @@ receipt" plan, asks for consent as usual, and removes exactly those artifacts
 something else of gbrain's corroborates it — the wrapper, the unit/plist, or
 the supervisor reporting the service — because another tool may proxy `:443`
 to the same port; a handler standing alone is reported and left in place
-(exit 0) until you pass `--force`. The admin token file is left alone. When
+(exit 0) until you pass `--force`. A handler that survives the `off` attempt
+is `handler_not_removed` here too (exit 1); the wrapper is kept as the
+corroboration the re-run needs. The admin token file is left alone. When
 nothing of gbrain's is found the answer stays "not exposed — nothing to
 remove", exit 0.
 
@@ -255,15 +285,19 @@ check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
 | `https_not_enabled` / `funnel_not_enabled` (exit 1) — `tailscale serve` / `funnel` itself refused after the pre-checks passed | Same fixes as the two rows above; the classifier reads the CLI's stderr as a second line of defense. `unknown` after 60s means the CLI is waiting on you — run the printed `tailscale serve --bg <port>` by hand to see its prompt. |
 | `needs_operator` — "Access denied" from `tailscale serve` on Linux | `sudo tailscale set --operator=$USER`, then re-run. `expose` runs that `set --operator` itself before its flagless `sudo tailscale up` (a failure there is noted, not fatal); a tailnet joined earlier by other means may not have it. |
 | `needs_login` / exit 2 after the login URL | Finish the login in the browser (macOS: open the Tailscale app and sign in), then run the printed re-run command. |
+| `tailscale_login_manual` (exit 2) — "tailscale at <path> is not a system install, so gbrain will not run it with sudo" | The `tailscale` on your `PATH` lives outside the system install locations, and gbrain never hands root to a user-writable binary. Sign in yourself — `sudo tailscale set --operator=$USER && sudo tailscale up` — then re-run the printed command. |
+| `tailscale_receipt_present` (exit 1, `plan` fails) — "This brain is already published on your tailnet at <url>" | You passed `--no-tailscale` while the receipt records a live Serve/Funnel mapping. Run `gbrain mcp expose --remove --yes` first, or re-run without `--no-tailscale`. |
 | `daemon_not_running` — "failed to connect to local Tailscale service" | macOS: `open -a Tailscale`. Linux: `sudo systemctl enable --now tailscaled`. |
 | `tailnet_health: pending` (exit 2) | The first certificate for your MagicDNS name is being issued. `gbrain mcp expose --status` in a minute. Local health `ok` means the server itself is fine. |
+| `verify.tailnet: warn` — "this host cannot resolve your-machine.your-tailnet.ts.net" (exit 0) | The brain host itself cannot resolve its MagicDNS name, usually because MagicDNS is off on this machine: `tailscale set --accept-dns=true`, then `gbrain mcp expose --status`. Devices that do resolve the name may already reach the server; this is not a certificate wait. |
 | Another device cannot resolve `your-machine.your-tailnet.ts.net` | Resolution needs **MagicDNS** on the tailnet (https://login.tailscale.com/admin/dns) and "Use Tailscale DNS settings" turned on in that device's Tailscale client. Reaching the name over HTTPS additionally needs the tailnet's **HTTPS Certificates** toggle on the same page (the `tailscale_https_not_enabled` pre-check catches that on the host). |
 | Service not starting (`--status` reports the service stopped) | Read `~/.gbrain/serve/serve.err`. Typical causes: `gbrain` not on `PATH` for a login-less shell (the wrapper falls back to `type -P gbrain`; install into `~/.bun/bin` or reinstall), a key missing from `~/.gbrain/env`, or the port already taken. `launchctl print gui/$(id -u)/com.gbrain.serve` / `systemctl --user status gbrain-serve.service` show the supervisor's view. |
-| `foreign_listener` — "Something already answers on 127.0.0.1:<port> and no expose receipt claims it. Stop it, pick another --port, or pass --no-service to only publish it. If this is a gbrain server left behind by an interrupted `gbrain mcp expose`, run `gbrain mcp expose --remove --yes` first." | **Any** process answering on `127.0.0.1:<port>` counts as occupied — a 404 or 500 on `/health` is still a listener — and no receipt claims that port. Refused during `plan`, before anything is published. Stop it, choose another `--port`, or pass `--no-service` to only publish the server you already run. A gbrain server left behind by an interrupted run is cleaned up by `gbrain mcp expose --remove --yes` (receipt-less recovery, see [`--remove`](#--remove)). |
+| `foreign_listener` — "Something already answers on 127.0.0.1:<port> and no expose receipt claims it. Stop it, pick another --port, or pass --no-service to only publish it. If this is a gbrain server left behind by an interrupted `gbrain mcp expose`, run `gbrain mcp expose --remove --yes` first." | **Anything** listening on `127.0.0.1:<port>` counts as occupied — an accepted TCP connect (a database, a non-HTTP service) as much as a 404 or 500 on `/health` — and no receipt claims that port. Refused during `plan`, before anything is published. Stop it, choose another `--port`, or pass `--no-service` to only publish the server you already run. A gbrain server left behind by an interrupted run is cleaned up by `gbrain mcp expose --remove --yes` (receipt-less recovery, see [`--remove`](#--remove)). |
 | `no_brain_config` (exit 1, `plan` fails) — "No brain is configured on this host (gbrain init first), so a service would only crash-loop; pass --no-service to publish a server you run yourself." | This host has no `gbrain` config (or it cannot be read), so `gbrain serve` would have nothing to open and the supervisor would restart it forever. Run `gbrain init` on this host first, then re-run; or pass `--no-service` to only publish a server you start yourself. `--dry-run` still shows the plan. |
 | `pglite_lock` warn — "a live process holds this PGLite brain (pid N, …): the service cannot start until it exits" | PGLite is single-writer and a process other than gbrain's own running service holds the lock, so the freshly installed service will crash-loop until it exits. Stop that process (or let it finish), then `gbrain mcp expose --status`; for concurrent local use move to Postgres ([ENGINES.md](../ENGINES.md)). The publish itself still completes. |
 | "could not read tailscale serve status" — `tailscale.publish` fails during publish (exit 1, reason `tailscale_<kind>`), `--status` (exit 1) or `--remove` (exit 1, `tailscale_serve_status_unreadable`; receipt and wrapper kept) | `tailscale serve status --json` exited non-zero, was killed, or printed something that is not JSON. The command fails closed rather than guess: nothing is published over, removed from, or reported about a config it could not read. Run `tailscale serve status --json` by hand and apply the classified fix (operator, daemon, login), then re-run the same command. |
-| An interrupted `gbrain mcp expose` (no receipt, but a handler / service / wrapper is left behind) | `gbrain mcp expose --remove --yes` (add `--port N` if you published a non-default port) recovers without a receipt: it removes the service, the wrapper and the `:443` handler proxying that port, and leaves the admin token. A handler with no wrapper, unit or service next to it is left in place until you add `--force`. See [`--remove`](#--remove). |
+| An interrupted `gbrain mcp expose` (no receipt, but a handler / service / wrapper is left behind) — `gbrain mcp expose --status` reports `leftovers_without_receipt` (exit 1) naming each artifact | Run the command `--status` prints: `gbrain mcp expose --remove --yes` (add `--port N` if you published a non-default port; `--force` when only a handler stands) recovers without a receipt: it removes the service, the wrapper and the `:443` handler proxying that port, and leaves the admin token. A handler with no wrapper, unit or service next to it is left in place until you add `--force`. See [`--remove`](#--remove). |
+| `handler_not_removed` (exit 1) — "--remove" stopped with "the tailscale handler for port <port> is still present" (or "could not be confirmed gone") | `tailscale serve --https=443 --set-path=/ off` ran but the re-read still shows gbrain's handler (or the serve status could not be re-read). The service was already uninstalled; the receipt and the wrapper were kept on purpose so the re-run finds everything. Run `tailscale serve status`, fix what it reports (operator, daemon), then `gbrain mcp expose --remove --yes` again. |
 | `foreign_serve_config` — "tailscale serve already proxies :443 to <target>. Re-run with --force to take it over, or pick another local port for that service." | A `/` handler on `:443` (a background config, another terminal's foreground `tailscale serve` session, or a raw TCP forward) already points somewhere else. Inspect it with `tailscale serve status` (the suggested next action), move that service, or — for a background handler only — re-run with `--force`; a foreground session must be stopped in its own terminal. |
 | `verify.local` warn / `local_health_timeout` (exit 2) | The service was installed but `http://127.0.0.1:<port>/health` did not answer within 20s; `verify.tailnet` is skipped. Read `~/.gbrain/serve/serve.err`, then `gbrain mcp expose --status`. |
 | `service: manual` (cloud sandbox, ephemeral container, no user bus) | There is no supervisor to keep the server alive. Run the printed foreground command, or the `nohup ~/.gbrain/serve/gbrain-serve.sh &` line, and re-run `--status`. On Linux without a user bus, `loginctl enable-linger $USER` may enable one. |
@@ -287,8 +321,16 @@ check. Logs: `~/.gbrain/serve/serve.log` and `serve.err`.
   wrapper reads at run time; the receipt carries none. Credential handoffs go
   through private files (`--credentials-out`), never pasted into a
   conversation.
-- **Removal is scoped.** `--remove` touches only gbrain's own handler and
-  service; your Tailscale login and other serve configs stay as they were.
+- **Removal is scoped.** `--remove` touches only gbrain's own handler (the
+  `--set-path=/` mount) and service; your Tailscale login, other serve
+  configs and the Linux operator preference the login step set stay as they
+  were (`sudo tailscale set --operator=` resets the latter).
+- **Keep `GBRAIN_HTTP_TRUST_PROXY` at its default for this shape.** Tailscale
+  is a loopback proxy and the default (`loopback`) trusts exactly that hop, so
+  every tailnet or Funnel client keeps its own rate-limit bucket; turning
+  trust off makes every request look like `127.0.0.1` and collapses the
+  per-client limits into one bucket, and a wider setting trusts hops Tailscale
+  does not vouch for.
 
 See [SECURITY.md](../../SECURITY.md) for the HTTP server's hardening knobs
 (CORS allowlist, trust-proxy, rate limits, body cap).

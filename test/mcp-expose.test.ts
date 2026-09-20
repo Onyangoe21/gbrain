@@ -5,10 +5,11 @@
  */
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mcpNeedsEngine, runMcp } from '../src/commands/mcp.ts';
-import { runMcpExpose, parseExposeArgs, MCP_EXPOSE_HELP, type McpExposeDeps } from '../src/commands/mcp-expose.ts';
+import { defaultTcpProbe, runMcpExpose, parseExposeArgs, MCP_EXPOSE_HELP, type McpExposeDeps } from '../src/commands/mcp-expose.ts';
 import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
 import { TAILSCALE_ADMIN_ACL_URL, TAILSCALE_ADMIN_DNS_URL, TAILSCALE_BINARY_CANDIDATES, TAILSCALE_FUNNEL_KB_URL, type CommandRunner, type CommandRunOptions } from '../src/core/tailscale.ts';
 import { adminTokenPath, readExposeReceipt, receiptPath, wrapperPath, writeExposeReceipt, type ExposeReceipt } from '../src/core/serve-service.ts';
@@ -124,7 +125,7 @@ function fakeTailnet(o: TailnetOpts = {}): Fake {
       handlers[Number(argv[3])] = o.publishedFunnel ?? (argv[1] === 'funnel');
       return { status: 0, stdout: '', stderr: '' };
     }
-    if (argv[0] === ts && argv[2] === '--https=443' && argv[3] === 'off') {
+    if (argv[0] === ts && argv[2] === '--https=443' && argv[3] === '--set-path=/' && argv[4] === 'off') {
       for (const k of Object.keys(handlers)) delete handlers[Number(k)];
       return { status: 0, stdout: '', stderr: '' };
     }
@@ -157,6 +158,8 @@ function fakeTailnet(o: TailnetOpts = {}): Fake {
       if (url.startsWith(`https://${DNS}/`)) { if (o.tailnetHealthy ?? true) return { ok: true, status: 200 }; throw new Error('cert pending'); }
       throw new Error(`unexpected fetch ${url}`);
     },
+    // The default tcpProbe opens a real loopback socket; the fake never does.
+    tcpProbe: async () => false,
     isTTY: false, prompt: async () => { throw new Error('prompt must not be called'); },
     stdout: (l) => stdout.push(l), stderr: (l) => stderr.push(l),
     now: () => new Date('2026-06-01T12:00:00.000Z'), sleep: async () => {},
@@ -475,7 +478,7 @@ describe('tailscale steps', () => {
     const c = checkOf(doc, 'tailscale.publish')!;
     expect(c.status).toBe('warn');
     expect(c.detail).toContain('funnel=true (wanted false)');
-    expect(f.stderr.join('\n')).toContain('tailscale funnel --https=443 off');
+    expect(f.stderr.join('\n')).toContain('tailscale funnel --https=443 --set-path=/ off');
   });
   test('a foreign :443 handler is refused without --force (next action is serve status, never --force) and taken over with it', async () => {
     const f = fakeTailnet({ existingHandlers: { 8080: false } });
@@ -521,7 +524,7 @@ describe('tailscale steps', () => {
     writeExposeReceipt(receiptPath(f.serveDir), fullReceipt(f, { mode: 'funnel' }));
     expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
     const calls = joinedCalls(f);
-    expect(calls.indexOf(`${TS} funnel --https=443 off`)).toBeLessThan(calls.indexOf(`${TS} serve --bg 3131`));
+    expect(calls.indexOf(`${TS} funnel --https=443 --set-path=/ off`)).toBeLessThan(calls.indexOf(`${TS} serve --bg 3131`));
     expect(calls.some(c => c.includes('reset'))).toBe(false);
     expect(readExposeReceipt(receiptPath(f.serveDir))?.mode).toBe('tailnet');
   });
@@ -843,7 +846,7 @@ describe('service edge cases', () => {
     f.calls.length = 0;
     f.stdout.length = 0;
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
-    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 off`);
+    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(existsSync(receiptPath(f.serveDir))).toBe(false);
   });
   test('a symlinked token path is refused → structured error, nothing published', async () => {
@@ -879,7 +882,7 @@ describe('--status', () => {
     expect(doc.status).toBe('exposed');
     for (const name of ['receipt', 'tailscale.publish', 'service', 'verify.local', 'verify.tailnet']) expect(checkOf(doc, name)?.status).toBe('ok');
     // knock the handler out from under us
-    await f.run([TS, 'serve', '--https=443', 'off']);
+    await f.run([TS, 'serve', '--https=443', '--set-path=/', 'off']);
     f.stdout.length = 0;
     expect(await runMcpExpose(['--status', '--json'], f.deps)).toBe(1);
     const bad = jsonDoc(f);
@@ -926,7 +929,7 @@ describe('--remove', () => {
     expect(doc.status).toBe('removed');
     const calls = joinedCalls(f);
     expect(calls).toContain('systemctl --user disable --now gbrain-serve.service');
-    expect(calls).toContain(`${TS} funnel --https=443 off`);
+    expect(calls).toContain(`${TS} funnel --https=443 --set-path=/ off`);
     expect(calls.some(c => /reset|logout|uninstall|down/.test(c))).toBe(false);
     expect(calls.some(c => c.startsWith('sh -c') || c.startsWith('sudo'))).toBe(false);
     expect(existsSync(wrapperPath(f.serveDir))).toBe(false);
@@ -936,18 +939,18 @@ describe('--remove', () => {
     expect(f.stderr.join('\n')).toContain('Tailscale itself (installed and signed in)');
     expect(f.stderr.join('\n')).toContain('admin token');
   });
-  test('tailnet-mode --remove turns off with `serve --https=443 off` (no funnel off)', async () => {
+  test('tailnet-mode --remove turns off with `serve --https=443 --set-path=/ off` (no funnel off)', async () => {
     const f = fakeTailnet();
     expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
     f.calls.length = 0;
     f.stdout.length = 0;
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
     const calls = joinedCalls(f);
-    expect(calls).toContain(`${TS} serve --https=443 off`);
+    expect(calls).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(calls.some(c => c.includes('funnel'))).toBe(false);
     expect(checkOf(jsonDoc(f), 'tailscale.publish')?.detail).toContain('serve off: exit 0');
   });
-  test('--remove with a FOREIGN port on :443 issues no `--https=443 off` and reports nothing to turn off', async () => {
+  test('--remove with a FOREIGN port on :443 issues no `--https=443 --set-path=/ off` and reports nothing to turn off', async () => {
     const f = fakeTailnet({ existingHandlers: { 8080: false } });
     writeExposeReceipt(receiptPath(f.serveDir), {
       version: 1, created_at: 'x', updated_at: 'x', port: 3131, public_url: `https://${DNS}`, mcp_url: `https://${DNS}/mcp`, admin_url: `https://${DNS}/admin`,
@@ -958,7 +961,7 @@ describe('--remove', () => {
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
     const doc = jsonDoc(f);
     expect(doc.status).toBe('removed');
-    expect(joinedCalls(f).some(c => c.includes('--https=443 off'))).toBe(false);
+    expect(joinedCalls(f).some(c => c.includes('--https=443 --set-path=/ off'))).toBe(false);
     expect(checkOf(doc, 'tailscale.publish')?.detail).toContain('nothing to turn off');
     // the foreign handler is untouched
     const view = await f.run([TS, 'serve', 'status', '--json']);
@@ -1216,14 +1219,13 @@ describe('tailscale binary + login step edges', () => {
 });
 
 describe('publish step edges', () => {
-  test('switching our own handler from tailnet to funnel turns the plain serve handler off first; raw TCP forwards and non-proxy handlers are described honestly', async () => {
+  test('switching our own handler from tailnet to funnel is one atomic `funnel --bg` (no pre-off in that direction); raw TCP forwards and non-proxy handlers are described honestly', async () => {
     const f = fakeTailnet({ existingHandlers: { 3131: false } });
     writeExposeReceipt(receiptPath(f.serveDir), fullReceipt(f));
     expect(await runMcpExpose(['--yes', '--funnel', '--json'], f.deps)).toBe(0);
     const calls = joinedCalls(f);
-    expect(calls.indexOf(`${TS} serve --https=443 off`)).toBeGreaterThanOrEqual(0);
-    expect(calls.indexOf(`${TS} serve --https=443 off`)).toBeLessThan(calls.indexOf(`${TS} funnel --bg 3131`));
-    expect(calls.some(c => c.includes('funnel --https=443 off'))).toBe(false);
+    expect(calls).toContain(`${TS} funnel --bg 3131`);
+    expect(calls.some(c => c.includes(' off'))).toBe(false);
     expect(readExposeReceipt(receiptPath(f.serveDir))?.mode).toBe('funnel');
     const serveStatus = (doc: unknown) => async (argv: string[], o: CommandRunOptions | undefined, inner: CommandRunner) =>
       (argv.join(' ') === `${TS} serve status --json` ? { status: 0, stdout: JSON.stringify(doc), stderr: '' } : inner(argv, o));
@@ -1355,8 +1357,8 @@ describe('--remove edges', () => {
         const allow = funnelOn && handlerOn ? { [`${DNS}:443`]: true } : {};
         return { status: 0, stdout: JSON.stringify({ TCP: { '443': { HTTPS: true } }, Web: web, AllowFunnel: allow }), stderr: '' };
       }
-      if (joined === `${TS} funnel --https=443 off`) { f.calls.push(argv); funnelOn = false; return { status: 0, stdout: '', stderr: '' }; }
-      if (joined === `${TS} serve --https=443 off`) { f.calls.push(argv); handlerOn = false; return { status: 0, stdout: '', stderr: '' }; }
+      if (joined === `${TS} funnel --https=443 --set-path=/ off`) { f.calls.push(argv); funnelOn = false; return { status: 0, stdout: '', stderr: '' }; }
+      if (joined === `${TS} serve --https=443 --set-path=/ off`) { f.calls.push(argv); handlerOn = false; return { status: 0, stdout: '', stderr: '' }; }
       return inner(argv, o);
     };
     f.stdout.length = 0;
@@ -1364,21 +1366,40 @@ describe('--remove edges', () => {
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
     const doc = jsonDoc(f);
     const calls = joinedCalls(f);
-    expect(calls.indexOf(`${TS} funnel --https=443 off`)).toBeGreaterThanOrEqual(0);
-    expect(calls.indexOf(`${TS} funnel --https=443 off`)).toBeLessThan(calls.indexOf(`${TS} serve --https=443 off`));
+    expect(calls.indexOf(`${TS} funnel --https=443 --set-path=/ off`)).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf(`${TS} funnel --https=443 --set-path=/ off`)).toBeLessThan(calls.indexOf(`${TS} serve --https=443 --set-path=/ off`));
     expect(checkOf(doc, 'tailscale.publish')).toMatchObject({ status: 'ok', detail: 'funnel off: exit 0, serve off: exit 0' });
+    // a handler that survives `off` is NOT a successful removal: the service is gone, but the receipt and the wrapper stay for the re-run
     const g = fakeTailnet();
     expect(await runMcpExpose(['--yes'], g.deps)).toBe(0);
     const ginner = g.deps.run!;
-    g.deps.run = async (argv, o) => (argv[0] === TS && argv[2] === '--https=443' && argv[3] === 'off' ? { status: 1, stdout: '', stderr: 'nope' } : ginner(argv, o));
+    g.deps.run = async (argv, o) => (argv[0] === TS && argv[2] === '--https=443' && argv[3] === '--set-path=/' && argv[4] === 'off' ? { status: 1, stdout: '', stderr: 'nope' } : ginner(argv, o));
     g.stdout.length = 0;
-    expect(await runMcpExpose(['--remove', '--yes', '--json'], g.deps)).toBe(0);
+    g.calls.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], g.deps)).toBe(1);
     const gdoc = jsonDoc(g);
-    expect(checkOf(gdoc, 'tailscale.publish')).toMatchObject({ status: 'warn' });
+    expect(gdoc).toMatchObject({ status: 'error', reason: 'handler_not_removed' });
+    expect(gdoc.message).toBe('the tailscale handler for port 3131 is still present; left in place: the wrapper and the receipt');
+    expect(gdoc.receipt).not.toBeNull();
+    expect(checkOf(gdoc, 'tailscale.publish')).toMatchObject({ status: 'fail' });
     expect(checkOf(gdoc, 'tailscale.publish')?.detail).toContain('serve off: exit 1');
     expect(checkOf(gdoc, 'tailscale.publish')?.detail).toContain('handler still present');
-    expect(g.stderr.join('\n')).toContain('Left in place: the tailscale serve handler;');
+    expect(checkOf(gdoc, 'service')).toMatchObject({ status: 'ok' });
+    expect(checkOf(gdoc, 'receipt')).toMatchObject({ status: 'skipped' });
+    expect(checkOf(gdoc, 'receipt')?.detail).toContain('kept: the wrapper and the receipt');
+    expect(gdoc.next_actions).toEqual(['tailscale serve status', 'gbrain mcp expose --remove --yes']);
+    expect(g.stderr.join('\n')).toContain('Stopped here: the service was stopped and removed, but the tailscale handler for port 3131 is still present. Left in place: the wrapper and the receipt.');
+    expect(joinedCalls(g)).toContain('systemctl --user disable --now gbrain-serve.service');
+    expect(existsSync(g.deps.unitPath!)).toBe(false);
+    expect(existsSync(receiptPath(g.serveDir))).toBe(true);
+    expect(existsSync(wrapperPath(g.serveDir))).toBe(true);
+    // once `off` works again the re-run finishes the job (the service step is now "none installed" — already removed)
+    g.deps.run = ginner;
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], g.deps)).toBe(0);
+    expect(jsonDoc(g).status).toBe('removed');
     expect(existsSync(receiptPath(g.serveDir))).toBe(false);
+    expect(existsSync(wrapperPath(g.serveDir))).toBe(false);
   });
   test('darwin: a malformed pre-existing token is regenerated with a note; --remove boots the launchd agent out and deletes the plist', async () => {
     const f = fakeMac();
@@ -1492,11 +1513,11 @@ describe('receipt shape guard, rollback, binary + path confinement', () => {
     expect(doc.message).toContain('turned off again');
     expect(doc.message).toContain('no receipt written');
     expect(checkOf(doc, 'rollback')).toMatchObject({ status: 'ok' });
-    expect(checkOf(doc, 'rollback')?.detail).toContain('tailscale serve --https=443 off');
+    expect(checkOf(doc, 'rollback')?.detail).toContain('tailscale serve --https=443 --set-path=/ off');
     expect(checkOf(doc, 'internal')?.status).toBe('fail');
     const calls = joinedCalls(f);
     expect(calls.indexOf(`${TS} serve --bg 3131`)).toBeGreaterThanOrEqual(0);
-    expect(calls.indexOf(`${TS} serve --bg 3131`)).toBeLessThan(calls.indexOf(`${TS} serve --https=443 off`));
+    expect(calls.indexOf(`${TS} serve --bg 3131`)).toBeLessThan(calls.indexOf(`${TS} serve --https=443 --set-path=/ off`));
     expect(calls.some(c => c.includes('reset'))).toBe(false);
     expect(existsSync(receiptPath(f.serveDir))).toBe(false);
     expect((await f.run([TS, 'serve', 'status', '--json'])).stdout).not.toContain('127.0.0.1:3131');
@@ -1505,7 +1526,7 @@ describe('receipt shape guard, rollback, binary + path confinement', () => {
     mkdirSync(h.serveDir, { recursive: true });
     symlinkSync(join(h.home, 'victim'), adminTokenPath(h.serveDir));
     expect(await runMcpExpose(['--yes', '--funnel', '--json'], h.deps)).toBe(1);
-    expect(joinedCalls(h)).toContain(`${TS} funnel --https=443 off`);
+    expect(joinedCalls(h)).toContain(`${TS} funnel --https=443 --set-path=/ off`);
     expect(existsSync(receiptPath(h.serveDir))).toBe(false);
     // a handler for our port existed before this run → left in place, no off at all
     const g = fakeTailnet({ existingHandlers: { 3131: false } });
@@ -1517,7 +1538,7 @@ describe('receipt shape guard, rollback, binary + path confinement', () => {
     expect(gdoc.message).toContain('left in place');
     expect(checkOf(gdoc, 'rollback')).toMatchObject({ status: 'skipped' });
     expect(joinedCalls(g)).toContain(`${TS} serve --bg 3131`);
-    expect(joinedCalls(g).some(c => c.includes('--https=443 off'))).toBe(false);
+    expect(joinedCalls(g).some(c => c.includes('--https=443 --set-path=/ off'))).toBe(false);
     expect(existsSync(receiptPath(g.serveDir))).toBe(false);
     expect((await g.run([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:3131');
     // a throw BEFORE publishing (or with --no-tailscale) has nothing to roll back
@@ -1545,7 +1566,7 @@ describe('receipt shape guard, rollback, binary + path confinement', () => {
     f.calls.length = 0;
     f.stdout.length = 0;
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
-    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 off`);
+    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(f.calls.some(c => c[0] === planted)).toBe(false);
     expect(existsSync(planted)).toBe(true);
     // the macOS app-bundle CLI is not on PATH but IS a known candidate → the recorded path is used
@@ -1564,7 +1585,7 @@ describe('receipt shape guard, rollback, binary + path confinement', () => {
       symlinkSync(join(f.home, 'victim'), adminTokenPath(f.serveDir));
       const inner = f.deps.run!;
       f.deps.run = async (argv, o) => {
-        if (argv[0] === TS && argv[2] === '--https=443' && argv[3] === 'off') {
+        if (argv[0] === TS && argv[2] === '--https=443' && argv[3] === '--set-path=/' && argv[4] === 'off') {
           f.calls.push(argv);
           if (mode === 'throw') throw new Error('spawn exploded during off');
           return { status: 1, stdout: '', stderr: 'nope' };
@@ -1580,7 +1601,7 @@ describe('receipt shape guard, rollback, binary + path confinement', () => {
       expect(doc.message).toContain('no receipt written');
       expect(checkOf(doc, 'rollback')).toMatchObject({ status: 'warn' });
       expect(checkOf(doc, 'rollback')?.detail).toContain('NOT turned off');
-      expect(joinedCalls(f)).toContain(`${TS} serve --https=443 off`);
+      expect(joinedCalls(f)).toContain(`${TS} serve --https=443 --set-path=/ off`);
       expect(existsSync(receiptPath(f.serveDir))).toBe(false);
     }
   });
@@ -1744,7 +1765,7 @@ describe('tailscale serve status fails closed', () => {
     expect(checkOf(doc, 'receipt')).toMatchObject({ status: 'skipped' });
     expect(doc.receipt).not.toBeNull();
     expect(doc.next_actions).toContain('gbrain mcp expose --remove --yes');
-    expect(joinedCalls(f).some(c => c.includes('--https=443 off'))).toBe(false);
+    expect(joinedCalls(f).some(c => c.includes('--https=443 --set-path=/ off'))).toBe(false);
     expect(existsSync(receiptPath(f.serveDir))).toBe(true);
     expect(existsSync(wrapperPath(f.serveDir))).toBe(true);
     expect((await inner([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:3131');
@@ -1755,7 +1776,7 @@ describe('tailscale serve status fails closed', () => {
     f.stdout.length = 0;
     expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
     expect(jsonDoc(f).status).toBe('removed');
-    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 off`);
+    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(existsSync(receiptPath(f.serveDir))).toBe(false);
     expect(existsSync(wrapperPath(f.serveDir))).toBe(false);
   });
@@ -1781,27 +1802,32 @@ describe('tailscale serve status fails closed', () => {
     expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(1);
     expect(checkOf(jsonDoc(g), 'tailscale.publish')?.detail).toContain('exit 0 but stdout was not a JSON object');
   });
-  test('--remove: a serve-status re-read that fails only AFTER `off` ran is a warn (could not re-read), the handler state is reported unknown, the run still finishes', async () => {
+  test('--remove: a serve-status re-read that fails only AFTER `off` ran is a warn (could not re-read), the handler state is unknown — never claimed removed: receipt + wrapper kept, exit 1 handler_not_removed', async () => {
     const f = fakeTailnet();
     expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
     const inner = f.deps.run!;
     let offRan = false;
     f.deps.run = async (argv, o) => {
-      if (argv[0] === TS && argv[2] === '--https=443' && argv[3] === 'off') offRan = true;
+      if (argv[0] === TS && argv[2] === '--https=443' && argv[3] === '--set-path=/' && argv[4] === 'off') offRan = true;
       if (offRan && argv.join(' ') === `${TS} serve status --json`) { f.calls.push(argv); return { status: 1, stdout: '', stderr: 'Access denied' }; }
       return inner(argv, o);
     };
     f.calls.length = 0;
     f.stdout.length = 0;
-    expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(1);
     const doc = jsonDoc(f);
-    expect(doc.status).toBe('removed');
+    expect(doc).toMatchObject({ status: 'error', reason: 'handler_not_removed' });
+    expect(doc.message).toContain('could not be confirmed gone (tailscale serve status could not be re-read)');
     expect(checkOf(doc, 'tailscale.publish')).toMatchObject({ status: 'warn' });
     expect(checkOf(doc, 'tailscale.publish')?.detail).toContain('serve off: exit 0');
     expect(checkOf(doc, 'tailscale.publish')?.detail).toContain('could not re-read');
-    expect(f.stderr.join('\n')).toContain('the tailscale serve handler (state unknown: serve status could not be re-read)');
-    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 off`);
-    expect(existsSync(receiptPath(f.serveDir))).toBe(false);
+    expect(checkOf(doc, 'service')).toMatchObject({ status: 'ok' });
+    expect(checkOf(doc, 'receipt')).toMatchObject({ status: 'skipped' });
+    expect(doc.next_actions).toContain('gbrain mcp expose --remove --yes');
+    expect(f.stderr.join('\n')).toContain('Stopped here: the service was stopped and removed, but the tailscale handler for port 3131 could not be confirmed gone');
+    expect(joinedCalls(f)).toContain(`${TS} serve --https=443 --set-path=/ off`);
+    expect(existsSync(receiptPath(f.serveDir))).toBe(true);
+    expect(existsSync(wrapperPath(f.serveDir))).toBe(true);
   });
   test('publish: the POST-publish serve-status read failing is tailscale_publish_unconfirmed ("could not be read afterwards"), points at --remove --yes, writes no receipt', async () => {
     const f = fakeTailnet();
@@ -1858,7 +1884,7 @@ describe('early receipt + receipt-less recovery', () => {
     expect(checkOf(doc, 'rollback')).toMatchObject({ status: 'skipped' });
     expect(checkOf(doc, 'rollback')?.detail).toContain('receipt already written');
     expect(doc.next_actions).toContain('gbrain mcp expose --remove --yes');
-    expect(joinedCalls(f).some(c => c.includes('--https=443 off'))).toBe(false);
+    expect(joinedCalls(f).some(c => c.includes('--https=443 --set-path=/ off'))).toBe(false);
     expect(existsSync(receiptPath(f.serveDir))).toBe(true);
     expect((await f.run([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:3131');
     // and --remove cleans it all up
@@ -1894,7 +1920,7 @@ describe('early receipt + receipt-less recovery', () => {
     expect(doc).toMatchObject({ status: 'removed', reason: 'recovered_without_receipt' });
     const calls = joinedCalls(f);
     expect(calls).toContain('systemctl --user disable --now gbrain-serve.service');
-    expect(calls).toContain(`${TS} serve --https=443 off`);
+    expect(calls).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(calls.some(c => /reset|logout|uninstall/.test(c))).toBe(false);
     expect(checkOf(doc, 'service')?.detail).toContain(f.deps.unitPath!);
     expect(checkOf(doc, 'tailscale.publish')).toMatchObject({ status: 'ok', detail: 'serve off: exit 0' });
@@ -1921,7 +1947,7 @@ describe('early receipt + receipt-less recovery', () => {
     const other = jsonDoc(f);
     expect(other.status).toBe('removed');
     expect(checkOf(other, 'tailscale.publish')?.detail).toContain('no :443 handler proxies to port 5000');
-    expect(joinedCalls(f).some(c => c.includes('--https=443 off'))).toBe(false);
+    expect(joinedCalls(f).some(c => c.includes('--https=443 --set-path=/ off'))).toBe(false);
     expect((await f.run([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:4000');
     // right port: funnel off first, then serve off
     // (re-create the wrapper the previous recovery removed, as an interrupted run would have left it)
@@ -1932,7 +1958,7 @@ describe('early receipt + receipt-less recovery', () => {
     const doc = jsonDoc(f);
     expect(checkOf(doc, 'plan')?.detail).toContain('(funnel first)');
     const calls = joinedCalls(f);
-    expect(calls).toContain(`${TS} funnel --https=443 off`);
+    expect(calls).toContain(`${TS} funnel --https=443 --set-path=/ off`);
     expect((await f.run([TS, 'serve', 'status', '--json'])).stdout).not.toContain('127.0.0.1:4000');
     expect(existsSync(wrapperPath(f.serveDir))).toBe(false);
     // darwin
@@ -1945,7 +1971,7 @@ describe('early receipt + receipt-less recovery', () => {
     expect(jsonDoc(g).reason).toBe('recovered_without_receipt');
     expect(joinedCalls(g)).toContain(`launchctl bootout gui/501 ${g.deps.plistPath}`);
     expect(existsSync(g.deps.plistPath!)).toBe(false);
-    expect(joinedCalls(g)).toContain(`${APP_TS} serve --https=443 off`);
+    expect(joinedCalls(g)).toContain(`${APP_TS} serve --https=443 --set-path=/ off`);
   });
   test('recovery with only a stray wrapper removes just the wrapper; an unreadable serve status is reported and leaves the handler', async () => {
     const f = fakeTailnet();
@@ -1990,7 +2016,7 @@ describe('early receipt + receipt-less recovery', () => {
     expect(doc.next_actions).toContain('gbrain mcp expose --remove --yes --force');
     expect(f.stderr.join('\n')).toContain('not proven to be ours');
     expect(f.stderr.join('\n')).toContain('not exposed — nothing to remove');
-    expect(joinedCalls(f).some(c => c.includes('--https=443 off') || c.includes('disable'))).toBe(false);
+    expect(joinedCalls(f).some(c => c.includes('--https=443 --set-path=/ off') || c.includes('disable'))).toBe(false);
     expect((await f.run([TS, 'serve', 'status', '--json'])).stdout).toContain('127.0.0.1:3131');
     // --force: the operator vouches for it → turned off, and the plan says why
     const g = fakeTailnet({ existingHandlers: { 3131: false } });
@@ -1998,7 +2024,7 @@ describe('early receipt + receipt-less recovery', () => {
     const gdoc = jsonDoc(g);
     expect(gdoc.reason).toBe('recovered_without_receipt');
     expect(checkOf(gdoc, 'plan')?.detail).toContain('turn off the :443 handler proxying http://127.0.0.1:3131 (--force: no wrapper, unit or service corroborates it)');
-    expect(joinedCalls(g)).toContain(`${TS} serve --https=443 off`);
+    expect(joinedCalls(g)).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(joinedCalls(g).some(c => c.includes('disable'))).toBe(false);
     expect(checkOf(gdoc, 'files')?.detail).toBe('removed nothing');
     expect((await g.run([TS, 'serve', 'status', '--json'])).stdout).not.toContain('127.0.0.1:3131');
@@ -2010,7 +2036,7 @@ describe('early receipt + receipt-less recovery', () => {
     const hdoc = jsonDoc(h);
     expect(hdoc.reason).toBe('recovered_without_receipt');
     expect(checkOf(hdoc, 'plan')?.detail).not.toContain('--force');
-    expect(joinedCalls(h)).toContain(`${TS} serve --https=443 off`);
+    expect(joinedCalls(h)).toContain(`${TS} serve --https=443 --set-path=/ off`);
     expect(existsSync(wrapperPath(h.serveDir))).toBe(false);
     expect((await h.run([TS, 'serve', 'status', '--json'])).stdout).not.toContain('127.0.0.1:3131');
     // a non-TTY plan without --yes carries --force forward in the re-run hint
@@ -2078,5 +2104,379 @@ describe('PGLite lock-holder warning', () => {
     const g = fakeTailnet();
     expect(await runMcpExpose(['--dry-run', '--json'], g.deps)).toBe(0);
     expect(checkOf(jsonDoc(g), 'pglite_lock')).toBeUndefined();
+  });
+});
+
+describe('scoped off + honest recovery (adversarial-review batch)', () => {
+  /** Provoke a throw in the admin-token step AFTER this run published: a symlink where the token file goes. */
+  const plantTokenSymlink = (f: Fake) => { mkdirSync(f.serveDir, { recursive: true }); symlinkSync(join(f.home, 'victim'), adminTokenPath(f.serveDir)); };
+  const isOff = (argv: string[]) => argv[0] === TS && argv[2] === '--https=443' && argv[3] === '--set-path=/' && argv[4] === 'off';
+
+  test('rollback re-reads serve status after `off`: an exit 0 that leaves the handler in place is NOT turned off (warn); an unreadable re-read is "state unknown" (warn) — never "turned off again"', async () => {
+    // off exits 0 but the mount survives (the fake keeps its handler table untouched)
+    const f = fakeTailnet();
+    plantTokenSymlink(f);
+    const inner = f.deps.run!;
+    f.deps.run = async (argv, o) => (isOff(argv) ? (f.calls.push(argv), { status: 0, stdout: '', stderr: '' }) : inner(argv, o));
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc).toMatchObject({ status: 'error', reason: 'mcp_expose_failed' });
+    expect(doc.message).toContain('NOT turned off (off exited 0 but the handler is still present');
+    expect(doc.message).not.toContain('turned off again');
+    expect(checkOf(doc, 'rollback')).toMatchObject({ status: 'warn' });
+    expect(checkOf(doc, 'rollback')?.detail).toContain('tailscale serve --https=443 --set-path=/ off: NOT turned off');
+    const calls = joinedCalls(f);
+    expect(calls.indexOf(`${TS} serve --https=443 --set-path=/ off`)).toBeLessThan(calls.lastIndexOf(`${TS} serve status --json`));
+    expect(existsSync(receiptPath(f.serveDir))).toBe(false);
+    // off exits 0 (and really clears it) but the re-read fails → state unknown, warn
+    const g = fakeTailnet();
+    plantTokenSymlink(g);
+    const ginner = g.deps.run!;
+    let offRan = false;
+    g.deps.run = async (argv, o) => {
+      if (isOff(argv)) offRan = true;
+      if (offRan && argv.join(' ') === `${TS} serve status --json`) return { status: 1, stdout: '', stderr: 'Access denied' };
+      return ginner(argv, o);
+    };
+    expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(1);
+    const gdoc = jsonDoc(g);
+    expect(gdoc.message).toContain('state unknown (off exited 0 but tailscale serve status could not be re-read');
+    expect(checkOf(gdoc, 'rollback')).toMatchObject({ status: 'warn' });
+    expect(existsSync(receiptPath(g.serveDir))).toBe(false);
+    // the happy rollback still claims "turned off again" only because the re-read shows the port gone
+    const h = fakeTailnet();
+    plantTokenSymlink(h);
+    expect(await runMcpExpose(['--yes', '--json'], h.deps)).toBe(1);
+    expect(jsonDoc(h).message).toContain('turned off again');
+    expect(joinedCalls(h).filter(c => c === `${TS} serve status --json`).length).toBeGreaterThanOrEqual(3); // before, after publish, after off
+  });
+
+  test('--no-tailscale over a receipt that says the brain is published on the tailnet is refused before consent (tailscale_receipt_present); --dry-run marks it; a loopback receipt re-runs fine', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    const before = readExposeReceipt(receiptPath(f.serveDir))!;
+    f.calls.length = 0;
+    f.stdout.length = 0;
+    f.fetches.length = 0;
+    expect(await runMcpExpose(['--yes', '--no-tailscale', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc).toMatchObject({ status: 'error', reason: 'tailscale_receipt_present' });
+    expect(doc.message).toBe(`This brain is already published on your tailnet at https://${DNS}; run \`gbrain mcp expose --remove --yes\` first, or re-run without --no-tailscale.`);
+    expect(checkOf(doc, 'plan')).toMatchObject({ status: 'fail' });
+    expect(checkOf(doc, 'plan')?.detail).toContain(`Tailscale REFUSED (--no-tailscale): this brain is already published on your tailnet at https://${DNS}`);
+    expect(checkOf(doc, 'consent')).toBeUndefined();
+    expect(doc.next_actions).toEqual(['gbrain mcp expose --remove --yes', 'gbrain mcp expose --yes']);
+    expect(doc.receipt).toEqual(before);
+    expect(readExposeReceipt(receiptPath(f.serveDir))).toEqual(before);
+    expect(joinedCalls(f).some(c => c.includes('--bg') || c.startsWith('systemctl --user enable') || c.startsWith('systemctl --user restart'))).toBe(false);
+    expect(f.fetches).toEqual([]);
+    // --dry-run: the plan shows the refusal, exit 0, nothing changed
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--dry-run', '--no-tailscale', '--json'], f.deps)).toBe(0);
+    const ddoc = jsonDoc(f);
+    expect(ddoc.status).toBe('planned');
+    expect(ddoc.plan.join('\n')).toContain('Tailscale WOULD BE REFUSED (--no-tailscale)');
+    // a receipt written by --no-tailscale (no dns_name) is not a tailnet mapping → the re-run is allowed
+    const g = fakeTailnet();
+    expect(await runMcpExpose(['--yes', '--no-tailscale'], g.deps)).toBe(0);
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--yes', '--no-tailscale', '--json'], g.deps)).toBe(0);
+    expect(jsonDoc(g).status).toBe('exposed');
+    // --funnel + --no-tailscale is still an argument conflict, not this refusal
+    expect(() => parseExposeArgs(['--funnel', '--no-tailscale'])).toThrow('Conflicting');
+  });
+
+  test('funnel -> tailnet switch: Funnel is turned off first; when `serve --bg` then fails (non-zero, unconfirmed) the previous funnel shape is re-published and the receipt kept; a restore that fails says so', async () => {
+    const failing = (f: Fake, serveBg: { status: number | null; stdout: string; stderr: string } | 'noop', funnelBgFails = false) => {
+      const inner = f.deps.run!;
+      f.deps.run = async (argv, o) => {
+        if (argv[0] === TS && argv[1] === 'serve' && argv[2] === '--bg') {
+          f.calls.push(argv);
+          if (serveBg === 'noop') { await inner([TS, 'serve', 'status', '--json']); return { status: 0, stdout: '', stderr: '' }; }
+          return serveBg;
+        }
+        if (funnelBgFails && argv[0] === TS && argv[1] === 'funnel' && argv[2] === '--bg') { f.calls.push(argv); return { status: 1, stdout: '', stderr: 'boom again' }; }
+        return inner(argv, o);
+      };
+    };
+    // non-zero publish → restored
+    const f = fakeTailnet({ existingHandlers: { 3131: true } });
+    writeExposeReceipt(receiptPath(f.serveDir), fullReceipt(f, { mode: 'funnel' }));
+    failing(f, { status: 1, stdout: '', stderr: 'boom' });
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc.reason).toBe('tailscale_unknown');
+    const calls = joinedCalls(f);
+    const preOff = calls.indexOf(`${TS} funnel --https=443 --set-path=/ off`);
+    expect(preOff).toBeGreaterThanOrEqual(0);
+    expect(preOff).toBeLessThan(calls.indexOf(`${TS} serve --bg 3131`));
+    expect(calls.indexOf(`${TS} serve --bg 3131`)).toBeLessThan(calls.indexOf(`${TS} funnel --bg 3131`));
+    expect(checkOf(doc, 'tailscale.publish')?.detail).toContain('unknown: boom; the previous funnel handler was restored (tailscale funnel --bg 3131) and the existing receipt kept');
+    expect(readExposeReceipt(receiptPath(f.serveDir))?.mode).toBe('funnel');
+    const view = JSON.parse((await f.run([TS, 'serve', 'status', '--json'])).stdout);
+    expect(JSON.stringify(view.Web)).toContain('127.0.0.1:3131');
+    expect(view.AllowFunnel).toEqual({ [`${DNS}:443`]: true });
+    // timeout (status null) → restored, and the run-by-hand hint stays
+    const t = fakeTailnet({ existingHandlers: { 3131: true } });
+    writeExposeReceipt(receiptPath(t.serveDir), fullReceipt(t, { mode: 'funnel' }));
+    failing(t, { status: null, stdout: '', stderr: '\n(timed out after 60000ms)' });
+    expect(await runMcpExpose(['--yes', '--json'], t.deps)).toBe(1);
+    const tdoc = jsonDoc(t);
+    expect(tdoc.reason).toBe('tailscale_unknown');
+    expect(checkOf(tdoc, 'tailscale.publish')?.detail).toContain('timed out after 60s; the previous funnel handler was restored');
+    expect(joinedCalls(t)).toContain(`${TS} funnel --bg 3131`);
+    // unconfirmed (exit 0, no handler) → restored
+    const u = fakeTailnet({ existingHandlers: { 3131: true } });
+    writeExposeReceipt(receiptPath(u.serveDir), fullReceipt(u, { mode: 'funnel' }));
+    failing(u, 'noop');
+    expect(await runMcpExpose(['--yes', '--json'], u.deps)).toBe(1);
+    const udoc = jsonDoc(u);
+    expect(udoc.reason).toBe('tailscale_publish_unconfirmed');
+    expect(checkOf(udoc, 'tailscale.publish')?.detail).toContain('exited 0 but serve status shows no / handler for port 3131; the previous funnel handler was restored');
+    expect(readExposeReceipt(receiptPath(u.serveDir))?.mode).toBe('funnel');
+    // the restore itself fails → said plainly, receipt still kept
+    const g = fakeTailnet({ existingHandlers: { 3131: true } });
+    writeExposeReceipt(receiptPath(g.serveDir), fullReceipt(g, { mode: 'funnel' }));
+    failing(g, { status: 1, stdout: '', stderr: 'boom' }, true);
+    expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(1);
+    const gdoc = jsonDoc(g);
+    expect(checkOf(gdoc, 'tailscale.publish')?.detail).toContain('the previous funnel handler could NOT be restored (tailscale funnel --bg 3131: exit 1) — run `tailscale serve status`; the existing receipt was kept');
+    expect(readExposeReceipt(receiptPath(g.serveDir))?.mode).toBe('funnel');
+    // no switch (fresh publish) → a failure carries no restore talk and issues no funnel argv at all
+    const h = fakeTailnet({ publishStatus: 1, publishStderr: 'boom' });
+    expect(await runMcpExpose(['--yes', '--json'], h.deps)).toBe(1);
+    expect(checkOf(jsonDoc(h), 'tailscale.publish')?.detail).toBe('unknown: boom');
+    expect(joinedCalls(h).some(c => c.includes('funnel'))).toBe(false);
+  });
+
+  test('linux login: `sudo` only in front of a system-installed binary — a ~/.local/bin/tailscale found on PATH is refused with tailscale_login_manual (exit 2, no sudo at all)', async () => {
+    const f = fakeTailnet({ backendState: 'NeedsLogin' });
+    const local = join(f.home, '.local', 'bin', 'tailscale');
+    // re-point the fake at the user-local binary: PATH finds it, nothing under the system candidates
+    const g = fakeTailnet({ backendState: 'NeedsLogin', binary: local });
+    g.deps.which = (n) => (n === 'tailscale' ? local : n === 'systemctl' ? '/usr/bin/systemctl' : n === 'gbrain' ? '/usr/local/bin/gbrain' : null);
+    expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(2);
+    const doc = jsonDoc(g);
+    expect(doc).toMatchObject({ status: 'pending', reason: 'tailscale_login_manual' });
+    expect(doc.message).toBe(`tailscale at ${local} is not a system install, so gbrain will not run it with sudo. Sign in yourself: \`sudo tailscale set --operator=$USER && sudo tailscale up\`, then re-run: gbrain mcp expose --yes`);
+    expect(checkOf(doc, 'tailscale.binary')?.detail).toBe(local);
+    expect(checkOf(doc, 'tailscale.login')).toMatchObject({ status: 'pending' });
+    expect(checkOf(doc, 'tailscale.login')?.detail).toContain('not a system install');
+    expect(doc.next_actions).toEqual(['sudo tailscale set --operator=$USER && sudo tailscale up', 'gbrain mcp expose --yes']);
+    expect(joinedCalls(g).some(c => c.startsWith('sudo'))).toBe(false);
+    expect(joinedCalls(g).some(c => c.includes(' up') || c.includes('--bg'))).toBe(false);
+    expect(existsSync(g.serveDir)).toBe(false);
+    // the system path (/usr/bin/tailscale) keeps the sudo login
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
+    expect(joinedCalls(f)).toContain(`sudo ${TS} set --operator=alice-example`);
+    expect(joinedCalls(f)).toContain(`sudo ${TS} up`);
+    // already Running: the guard is never consulted, a user-local binary publishes fine
+    const h = fakeTailnet({ binary: local });
+    h.deps.which = g.deps.which;
+    expect(await runMcpExpose(['--yes', '--json'], h.deps)).toBe(0);
+    expect(joinedCalls(h)).toContain(`${local} serve --bg 3131`);
+    expect(joinedCalls(h).some(c => c.startsWith('sudo'))).toBe(false);
+  });
+
+  test('occupied-port probe counts an accepted TCP connect even when the HTTP fetch rejects (a non-HTTP listener): foreign_listener before anything is published; with --no-service it is "something listens"', async () => {
+    const f = fakeTailnet();
+    const probes: [string, number, number][] = [];
+    f.deps.tcpProbe = async (host, port, timeoutMs) => { probes.push([host, port, timeoutMs]); return true; };
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc).toMatchObject({ status: 'error', reason: 'foreign_listener' });
+    expect(probes).toEqual([['127.0.0.1', 3131, 1500]]);
+    expect(f.fetches).toEqual(['http://127.0.0.1:3131/health']); // the fetch still ran (and rejected) — TCP alone decided
+    expect(checkOf(doc, 'service')?.detail).toBe('something already answers on 127.0.0.1:3131 (a TCP connect was accepted or http://127.0.0.1:3131/health answered) and no expose receipt claims it');
+    expect(f.calls.some(c => c[0] === TS)).toBe(false);
+    expect(existsSync(f.serveDir)).toBe(false);
+    // a tcpProbe that throws is "not listening", never a crash
+    const g = fakeTailnet();
+    g.deps.tcpProbe = async () => { throw new Error('probe exploded'); };
+    expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(0);
+    // --no-service: the TCP occupant is the operator's server → the local wait runs instead of "Nothing listens"
+    const h = fakeTailnet();
+    h.deps.tcpProbe = async () => true;
+    expect(await runMcpExpose(['--yes', '--no-service', '--json'], h.deps)).toBe(2);
+    expect(jsonDoc(h)).toMatchObject({ status: 'pending', reason: 'local_health_timeout' });
+    expect(h.stderr.join('\n')).not.toContain('Nothing listens on 127.0.0.1:3131');
+    // the help text says so
+    expect(MCP_EXPOSE_HELP).toContain('a TCP connect that is accepted');
+  });
+
+  test('defaultTcpProbe: true against a real loopback listener, false against a closed port (sockets closed either way)', async () => {
+    const server = createServer(c => c.destroy());
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    try {
+      expect(await defaultTcpProbe('127.0.0.1', port, 2_000)).toBe(true);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+    expect(await defaultTcpProbe('127.0.0.1', port, 2_000)).toBe(false);
+  });
+
+  test('--status without a receipt probes for leftovers: wrapper + unit + handler → one warn check each, exit 1 leftovers_without_receipt with the recovery command; a handler alone → --force; nothing → not_exposed', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    rmSync(receiptPath(f.serveDir));
+    f.calls.length = 0;
+    f.stdout.length = 0;
+    f.fetches.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc).toMatchObject({ status: 'error', reason: 'leftovers_without_receipt' });
+    expect(checkOf(doc, 'receipt')).toMatchObject({ status: 'warn' });
+    expect(checkOf(doc, 'receipt')?.detail).toContain('leftovers of an interrupted publish');
+    expect(checkOf(doc, 'service')).toMatchObject({ status: 'warn', detail: 'systemd (user) gbrain-serve.service is installed (running) without a receipt' });
+    expect(checkOf(doc, 'tailscale.publish')).toMatchObject({ status: 'warn', detail: 'a :443 handler proxies http://127.0.0.1:3131 without a receipt' });
+    expect(checkOf(doc, 'files')).toMatchObject({ status: 'warn', detail: 'wrapper ~/.gbrain/serve/gbrain-serve.sh exists without a receipt' });
+    expect(doc.next_actions).toEqual(['gbrain mcp expose --remove --yes']);
+    expect(doc.message).toContain('run gbrain mcp expose --remove --yes');
+    expect(f.fetches).toEqual([]); // read-only probes, no health fetches
+    expect(joinedCalls(f).every(c => c === 'systemctl --user is-system-running' || c === 'systemctl --user is-active gbrain-serve.service' || c === `${TS} serve status --json`)).toBe(true);
+    expect(f.stderr.join('\n')).toContain('Clean up: gbrain mcp expose --remove --yes');
+    // human mode exits 1 too
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status'], f.deps)).toBe(1);
+    expect(f.stdout.join('\n')).toContain('an interrupted `gbrain mcp expose` left these behind');
+    // and the suggested command really cleans it up → then the plain not_exposed
+    expect(await runMcpExpose(['--remove', '--yes'], f.deps)).toBe(0);
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], f.deps)).toBe(2);
+    expect(jsonDoc(f)).toMatchObject({ status: 'not_exposed', reason: 'not_exposed' });
+    // a handler alone (nothing else of gbrain's) → --force in the recovery command; --port is honored
+    const g = fakeTailnet({ existingHandlers: { 4000: true } });
+    expect(await runMcpExpose(['--status', '--port', '4000', '--json'], g.deps)).toBe(1);
+    const gdoc = jsonDoc(g);
+    expect(gdoc.reason).toBe('leftovers_without_receipt');
+    expect(checkOf(gdoc, 'tailscale.publish')?.detail).toBe('a :443 handler proxies http://127.0.0.1:4000 (funnel) without a receipt');
+    expect(checkOf(gdoc, 'service')).toBeUndefined();
+    expect(checkOf(gdoc, 'files')).toBeUndefined();
+    expect(gdoc.next_actions).toEqual(['gbrain mcp expose --remove --yes --force --port 4000']);
+    // the default port does not see a handler for another port
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], g.deps)).toBe(2);
+    expect(jsonDoc(g)).toMatchObject({ status: 'not_exposed' });
+    // an unreadable serve status alone is a caveat, not a leftover
+    const h = fakeTailnet();
+    const hinner = h.deps.run!;
+    h.deps.run = async (argv, o) => (argv.join(' ') === `${TS} serve status --json` ? { status: 1, stdout: '', stderr: 'Access denied' } : hinner(argv, o));
+    expect(await runMcpExpose(['--status', '--json'], h.deps)).toBe(2);
+    const hdoc = jsonDoc(h);
+    expect(hdoc).toMatchObject({ status: 'not_exposed' });
+    expect(checkOf(hdoc, 'tailscale.publish')?.detail).toContain('could not be checked');
+  });
+
+  test('darwin --remove: a launchd bootout that fails for a real reason is a service warn and "the launchd job (bootout failed)" is left in place — with a receipt and without one', async () => {
+    const f = fakeMac();
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    const inner = f.deps.run!;
+    f.deps.run = async (argv, o) => (argv.join(' ').startsWith('launchctl bootout gui/') ? (f.calls.push(argv), { status: 1, stdout: '', stderr: 'Boot-out failed: 1: Operation not permitted' }) : inner(argv, o));
+    f.calls.length = 0;
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(0);
+    const doc = jsonDoc(f);
+    expect(doc.status).toBe('removed');
+    expect(checkOf(doc, 'service')).toMatchObject({ status: 'warn' });
+    expect(checkOf(doc, 'service')?.detail).toContain(`removed ${f.deps.plistPath}; launchctl bootout failed, so the job may still be loaded — check \`launchctl print gui/$(id -u)/com.gbrain.serve\``);
+    expect(f.stderr.join('\n')).toContain('Note: launchctl bootout failed: Boot-out failed: 1: Operation not permitted');
+    expect(f.stderr.join('\n')).toContain('Left in place: the launchd job (bootout failed);');
+    expect(existsSync(f.deps.plistPath!)).toBe(false);
+    expect(checkOf(doc, 'tailscale.publish')).toMatchObject({ status: 'ok' });
+    // the benign "not loaded" answer (the fake's default once the job is down) stays silent
+    const g = fakeMac();
+    expect(await runMcpExpose(['--yes'], g.deps)).toBe(0);
+    g.stopService();
+    g.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], g.deps)).toBe(0);
+    expect(checkOf(jsonDoc(g), 'service')).toMatchObject({ status: 'ok' });
+    expect(g.stderr.join('\n')).not.toContain('bootout failed');
+    // receipt-less recovery reports it the same way, and the handler-not-removed message quotes the truthful service summary
+    const h = fakeMac();
+    expect(await runMcpExpose(['--yes'], h.deps)).toBe(0);
+    rmSync(receiptPath(h.serveDir));
+    const hinner = h.deps.run!;
+    h.deps.run = async (argv, o) => {
+      if (argv.join(' ').startsWith('launchctl bootout gui/')) return { status: 1, stdout: '', stderr: 'Boot-out failed: 1: Operation not permitted' };
+      if (argv[0] === APP_TS && argv[2] === '--https=443' && argv[3] === '--set-path=/' && argv[4] === 'off') return { status: 1, stdout: '', stderr: 'nope' };
+      return hinner(argv, o);
+    };
+    h.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], h.deps)).toBe(1);
+    const hdoc = jsonDoc(h);
+    expect(hdoc).toMatchObject({ status: 'error', reason: 'handler_not_removed' });
+    expect(checkOf(hdoc, 'service')).toMatchObject({ status: 'warn' });
+    expect(checkOf(hdoc, 'files')).toMatchObject({ status: 'skipped' });
+    expect(checkOf(hdoc, 'files')?.detail).toContain('kept: the wrapper');
+    expect(hdoc.next_actions).toEqual(['tailscale serve status', 'gbrain mcp expose --remove --yes']);
+    expect(h.stderr.join('\n')).toContain('Stopped here: the service files were removed but the launchd bootout failed, but the tailscale handler for port 3131 is still present. Left in place: the wrapper.');
+    expect(existsSync(wrapperPath(h.serveDir))).toBe(true);
+    expect(existsSync(h.deps.plistPath!)).toBe(false);
+  });
+
+  test('receipt-less --remove with a surviving handler keeps the wrapper (corroboration for the re-run) and exits 1 handler_not_removed; without a wrapper the re-run hint carries --force', async () => {
+    const f = fakeTailnet();
+    expect(await runMcpExpose(['--yes'], f.deps)).toBe(0);
+    rmSync(receiptPath(f.serveDir));
+    const inner = f.deps.run!;
+    f.deps.run = async (argv, o) => (isOff(argv) ? { status: 1, stdout: '', stderr: 'nope' } : inner(argv, o));
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--remove', '--yes', '--json'], f.deps)).toBe(1);
+    const doc = jsonDoc(f);
+    expect(doc).toMatchObject({ status: 'error', reason: 'handler_not_removed', receipt: null });
+    expect(checkOf(doc, 'service')).toMatchObject({ status: 'ok' });
+    expect(checkOf(doc, 'tailscale.publish')).toMatchObject({ status: 'fail' });
+    expect(checkOf(doc, 'files')?.detail).toContain('kept: the wrapper');
+    expect(doc.next_actions).toEqual(['tailscale serve status', 'gbrain mcp expose --remove --yes']);
+    expect(existsSync(wrapperPath(f.serveDir))).toBe(true);
+    expect(existsSync(f.deps.unitPath!)).toBe(false);
+    // handler + --force, no wrapper: nothing to keep, the re-run needs --force again
+    const g = fakeTailnet({ existingHandlers: { 3131: false } });
+    const ginner = g.deps.run!;
+    g.deps.run = async (argv, o) => (isOff(argv) ? { status: 1, stdout: '', stderr: 'nope' } : ginner(argv, o));
+    expect(await runMcpExpose(['--remove', '--yes', '--force', '--json'], g.deps)).toBe(1);
+    const gdoc = jsonDoc(g);
+    expect(gdoc.reason).toBe('handler_not_removed');
+    expect(gdoc.message).toBe('the tailscale handler for port 3131 is still present; left in place: nothing (no wrapper was found)');
+    expect(gdoc.next_actions).toEqual(['tailscale serve status', 'gbrain mcp expose --remove --yes --force']);
+    expect(g.stderr.join('\n')).toContain('Stopped here: no service was found, but the tailscale handler for port 3131 is still present.');
+  });
+
+  test('tailnet verify: a name-resolution failure is a warn ("this host cannot resolve …", MagicDNS hint) and exit 0 — on publish and on --status; other rejections keep the pending semantics', async () => {
+    const f = fakeTailnet();
+    const inner = f.deps.fetch!;
+    f.deps.fetch = async (url, init) => (url.startsWith('https://') ? Promise.reject(new Error(`getaddrinfo ENOTFOUND ${DNS}`)) : inner(url, init));
+    expect(await runMcpExpose(['--yes', '--json'], f.deps)).toBe(0);
+    const doc = jsonDoc(f);
+    expect(doc.status).toBe('exposed');
+    expect(doc.reason).toBeUndefined();
+    expect(checkOf(doc, 'verify.tailnet')).toMatchObject({ status: 'warn' });
+    expect(checkOf(doc, 'verify.tailnet')?.detail).toBe(`https://${DNS}/health: this host cannot resolve ${DNS} (MagicDNS may be off here: \`tailscale set --accept-dns=true\`); devices that do resolve it may already reach the server`);
+    expect(f.stderr.join('\n')).toContain(`Health    https://${DNS}/health: this host cannot resolve ${DNS}`);
+    expect(f.stderr.join('\n')).not.toContain('still pending');
+    expect(existsSync(receiptPath(f.serveDir))).toBe(true);
+    // --status: same warn, exit 0 when everything else verifies
+    f.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], f.deps)).toBe(0);
+    const sdoc = jsonDoc(f);
+    expect(sdoc.status).toBe('exposed');
+    expect(checkOf(sdoc, 'verify.tailnet')).toMatchObject({ status: 'warn' });
+    expect(checkOf(sdoc, 'verify.tailnet')?.detail).toContain(`this host cannot resolve ${DNS}`);
+    // the other spellings classify too
+    for (const msg of ['fetch failed: EAI_AGAIN', 'Unable to connect. Is the computer able to access the url? failed to resolve host', 'Failed to resolve hostname']) {
+      const g = fakeTailnet();
+      const ginner = g.deps.fetch!;
+      g.deps.fetch = async (url, init) => (url.startsWith('https://') ? Promise.reject(new Error(msg)) : ginner(url, init));
+      expect(await runMcpExpose(['--yes', '--json'], g.deps)).toBe(0);
+      expect(checkOf(jsonDoc(g), 'verify.tailnet')?.status).toBe('warn');
+    }
+    // a refused / pending certificate is still `pending`, exit 2 (publish) and exit 1 (--status)
+    const h = fakeTailnet({ tailnetHealthy: false });
+    expect(await runMcpExpose(['--yes', '--json'], h.deps)).toBe(2);
+    expect(jsonDoc(h)).toMatchObject({ status: 'pending', reason: 'tailnet_health_pending' });
+    h.stdout.length = 0;
+    expect(await runMcpExpose(['--status', '--json'], h.deps)).toBe(1);
+    expect(jsonDoc(h)).toMatchObject({ status: 'pending', reason: 'tailnet_health_pending' });
   });
 });
