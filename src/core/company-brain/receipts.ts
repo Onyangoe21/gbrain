@@ -153,7 +153,7 @@ export async function readSourceIngestionState(db: BrainEngine, input: SourceIng
 export async function beginSourceIngestionReceipt(db: BrainEngine, input: BeginSourceIngestionReceiptInput): Promise<SourceIngestionReceipt> {
   validateId(input.id);
   if (!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(input.approvedRevision) || !/^[a-f0-9]{64}$/.test(input.schemaFingerprint)
-    || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(input.profile) || !/^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,127}$/.test(input.extractorVersion)) {
+    || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(input.profile) || !/^[a-zA-Z0-9][a-zA-Z0-9._+:-]{0,127}$/.test(input.extractorVersion)) {
     fail('invalid_receipt', 'Receipts require a full approved revision, resolved-schema SHA-256, profile ID, and extractor version.');
   }
   const requests = validatedRequests(input.lifecycleRequestIds ?? []);

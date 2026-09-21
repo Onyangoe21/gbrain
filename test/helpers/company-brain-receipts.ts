@@ -10,6 +10,7 @@ import {
 } from '../../src/core/company-brain/receipts.ts';
 import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from '../../src/core/company-brain/receipt-schema.ts';
 import { appendCompleted, clearOpCheckpoint, loadOpCheckpoint, purgeStaleCheckpoints } from '../../src/core/op-checkpoint.ts';
+import { LINK_EXTRACTOR_VERSION_TS } from '../../src/core/link-extraction.ts';
 
 export function sourceIngestionReceiptTests(label: string, getEngine: () => BrainEngine): void {
   describe(label, () => {
@@ -234,6 +235,13 @@ export function sourceIngestionReceiptTests(label: string, getEngine: () => Brai
       await expect(beginSourceIngestionReceipt(engine, { ...input, approvedRevision: 'a'.repeat(8) })).rejects.toMatchObject({ code: 'invalid_receipt' });
       await expect(beginSourceIngestionReceipt(engine, { ...input, schemaFingerprint: 'b'.repeat(8) })).rejects.toMatchObject({ code: 'invalid_receipt' });
       expect(await read()).toBeNull();
+    });
+
+    test('accepts the real inspection extractor timestamp without accepting arbitrary diagnostics', async () => {
+      const current = await beginSourceIngestionReceipt(engine, { ...input, extractorVersion: LINK_EXTRACTOR_VERSION_TS });
+      expect(current.extractorVersion).toBe(LINK_EXTRACTOR_VERSION_TS);
+      await expect(beginSourceIngestionReceipt(engine, { ...input, id: randomUUID(), extractorVersion: 'private error\ncontent' }))
+        .rejects.toMatchObject({ code: 'invalid_receipt' });
     });
 
     test('completion requires VERIFY, actual outcome evidence, and no failed or pending writes', async () => {
