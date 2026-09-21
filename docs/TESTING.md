@@ -1,7 +1,23 @@
 # Testing (gbrain repo)
 
+`test/local-install-lifecycle.serial.test.ts` exercises isolated Bun-link install,
+keyless memory write/read/search, process reopen and migration/post-upgrade with
+service-command tripwires. `test/e2e/grandfather-projection-postgres.test.ts`
+checks guarded metadata-only grandfathering, duplicate source slugs, preserved
+valid text projections and refusal to seal previously unsealed rows on Postgres.
+`test/reindex-markdown-persistence.slow.test.ts` retains the bounded 3,600-page
+real-CLI reindex, SIGKILL and resume workload; the diagnostic benchmark launcher
+is `scripts/bench-reindex-markdown.ts`.
+
 On-demand reference (see CLAUDE.md Reference map). Current behavior + invariants
 only.
+
+`test/docs-navigation.test.ts` checks local links and fragments in the primary
+install/memory guides and all `docs/architecture/key-files/` references, requires
+every subsystem to be linked from `KEY_FILES.md`, and guards against blanket
+graph-write and preference-routing claims. The fixture suite
+`test/scripts/check-key-files-current-state.test.ts` covers history markers,
+cross-subsystem duplicate entries, and byte caps for the entry docs and references.
 
 `test/e2e/serve-http-oauth.test.ts` additionally pins confidential POST/Basic revocation, public-client SDK fallthrough, malformed/mixed authentication rejection, cross-client isolation, unknown-token opacity, metadata auth methods, no-store responses, strict post-revoke `401`, and retryable backend `503` semantics. SDK-driven discovery and real owner-approved PKCE also pin read-only bootstrap, explicit writer requests, scope clamping, and DCR delegation refusal. `test/oauth-scope-hint.test.ts` exercises the actual SDK middleware over HTTP without requiring a database.
 

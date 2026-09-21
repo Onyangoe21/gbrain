@@ -5,6 +5,7 @@ import { privatePagesFilterFragment } from '../search/private-visibility.ts';
 import type { ReadQuery } from '../search/read-enrichment.ts';
 import { rowToPage } from '../utils.ts';
 import type { PageSnapshot, PageSnapshotOptions, PageWithdrawal } from './types.ts';
+import { PageSnapshotAmbiguousError } from './types.ts';
 
 /** The DB normalizes companion lines, preserving its lower()/POSIX-space semantics. */
 function overlayWithdrawals(body: string, normalizedBody: string, withdrawals: PageWithdrawal[]): string {
@@ -56,9 +57,10 @@ export async function readPageSnapshot(query: ReadQuery, slug: string, opts?: Pa
   }
   if (!opts?.includeDeleted) where.push('p.deleted_at IS NULL');
   if (opts?.excludePrivate) where.push(privatePagesFilterFragment('p'));
+  if (opts?.requireLiveSource) where.push('EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)');
   params.push(opts?.sourceIds?.[0] ?? 'default');
   const rows = await query<Record<string, unknown>>(`WITH chosen AS (
-    SELECT p.* FROM pages p WHERE ${where.join(' AND ')}
+    SELECT p.*${opts?.requireUnambiguous ? ', count(*) OVER () AS snapshot_matches' : ''} FROM pages p WHERE ${where.join(' AND ')}
     ORDER BY (p.slug=$1) DESC, (p.source_id=$${params.length}) DESC, p.source_id ASC LIMIT 1
   ) SELECT p.*,
     (SELECT s.incarnation FROM sources s WHERE s.id=p.source_id) AS source_incarnation,
@@ -73,6 +75,7 @@ export async function readPageSnapshot(query: ReadQuery, slug: string, opts?: Pa
     FROM chosen p`, params);
   if (!rows.length) return null;
   const row = rows[0];
+  if (opts?.requireUnambiguous && Number(row.snapshot_matches) > 1) throw new PageSnapshotAmbiguousError();
   const page = rowToPage(row);
   const withdrawals = row.snapshot_withdrawals as PageWithdrawal[];
   page.compiled_truth = overlayWithdrawals(page.compiled_truth, String(row.fingerprint_body ?? ''), withdrawals);

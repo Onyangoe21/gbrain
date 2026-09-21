@@ -15,6 +15,14 @@ export interface PageKey { sourceId: string; slug: string }
 export interface PageSnapshotOptions extends GetPageOpts {
   /** Exact slug wins; only follow a source-scoped alias when explicitly requested. */
   resolveAlias?: boolean;
+  requireUnambiguous?: boolean;
+  requireLiveSource?: boolean;
+}
+export class PageSnapshotAmbiguousError extends Error {
+  constructor() {
+    super('Multiple readable pages match this identifier.');
+    this.name = 'PageSnapshotAmbiguousError';
+  }
 }
 export interface PageWithdrawal {
   visibility: 'private' | 'world';
