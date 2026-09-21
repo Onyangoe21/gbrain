@@ -37,7 +37,7 @@ export async function replaceDerivedLinks(
       || (link.origin_source_id && link.origin_source_id !== origin.sourceId)) {
       throw new TypeError('Derived link origin does not match the replacement scope');
     }
-    const row = { ...link, link_source: producer, origin_slug: origin.slug, origin_source_id: origin.sourceId,
+    const row = { ...link, link_source: producer, origin_slug: producer === 'frontmatter' ? origin.slug : undefined, origin_source_id: origin.sourceId,
       from_source_id: link.from_source_id ?? origin.sourceId, to_source_id: link.to_source_id ?? origin.sourceId };
     if (producer !== 'frontmatter' && (row.from_slug !== origin.slug || row.from_source_id !== origin.sourceId)) {
       throw new TypeError('Markdown links must originate at the replaced page');

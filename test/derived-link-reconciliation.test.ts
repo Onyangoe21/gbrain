@@ -99,6 +99,19 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
       expect((await graph()).map(row => row.link_type)).toEqual(['competes_with']);
     });
 
+    test('Markdown replacement keeps the same edge identity as legacy batch writers', async () => {
+      await seed('notes/reference', 'note');
+      await seed('people/target', 'person');
+      for (const producer of ['markdown', 'wikilink-resolved']) {
+        const link = { from_slug: 'notes/reference', to_slug: 'people/target', link_type: 'mentions',
+          link_source: producer, from_source_id: sourceId, to_source_id: sourceId };
+        await engine.replaceDerivedLinks(await origin('notes/reference'), [link]);
+        expect(await engine.addLinksBatch([link])).toBe(0);
+        expect(await graph()).toHaveLength(1);
+        expect((await graph())[0].origin_slug).toBeNull();
+      }
+    });
+
     test('owner replacement removes old derived edges, preserves manual rows, and is replay-safe', async () => {
       await seed('members/alice-example', 'person');
       await seed('members/bob-example', 'person');
@@ -138,7 +151,7 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
       expect(result.ok).toBe(true);
       expect(result.unresolved).toEqual([{ originSlug: 'rivals/rival-example', target: 'graph-other:organizations/shared', reason: 'cross_source' }]);
       expect((await graph()).map(row => [row.from_source, row.to_source, row.link_type])).toEqual([[sourceId, sourceId, 'mentions']]);
-      const foreign = await engine.executeRaw(`SELECT l.link_type FROM links l JOIN pages o ON o.id=l.origin_page_id WHERE o.source_id=$1`, [otherSource]);
+      const foreign = await engine.executeRaw(`SELECT l.link_type FROM links l JOIN pages o ON o.id=COALESCE(l.origin_page_id,l.from_page_id) WHERE o.source_id=$1`, [otherSource]);
       expect(foreign).toEqual([{ link_type: 'competes_with' }]);
     });
 
