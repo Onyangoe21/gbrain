@@ -504,7 +504,7 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 |-----------|---------------|-------------|-------|
 | CRUD | Full | Full | Same SQL |
 | Keyword search | tsvector + ts_rank | tsvector + ts_rank | Identical (real Postgres) |
-| Vector search | pgvector HNSW | pgvector HNSW | Identical (real Postgres) |
+| Vector search | pgvector HNSW | pgvector HNSW | Same operators; bounded fallback/cancellation differs |
 | Fuzzy slug | pg_trgm | pg_trgm | Identical (real Postgres) |
 | Graph traversal | Recursive CTE | Recursive CTE | Same SQL |
 | Transactions | Full ACID | Full ACID | Both support this |

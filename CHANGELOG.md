@@ -38,6 +38,111 @@ HNSW remains approximate. Postgres can use a server-cancelled exact fallback wit
 - Managed-safe code reindexing and shared Markdown/code preparation preserve fenced metadata, valid vectors and incoming graph edges; rebuilt outgoing edges become eligible for resolution again. Resolver batches and projection replacement share ordered guards, so a concurrent old resolver cannot certify new edges. Code reads enforce current live projections, and recursive operations do not reuse stale traversal caches.
 - Contributed by @time-attack (#5126, keyword ordering), @morven-ai (#5169, CJK operator selection), @Laochaleun (#5245, Markdown projection preparation), and @tarush1989 (#5085, atom diversification). Thanks to the issue reporters for the planner and retrieval reproductions.
 
+## [0.51.6.0] - 2026-09-21
+
+**A temporary brain gets one safe second chance to start.**
+
+An occasional startup failure no longer has to end a session that uses a fresh,
+temporary brain. If the first attempt fails before the database opens, GBrain
+tries once more from scratch. A successful retry tells you what happened. If
+both attempts fail, it stops and keeps both errors available for diagnosis.
+
+This second chance applies only to temporary databases held in memory. Your
+saved brain keeps its existing locking and repair protections. If a database
+has already opened and a later setup step fails, GBrain closes that database
+instead of replacing it with another one. If cleanup itself fails, it preserves
+the existing refusal to reopen until the process exits.
+
+| Situation | Result |
+|---|---|
+| Startup succeeds immediately | No retry or recovery warning. |
+| A temporary database fails to open once | One fresh attempt, without the cached snapshot. |
+| Both attempts fail | Startup fails with the original error and retry details. |
+| Setup fails after the database opens | The open database is closed; startup is not retried. |
+
+The behavior is automatic after upgrading. It does not retry entire failed test
+files, change saved-data repair rules, or guarantee recovery from every runtime
+failure. The doctor's separate temporary on-disk probe is unchanged.
+
+### Itemized changes
+
+- Bound in-memory `PGLiteEngine.connect()` recovery to one cold create before
+  any database is attached; replay the schema after snapshot fallback.
+- Preserve both failed-attempt diagnostics and existing shutdown ownership.
+- Add deterministic coverage for recovery, real snapshots, post-open cleanup,
+  poisoned close, concurrent connect/disconnect, and process exit status.
+
+Contributed by @RoniHenareh in #5272, with lifecycle safety and regression coverage
+extended during integration.
+
+## [0.51.4.0] - 2026-09-21
+
+**Queued writes move sooner, and contributor checks spend less time repeating work.**
+
+When several agents are waiting to save, finishing one write now wakes the next
+instead of waiting for an idle timer. Busy folders and retryable failures still
+back off normally. Shutdown still waits for active work, and every accepted write
+keeps the same durable receipt and recovery checks.
+
+Unchanged managed folders also stop replacing the same ownership-refusal record
+with two different descriptions on every refresh. Their files remain protected,
+including old paths after a move and sources without a worktree binding.
+
+Upgrade with `gbrain upgrade`; no configuration change or data migration is needed.
+These changes do not relax filesystem synchronization, lower stress-test counts,
+or move required checks out of pull-request CI.
+
+### The measured numbers
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| 256 disk-backed writes, same Linux machine and Bun 1.3.14 | 89.0s | 42.4s |
+| Privacy guard, same four-worker verify setup | 25.45s | 0.47–0.63s |
+| Full verify CPU time | 112.40s | 84.84–85.63s |
+| Repeated typecheck with native compiler state | 33.26s cold | 7.37–7.46s warm |
+| Full verify with warm compiler state | 36.19s cold | 18.12–18.40s warm |
+| 100 full PGLite fixture resets, median of three | 8.244s | 3.897s |
+| 12 reset-heavy files, four processes, median of two | 44.256s | 35.484s |
+
+The 256-write measurement is an iteration benchmark, not the full persistence
+gate. Full verification still requires 1,000 schedules, eight process-kill
+boundaries and 10,000 writes per engine. Cold type checking still takes about
+33 seconds on the measured machine; native incremental analysis speeds repeated
+local checks without caching test outcomes or restoring prior CI results.
+
+### Itemized changes
+
+- Canonical-write completion wakes the consumer promptly, including when the
+  wake-up arrives during another tick. Blocked attempts retain polling backoff.
+- Managed-root refresh chooses a stable bound record for each path while retaining
+  distinct fallback and moved paths. Unchanged registrations avoid redundant
+  durable replacements.
+
+### For contributors
+
+- Privacy and test-isolation guards batch fresh candidate scans before running
+  their existing detailed rules. Scanner errors fail closed; diagnostics,
+  allowlists and rule boundaries are unchanged.
+- Scheduler, root-registration and guard regressions cover the performance paths
+  alongside shutdown, retry, path confinement and scanner failure behavior.
+- Full PGLite fixture resets retain table/index storage rather than recreating it
+  for every test. Owned sequences, default-source reseeding, trigger behavior,
+  infrastructure state and fresh logical brain identities remain covered; unusual
+  schemas use the original truncation path. Exact aggregate storage accounting
+  also triggers truncation above 8 MiB, bounding retained fixture data.
+- `bun run typecheck` keeps native compiler analysis in ignored
+  `node_modules/.cache/gbrain-typecheck.tsbuildinfo`. Source/configuration/dependency
+  invalidation and repeated error reporting are regression-tested.
+- Every code-running local CI mode runs the authoritative `bun run verify` gate
+  once before tests, plus the existing test-timeout guard. It no longer maintains a smaller
+  parallel list of checks that can drift from hosted CI. The doc-only diff fast
+  path remains secrets-scan-only.
+- The Docker admin build has its own dependency and output volumes, keeping Linux
+  packages and root-owned generated files out of the host checkout.
+- A rename-recovery fixture now asserts that Git actually classified its change
+  as a rename. Terminated fixture lines keep it above Git's similarity threshold;
+  all original rejection, retry and recovery assertions remain in place.
+
 ## [0.51.3.0] - 2026-09-20
 
 **Use your brain from every device, app and cloud agent you have, without moving it off your own computer.** `gbrain mcp expose` publishes `gbrain serve --http` on your Tailscale tailnet with HTTPS, keeps it running as a user service, and hands you the grant command for each client. Tailnet-only by default; `--funnel` is the explicit opt-in for agents that run in a vendor's cloud (Grok Bot, Muse, ChatGPT, Claude.ai / Cowork, Perplexity). ngrok and cloud hosts stay documented as alternatives, and Grok Bot and Muse now recommend this shape first.

@@ -17,6 +17,15 @@ The recovery parity entry also runs `symbol-resolver-projection-race.test.ts`:
 paused resolver/rebuild ordering, atomic rollback, candidate revalidation, and
 a real PostgreSQL lock-wait receipt before releasing the competing writer.
 
+`test/pglite-in-memory-create-retry.serial.test.ts` injects create failures while
+using real PGLite instances and a validated schema snapshot. It pins one cold
+retry only before an in-memory database has opened, both failure diagnostics,
+schema replay after snapshot fallback, post-open cleanup and close poisoning,
+concurrent connect/disconnect ordering, exit-code preservation, and exclusion of
+the persistent repair path. Run it in its own Bun process because it mocks the
+PGLite module. Its recovery cases discriminate against the no-retry base; its
+post-open cleanup cases discriminate against a retry that replaces a live database.
+
 `test/e2e/serve-http-oauth.test.ts` additionally pins confidential POST/Basic revocation, public-client SDK fallthrough, malformed/mixed authentication rejection, cross-client isolation, unknown-token opacity, metadata auth methods, no-store responses, strict post-revoke `401`, and retryable backend `503` semantics. SDK-driven discovery and real owner-approved PKCE also pin read-only bootstrap, explicit writer requests, scope clamping, and DCR delegation refusal. `test/oauth-scope-hint.test.ts` exercises the actual SDK middleware over HTTP without requiring a database.
 
 `test/put-page-persistence.test.ts` and `test/e2e/put-page-persistence-postgres.test.ts`
@@ -60,6 +69,18 @@ array in `scripts/run-verify-parallel.sh` is the single execution list
 `check:no-legacy-getconnection`). The guard REGISTRY is `scripts/guards-manifest.tsv` (see "Guard registry and
 self-test" below).
 
+`bun run typecheck` uses TypeScript's native incremental analysis in
+`node_modules/.cache/gbrain-typecheck.tsbuildinfo`. Every invocation still runs
+the compiler; source, root-file, configuration and dependency changes invalidate
+the affected analysis, and cached diagnostics remain failures. The cache is local
+and ignored by Git; CI does not restore prior typecheck results.
+
+The local Docker runner isolates root and admin `node_modules`, plus the generated
+admin bundle, in named volumes. Admin build dependencies, Vite's generated cache
+and build output stay inside container volumes instead of replacing host files
+or leaving root-owned directories behind. `ci:local --clean` removes these volumes
+too; build the admin app on the host when updating its committed bundle.
+
 ### Native writer locks
 
 `bun test test/native-lock.test.ts test/scripts/native-lock-prebuilds.test.ts`
@@ -100,6 +121,15 @@ changes. `test/engine-control-routing.test.ts` pins direct/shared pool routing,
 nested transaction confinement and the Postgres resident-stop barrier.
 
 ### Durable persistence schedules and process crashes
+
+`test/persistence-consumer-scheduling.test.ts` pins completion wake-ups,
+including a wake-up arriving during an active tick, without lowering the idle
+poll interval. Per-root deadlines preserve blocked/retryable backoff even while
+another root keeps committing; expired deadlines permit retries. Shutdown drains
+active preparation without starting another request.
+`test/persistence-root-refresh.test.ts` checks that unchanged root registrations
+do not replace their durable files while unbound, moved and original bound paths
+all remain fenced.
 
 `test/persistence-chaos.slow.test.ts` and `test/e2e/persistence-chaos.test.ts`
 execute real journal/coordinator schedules and eight SIGKILL publication
@@ -228,6 +258,11 @@ partition estimates are projections until matched workflow runs confirm them;
 successful test results are never cached.
 
 ### Guard registry and self-test
+
+The privacy and test-isolation guards use `scripts/lib/guard-candidates.sh` to
+scan fresh file contents in bounded batches before applying their detailed
+per-file rules. They do not cache passing results. Candidate scanner failures
+fail the guard, and matching files retain the same allowlists and diagnostics.
 
 `scripts/guards-manifest.tsv` is THE single registry of `scripts/check-*`
 guards (currently 48), each classified `scanner` (greps/parses repo sources —
@@ -530,7 +565,13 @@ beforeEach(async () => {
 });
 ```
 
-Why this exact shape: `beforeAll` creates a single engine per file (PGLite WASM cold-start + initSchema is ~20s); `beforeEach` truncates user data via `resetPgliteState` ("two orders of magnitude faster" than fresh-engine-per-test); `afterAll` disconnects so the engine doesn't leak across file boundaries within a shard process.
+Why this exact shape: `beforeAll` creates a single engine per file (PGLite WASM cold-start + initSchema is ~20s); `beforeEach` clears user data via `resetPgliteState`; `afterAll` disconnects so the engine doesn't leak across file boundaries within a shard process. Ordinary resets atomically delete rows with cleanup-only trigger suppression and restart owned sequences, retaining table/index storage. The helper restores trigger behavior before reseeding and falls back to `TRUNCATE CASCADE` for schemas whose triggers, rules, inheritance, external foreign keys or privileges require its original semantics. Schema/generation infrastructure survives, and each reset rotates the logical brain identity.
+
+Every full reset measures aggregate target-table storage, including indexes and
+TOAST, with `pg_total_relation_size`. Above 8 MiB it uses the same atomic TRUNCATE
+path to reclaim storage; no reset counter or stale size estimate is retained.
+The helper regression suite checks repeated TOAST-heavy resets, cleanup and
+sequence parity, restored triggers and foreign-key enforcement.
 
 #### `withEnv` pattern (R1 fix)
 
@@ -578,7 +619,7 @@ consumer suites:
   not replay migrations on a later `initSchema()` after a version rewind —
   rewind-arc tests need the cold path (see `test/bootstrap.test.ts`).
 - `reset-pglite.ts#resetPgliteStateNarrow(engine, tables)` — explicit-table
-  truncate for hot loops (the full reset truncates the whole catalog). The
+  truncate for hot loops (the full reset clears the whole catalog). The
   table list is REQUIRED — a default would silently under-truncate.
 - `git-fixture.ts` — `makeGitFixture(dir)`: build-once git repo +
   `reset()`/`commitAll()` between tests, replacing per-test `git init` chains.
