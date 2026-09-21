@@ -8,6 +8,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { COMPANY_BRAIN_SAMPLE } from '../src/core/company-brain/sample.ts';
 import { parseCompanyBrainConnectArgs } from '../src/commands/company-brain-connect.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const cli = resolve(import.meta.dir, '../src/cli.ts');
 const roots: string[] = [];
@@ -28,7 +29,7 @@ async function fixture() {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, page.content);
   }
-  execFileSync('git', ['init', '-q', repo]);
+  await makeGitFixture(repo);
   execFileSync('git', ['-C', repo, 'add', '.']);
   execFileSync('git', ['-C', repo, 'commit', '-qm', 'Fictional company input']);
   await withEnv({ GBRAIN_HOME: home }, async () => {

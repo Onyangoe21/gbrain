@@ -18,14 +18,15 @@ import { performSync } from '../src/commands/sync.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { submitEmbedBackfill } from '../src/core/embed-backfill-submit.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-company-runtime-'));
 const engines: BrainEngine[] = [];
 let closePg: (() => Promise<void>) | undefined;
 const git = (root: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-C', root, ...args], { encoding: 'utf8' }).trim();
-function fixture() {
+async function fixture() {
   const root = mkdtempSync(join(home, 'repo-'));
-  git(root, 'init', '-q');
+  await makeGitFixture(root);
   for (const [path, body] of Object.entries({
     'people/operator.md': '---\ntype: person\ntitle: Example Operator\n---\n# Example Operator\nOwns the account.\n',
     'customers/account.md': '---\ntype: customer\ntitle: Example Account\nowner: "[[people/operator]]"\naudience: internal\n---\n# Example Account\nA synthetic account with an explicit owner.\n',
@@ -50,7 +51,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('admission is local-only, atomic and replayable without repository or host schema edits', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       const plan = await inspectCompanyBrain({ path: root, profile: 'company-brain' });
       expect(plan.ready).toBe(true);
       const sourceId = `company-${randomUUID().slice(0, 8)}`;
@@ -72,7 +73,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('connect verifies content and ownership, preserves history, and ordinary sync reconciles new targets', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       const path = join(root, 'customers/account.md');
       const body = readFileSync(path, 'utf8') + '\n---\n- **2026-09-01** | Meeting — Account approved.\n';
       writeFileSync(path, body); git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic account history');
@@ -101,7 +102,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('graph failure retains real cursors beyond GC and zero-diff resume completes only missing phases', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
         plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
       const original = engine.replaceDerivedLinks;
@@ -129,7 +130,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
       await engine.setConfig('sync.include_working_tree', 'true');
-      const root = fixture();
+      const root = await fixture();
       const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
         plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
       await admitCompanyBrain(engine, input);
@@ -150,7 +151,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('verification catches missing explicit edges and repairs them on zero-diff retry', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
         plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
       const original = engine.replaceDerivedLinks;
@@ -168,7 +169,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('canonical tag overlays refuse source writeback instead of changing approved bytes', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
         plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
       expect((await connectCompanyBrain(engine, input)).ok).toBe(true);
@@ -186,7 +187,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('private audience and incompatible destination schema never register a source', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       const file = join(root, 'customers/account.md');
       writeFileSync(file, readFileSync(file, 'utf8').replace('audience: internal', 'visibility: private'));
       git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic restricted source');
@@ -196,7 +197,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
       expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1', [input.sourceId])).toHaveLength(0);
       const schemaBefore = await engine.getConfig('schema_pack');
       await engine.setConfig('schema_pack.source.conflict', 'gbrain-base-v2');
-      const clean = fixture();
+      const clean = await fixture();
       try { await expect(admitCompanyBrain(engine, { ...input, path: clean, plan: await inspectCompanyBrain({ path: clean, profile: 'company-brain' }) })).rejects.toMatchObject({ code: 'schema_identity_mismatch' }); }
       finally { await engine.executeRaw("DELETE FROM config WHERE key='schema_pack.source.conflict'"); }
       expect(await engine.getConfig('schema_pack')).toBe(schemaBefore);
@@ -205,7 +206,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
   test('unchanged origins gain newly resolvable edges and lose edges after target retyping or deletion', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const root = fixture();
+      const root = await fixture();
       mkdirSync(join(root, 'decisions'));
       mkdirSync(join(root, 'meetings'));
       writeFileSync(join(root, 'decisions/choice.md'), '---\ntype: decision\ntitle: Example Choice\n---\n# Example Choice\nApproved in [[meetings/future]].\n');

@@ -16,20 +16,21 @@ import { startPersistenceIpcServer, persistenceSocketPathForConfig, requestPersi
 import { maybeDelegateLocalAdministration } from '../src/core/persistence/local-client.ts';
 import { readLocalWriter } from '../src/core/persistence/identity.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'company-recovery-'));
 afterAll(() => rmSync(home, { recursive: true, force: true }));
 const git = (root: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-C', root, ...args], { encoding: 'utf8' }).trim();
-function fixture() {
+async function fixture() {
   const root = mkdtempSync(join(home, 'repo-'));
   mkdirSync(join(root, 'people'));
   writeFileSync(join(root, 'people/operator.md'), '---\ntype: person\ntitle: Example Operator\n---\n# Example Operator\nA synthetic contact.\n');
-  git(root, 'init', '-q'); git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic recovery fixture');
+  await makeGitFixture(root); git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic recovery fixture');
   return root;
 }
 
 test('a real SIGKILL after content commit resumes the same managed receipt on a reopened PGLite database', async () => {
-  const root = fixture();
+  const root = await fixture();
   const dir = mkdtempSync(join(home, 'kill-'));
   const database = join(dir, 'db');
   const requestId = randomUUID();
@@ -60,7 +61,7 @@ test('a real SIGKILL after content commit resumes the same managed receipt on a 
 }, 120_000);
 
 test('private administration delegates to the actual resident PGLite owner and refuses the stdio lane', async () => {
-  const root = fixture();
+  const root = await fixture();
   const dir = mkdtempSync(join(home, 'resident-'));
   await withEnv({ GBRAIN_HOME: dir, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined }, async () => {
     const config = { engine: 'pglite' as const, database_path: join(dir, 'db') };
@@ -84,7 +85,7 @@ test('private administration delegates to the actual resident PGLite owner and r
 }, 120_000);
 
 test('preview refuses missing migration 160 without creating any database objects', async () => {
-  const root = fixture();
+  const root = await fixture();
   const engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
   try {
     await engine.executeRaw('DROP TABLE source_ingestion_receipts');
@@ -96,9 +97,9 @@ test('preview refuses missing migration 160 without creating any database object
 }, 120_000);
 
 test('mixed sync --all continues the keyless profile while reporting missing credentials for ordinary sources', async () => {
-  const root = fixture();
-  const other = fixture();
-  const missingPolicy = fixture();
+  const root = await fixture();
+  const other = await fixture();
+  const missingPolicy = await fixture();
   const dir = mkdtempSync(join(home, 'all-'));
   const database = join(dir, 'db');
   await withEnv({ GBRAIN_HOME: dir, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined }, async () => {
@@ -133,7 +134,7 @@ test('mixed sync --all continues the keyless profile while reporting missing cre
 }, 120_000);
 
 for (const managed of [false, true]) test(`hostile Git scripts cannot execute through real ${managed ? 'managed' : 'legacy'} profile connect or sync`, async () => {
-  const root = fixture();
+  const root = await fixture();
   const dir = mkdtempSync(join(home, 'hostile-'));
   const marker = join(dir, 'executed');
   const script = join(dir, 'marker.sh');

@@ -19,15 +19,16 @@ import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
 import { removeSource } from '../src/core/sources-ops.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'company-policy-'));
 const engines: BrainEngine[] = [];
 let closePg: (() => Promise<void>) | undefined;
 const git = (root: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-C', root, ...args], { encoding: 'utf8' }).trim();
-function fixture() {
+async function fixture() {
   const root = mkdtempSync(join(home, 'repo-')); mkdirSync(join(root, 'people'));
   for (let index = 1; index <= 15; index++) writeFileSync(join(root, `people/person-${String(index).padStart(2, '0')}.md`), `---\ntype: person\ntitle: Example ${index}\n---\n# Example ${index}\nA synthetic contact for policy validation.\n`);
-  git(root, 'init', '-q'); git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic policy fixture');
+  await makeGitFixture(root); git(root, 'add', '.'); git(root, 'commit', '-qm', 'Synthetic policy fixture');
   return root;
 }
 async function input(root: string) {
@@ -53,7 +54,7 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
   test('malformed or valid changed policy never broadens the approved one-page selection after plan GC', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const request = await input(fixture());
+      const request = await input(await fixture());
       const connected = await connectCompanyBrain(engine, request);
       expect(connected.ok).toBe(true);
       expect(connected.receipt.counts.importedPages).toBe(1);
@@ -101,7 +102,7 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
       for (const engine of engines) {
         await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
         await engine.setConfig('sync.federated_v2', 'true');
-        const request = await input(fixture());
+        const request = await input(await fixture());
         const connected = await connectCompanyBrain(engine, request);
         expect(connected.ok).toBe(true);
         const [initial] = await engine.executeRaw<{ config: Record<string, unknown> }>('SELECT config FROM sources WHERE id=$1', [request.sourceId]);
@@ -133,7 +134,7 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
   test('old extractor approval refuses same-commit, changed-commit, and full sync without a new receipt', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const request = await input(fixture());
+      const request = await input(await fixture());
       const connected = await connectCompanyBrain(engine, request); expect(connected.ok).toBe(true);
       const [row] = await engine.executeRaw<{ config: Record<string, unknown> }>('SELECT config FROM sources WHERE id=$1', [request.sourceId]);
       const profile = { ...companyBrainProfile(row.config)!, extractorVersion: '2000-01-01T00:00:00Z' };
@@ -154,7 +155,7 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
   test('preview replays only the exact prior request, source incarnation, principal, repository and approval', async () => withEnv({ GBRAIN_HOME: home }, async () => {
     for (const engine of engines) {
       await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
-      const request = await input(fixture());
+      const request = await input(await fixture());
       const admitted = await admitCompanyBrain(engine, request);
       const before = await state(engine, request.sourceId);
       expect(await previewCompanyBrain(engine, request)).toMatchObject({ replayed: true, receiptId: admitted.receiptId, approvedRevision: request.plan.revision!.commit });
@@ -166,7 +167,7 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
       await expect(previewCompanyBrain(engine, { ...request, brainId: 'other-example' })).rejects.toMatchObject({ code: 'idempotency_conflict' });
       const different = await inspectCompanyBrain({ path: request.path, profile: 'company-brain', include: ['people/person-02.md'] });
       await expect(previewCompanyBrain(engine, { ...request, plan: different })).rejects.toMatchObject({ code: 'idempotency_conflict' });
-      await expect(previewCompanyBrain(engine, { ...request, path: fixture() })).rejects.toBeDefined();
+      await expect(previewCompanyBrain(engine, { ...request, path: await fixture() })).rejects.toBeDefined();
       await removeSource(engine, { id: request.sourceId, confirmDestructive: true, yes: true, keepStorage: true, requestId: randomUUID() });
       const replacement = { ...request, requestId: randomUUID(), plan: await inspectCompanyBrain({ path: request.path, profile: 'company-brain',
         include: request.plan.selection.include, exclude: request.plan.selection.exclude, limits: request.plan.limits }) };
