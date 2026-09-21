@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
+import { hasDatabase, setupLegacyEmbeddingDB, teardownDB } from './helpers.ts';
 import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { seedSearchQueryContract, verifyKeywordTieOrder, verifyMixedCjkCase, verifySearchDateBounds } from '../helpers/search-query-contract.ts';
 import { withEnv } from '../helpers/with-env.ts';
@@ -7,7 +7,7 @@ import { withEnv } from '../helpers/with-env.ts';
 (hasDatabase() ? describe : describe.skip)('search query contract on Postgres', () => {
   let engine: PostgresEngine;
   beforeAll(async () => {
-    engine = await setupDB();
+    engine = await setupLegacyEmbeddingDB();
     await seedSearchQueryContract(engine);
   }, 120_000);
   afterAll(async () => { await teardownDB(); });
