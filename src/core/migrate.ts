@@ -6570,7 +6570,7 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
   { version: 157, name: 'recoverable_source_topology', idempotent: true, sql: PERSISTENCE_TOPOLOGY_SCHEMA_SQL },
   { version: 158, name: 'canonical_version_deletion_state', idempotent: true, sql: PAGE_VERSION_DELETION_SCHEMA_SQL },
   { version: 159, name: 'index_retained_publication_recovery', idempotent: true, sql: PERSISTENCE_REQUEST_RECOVERY_INDEX_SQL + ';' },
-  { version: 160, name: 'source_ingestion_receipts', idempotent: true, sql: SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL },
+  { version: 160, name: 'source_ingestion_receipts_with_policy', idempotent: true, sql: SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
