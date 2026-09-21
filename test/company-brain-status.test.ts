@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { beginSourceIngestionReceipt } from '../src/core/company-brain/receipts.ts';
 import { readCompanyBrainSourceStatus } from '../src/core/company-brain/status.ts';
+import { readCompanyBrainEvidence } from '../src/core/company-brain/evidence.ts';
 
 let engine: PGLiteEngine;
 beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 120_000);
@@ -12,6 +13,9 @@ describe('company ingestion status', () => {
   test('ordinary sources do not acquire an ingestion status', async () => {
     expect(await readCompanyBrainSourceStatus(engine, 'default')).toBeNull();
     expect(await readCompanyBrainSourceStatus(engine, 'absent')).toBeNull();
+    expect(await readCompanyBrainEvidence(engine, 'default')).toEqual({
+      ownership: { status: 'not_applicable' }, supersession: { status: 'not_applicable' }, page: null,
+    });
   });
 
   test('reports the source-scoped durable phase without host paths or raw diagnostics', async () => {

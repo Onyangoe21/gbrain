@@ -8,6 +8,10 @@ people, decisions, meetings, and reference pages. It uses an opt-in company sche
 and a durable import receipt. It does not reorganize your repository, install its
 agent instructions, or enable paid services.
 
+Verified ingestion is not a privacy audit or permission to share. Sanitizing a
+personal brain for team use is the separate `company-brainify` workflow and requires
+its own explicit approval; connect does not strip sensitive facts or Git history.
+
 ## Try it without private data
 
 ```bash
