@@ -1,32 +1,25 @@
 import type { BrainEngine, LinkBatchInput } from './engine.ts';
-import { extractPageLinks, buildBasenameIndex, queryBasenameIndex, normalizeBasename, unwrapWikilink,
+import { extractPageLinks, unwrapWikilink,
   type LinkExtractionPack, type SlugResolver } from './link-extraction.ts';
-import { slugifySegment } from './sync.ts';
 import { isValidSourceId } from './source-id.ts';
+import { buildSourceLocalReferenceIndex } from './source-local-reference-index.ts';
 
 export interface LinkPageMetadata {
   slug: string;
   source_id: string;
   type: string;
   title: string;
+  aliases?: unknown;
   knowledge_revision: string;
 }
 
 export async function loadLinkPageMetadata(engine: Pick<BrainEngine, 'executeRaw'>, sourceId?: string): Promise<LinkPageMetadata[]> {
-  return engine.executeRaw<LinkPageMetadata>(`SELECT slug, source_id, type, title, knowledge_revision FROM pages
+  return engine.executeRaw<LinkPageMetadata>(`SELECT slug, source_id, type, title, frontmatter->'aliases' AS aliases, knowledge_revision FROM pages
     WHERE deleted_at IS NULL${sourceId ? ' AND source_id=$1' : ''} ORDER BY source_id, slug`, sourceId ? [sourceId] : []);
 }
 
-function makeIndexedLinkResolver(pages: readonly LinkPageMetadata[], sourceId: string): SlugResolver {
-  const slugs = new Set(pages.map(page => page.slug));
-  const basenames = buildBasenameIndex(slugs);
-  const titles = new Map<string, string[]>();
-  for (const page of pages) {
-    const key = normalizeBasename(page.title);
-    const matches = titles.get(key) ?? [];
-    matches.push(page.slug);
-    titles.set(key, matches);
-  }
+export function makeIndexedLinkResolver(pages: readonly LinkPageMetadata[], sourceId: string): SlugResolver {
+  const index = buildSourceLocalReferenceIndex(pages.filter(page => page.source_id === sourceId));
   return {
     async resolve(name, dirHint) {
       if (!name) return null;
@@ -36,18 +29,10 @@ function makeIndexedLinkResolver(pages: readonly LinkPageMetadata[], sourceId: s
         if (value.slice(0, colon) !== sourceId) return null;
         value = value.slice(colon + 1);
       }
-      if (slugs.has(value)) return value;
-      const hints = Array.isArray(dirHint) ? dirHint : dirHint ? [dirHint] : [];
-      for (const hint of hints) {
-        for (const form of new Set([normalizeBasename(value), slugifySegment(value)])) {
-          if (slugs.has(`${hint}/${form}`)) return `${hint}/${form}`;
-        }
-      }
-      const matches = (titles.get(normalizeBasename(value)) ?? [])
-        .filter(slug => !hints.length || hints.some(hint => slug.startsWith(`${hint}/`)));
+      const matches = index.resolveMatches(value, dirHint);
       return matches.length === 1 ? matches[0] : null;
     },
-    async resolveBasenameMatches(name) { return name.includes(':') ? [] : queryBasenameIndex(basenames, name); },
+    async resolveBasenameMatches(name) { return index.basenameMatches(name); },
   };
 }
 

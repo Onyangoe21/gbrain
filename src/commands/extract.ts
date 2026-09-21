@@ -44,7 +44,7 @@ import { join, relative, dirname } from 'path';
 import type { BrainEngine, LinkBatchInput, TimelineBatchInput } from '../core/engine.ts';
 import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
-import { loadLinkPageMetadata } from '../core/link-reconciliation.ts';
+import { loadLinkPageMetadata, type LinkPageMetadata } from '../core/link-reconciliation.ts';
 export { reconcileSourceLinks, type SourceLinkReconciliationResult } from '../core/link-reconciliation.ts';
 import {
   extractPageLinks, parseTimelineEntries, deriveTimelineAnchor, inferLinkType, makeResolver,
@@ -1802,6 +1802,17 @@ function filterRefsSince<T extends { updated_at: Date }>(
   return refs.filter(r => r.updated_at.getTime() > sinceMs);
 }
 
+function capturedLinkEndpoints(links: LinkBatchInput[], metadata: ReadonlyMap<string, LinkPageMetadata>) {
+  const keys = new Set(links.flatMap(link => [
+    `${link.from_source_id ?? 'default'}\0${link.from_slug}`, `${link.to_source_id ?? 'default'}\0${link.to_slug}`,
+  ]));
+  return [...keys].map(key => {
+    const endpoint = metadata.get(key);
+    if (!endpoint) throw new Error('A derived link endpoint was not captured during type resolution');
+    return { slug: endpoint.slug, sourceId: endpoint.source_id, revision: endpoint.knowledge_revision };
+  });
+}
+
 async function extractLinksFromDB(
   engine: BrainEngine,
   dryRun: boolean,
@@ -1875,7 +1886,7 @@ async function extractLinksFromDB(
   const federatedSourceIds = new Set(
     (await loadAllSources(engine, { federatedOnly: true })).map(source => source.id),
   );
-  const targetTypes = new Map((await loadLinkPageMetadata(engine)).map(p => [`${p.source_id}\0${p.slug}`, p.type]));
+  const targetMetadata = new Map((await loadLinkPageMetadata(engine)).map(p => [`${p.source_id}\0${p.slug}`, p]));
   let processed = 0, created = 0;
   // #2576: skipped-candidate counter — see extractStaleFromDB's twin.
   let skippedMissingTarget = 0;
@@ -1915,7 +1926,7 @@ async function extractLinksFromDB(
       { skipFrontmatter: !includeFrontmatter, globalBasename, pack, targetType: (targetSlug, targetSourceId) => {
         const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, slug,
           source_id, allSlugs, slugToSources, federatedSourceIds.has(source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
-        return resolved.ok ? targetTypes.get(`${resolved.toSourceId}\0${targetSlug}`) : undefined;
+        return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
       } },
     );
     unresolved.push(...extracted.unresolved);
@@ -1973,7 +1984,8 @@ async function extractLinksFromDB(
     if (!dryRun) {
       try {
         const written = await engine.replaceDerivedLinks({ slug, sourceId: source_id, expectedRevision: snapshot.revision,
-          sourceIncarnation: snapshot.sourceIncarnation }, batch, { includeFrontmatter });
+          sourceIncarnation: snapshot.sourceIncarnation }, batch, { includeFrontmatter,
+          expectedEndpoints: capturedLinkEndpoints(batch, targetMetadata) });
         created += written.created;
       } catch (error) {
         if (jsonMode) process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, code: 'graph_write_failed' }) + '\n');
@@ -2222,7 +2234,7 @@ export async function extractStaleFromDB(
   const federatedSourceIds = new Set(
     (await loadAllSources(engine, { federatedOnly: true })).map(source => source.id),
   );
-  const targetTypes = new Map((await loadLinkPageMetadata(engine)).map(p => [`${p.source_id}\0${p.slug}`, p.type]));
+  const targetMetadata = new Map((await loadLinkPageMetadata(engine)).map(p => [`${p.source_id}\0${p.slug}`, p]));
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('extract.stale', totalStale);
@@ -2262,7 +2274,7 @@ export async function extractStaleFromDB(
         { skipFrontmatter: !includeFrontmatter, globalBasename, pack, targetType: (targetSlug, targetSourceId) => {
           const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, page.slug,
             page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
-          return resolved.ok ? targetTypes.get(`${resolved.toSourceId}\0${targetSlug}`) : undefined;
+          return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
         } },
       );
       for (const c of extracted.candidates) {
@@ -2284,7 +2296,8 @@ export async function extractStaleFromDB(
         });
       }
       const written = await engine.replaceDerivedLinks({ slug: page.slug, sourceId: page.source_id,
-        expectedRevision: snapshot.revision, sourceIncarnation: snapshot.sourceIncarnation }, linkRows, { includeFrontmatter });
+        expectedRevision: snapshot.revision, sourceIncarnation: snapshot.sourceIncarnation }, linkRows, { includeFrontmatter,
+        expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata) });
       linksCreated += written.created;
       for (const entry of parseTimelineEntries(fullContent)) {
         // #3957: carry the parsed source label — omitting it wrote source=''

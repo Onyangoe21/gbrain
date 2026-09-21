@@ -3,7 +3,8 @@ import { posix } from 'node:path';
 import { parseDataFrontmatter } from '../data-frontmatter.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { extractEntityRefs, LINK_EXTRACTOR_VERSION_TS, unwrapWikilink } from '../link-extraction.ts';
-import { normalizeAlias, normalizeAliasList } from '../search/alias-normalize.ts';
+import { normalizeAliasList } from '../search/alias-normalize.ts';
+import { buildSourceLocalReferenceIndex, frontmatterReferenceHints } from '../source-local-reference-index.ts';
 import { slugifyPath } from '../sync.ts';
 import { OperationError } from '../ops/contract.ts';
 import { loadResolvedPackByName } from '../schema-pack/load-active.ts';
@@ -159,7 +160,7 @@ function readPage(content: string, entry: InspectionEntry, plan: CompanyBrainPla
   }
   const fields = new Map<string, string>();
   for (const mapping of pack?.manifest.frontmatter_links ?? []) {
-    if (mapping.page_type === type || mapping.page_type === '*') for (const field of mapping.fields) if (!fields.has(field)) fields.set(field, mapping.link_type);
+    if (mapping.page_type === type) for (const field of mapping.fields) if (!fields.has(field)) fields.set(field, mapping.link_type);
   }
   for (const [field, linkType] of fields) {
     if (raw[field] == null) continue;
@@ -182,24 +183,15 @@ function readPage(content: string, entry: InspectionEntry, plan: CompanyBrainPla
     content_sha256: createHash('sha256').update(content).digest('hex'), references };
 }
 
-function resolveReferences(plan: CompanyBrainPlan): void {
+function resolveReferences(plan: CompanyBrainPlan, pack: ResolvedPack | null): void {
   const slugs = new Map<string, InspectionEntry[]>();
-  const names = new Map<string, Set<string>>();
-  const addName = (name: string, slug: string) => {
-    const key = normalizeAlias(name);
-    if (!key) return;
-    const matches = names.get(key) ?? new Set<string>();
-    matches.add(slug);
-    names.set(key, matches);
-  };
+  const index = buildSourceLocalReferenceIndex(plan.manifest.filter(entry => entry.disposition === 'included' && entry.page).map(entry => entry.page!));
   for (const entry of plan.manifest) {
     if (!entry.page) continue;
     const page = entry.page;
     const matching = slugs.get(page.slug) ?? [];
     matching.push(entry);
     slugs.set(page.slug, matching);
-    if (entry.disposition !== 'included') continue;
-    for (const name of [page.title, posix.basename(page.slug), ...page.aliases]) addName(name, page.slug);
   }
   for (const entries of slugs.values()) if (entries.length > 1) {
     for (const entry of entries) finding(plan, 'error', 'slug_collision', 'Multiple selected paths normalize to the same page slug; rename or exclude a file.', entry.path);
@@ -207,19 +199,22 @@ function resolveReferences(plan: CompanyBrainPlan): void {
   for (const entry of plan.manifest) {
     if (!entry.page) continue;
     for (const alias of entry.page.aliases) {
-      if ((names.get(alias)?.size ?? 0) > 1) finding(plan, 'warning', 'ambiguous_alias', 'An alias or title names more than one selected page.', entry.path);
+      if (index.namedMatches(alias).length > 1) finding(plan, 'warning', 'ambiguous_alias', 'An alias or title names more than one selected page.', entry.path);
     }
     for (const ref of entry.page.references) {
       if (ref.resolution === 'cross_source') {
         finding(plan, 'warning', 'cross_source_reference', 'Cross-source references are not resolved by this profile.', entry.path);
         continue;
       }
-      const target = slugifyPath(ref.target);
-      const direct = safeRepositoryPath(ref.target) ? slugs.get(target)?.filter(item => item.disposition === 'included') ?? [] : [];
-      const byName = names.get(normalizeAlias(ref.target));
-      const candidates = direct.length ? direct.map(item => item.page!.slug) : ref.target.includes('/') ? [] : [...(byName ?? [])];
+      const hints = pack && ref.field ? frontmatterReferenceHints(pack.manifest, entry.page.type, ref.field) : undefined;
+      const candidates = !safeRepositoryPath(ref.target) ? [] : ref.kind === 'frontmatter' ? index.resolveMatches(ref.target, hints) :
+        index.exactMatches(slugifyPath(ref.target)).filter(slug => slug !== entry.page!.slug);
       ref.resolution = candidates.length === 1 ? 'resolved' : candidates.length > 1 ? 'ambiguous' : 'unresolved';
-      if (candidates.length === 1) ref.resolved_slug = candidates[0];
+      const expectedType = ref.kind === 'frontmatter' ? pack?.manifest.link_types.find(item => item.name === ref.link_type)?.inference?.target_type : undefined;
+      if (candidates.length === 1 && expectedType && slugs.get(candidates[0]!)?.[0]?.page?.type !== expectedType) {
+        ref.resolution = 'unresolved';
+        finding(plan, 'warning', 'target_type_mismatch', 'The relationship target does not have the type required by its field.', entry.path);
+      } else if (candidates.length === 1) ref.resolved_slug = candidates[0];
       else finding(plan, 'warning', `${ref.resolution}_reference`, 'A relationship target is missing or ambiguous within the selected source.', entry.path);
     }
   }
@@ -317,7 +312,7 @@ export async function inspectCompanyBrain(options: InspectCompanyBrainOptions): 
     plan.uncommitted = await inspectUncommitted(plan.revision, entries, path => policy(path) === null && /\.mdx?$/i.test(path), limits);
     if (plan.uncommitted.some(item => item.eligible)) finding(plan, 'error', 'source_not_ready', 'Eligible files have uncommitted changes; commit or exclude them and inspect again. Only committed bytes were inspected.');
     if (plan.uncommitted.some(item => item.kind === 'untracked')) finding(plan, 'warning', 'untracked_input', 'Untracked files were not read or imported. Git-ignored untracked files are outside this inventory.');
-    resolveReferences(plan);
+    resolveReferences(plan, pack);
     if (!options.profile) {
       const typed = plan.manifest.filter(entry => entry.page?.type_explicit && distinctiveTypes.has(entry.page.type));
       if (new Set(typed.map(entry => entry.page!.type)).size >= 2 || typed.some(entry => pack?.manifest.page_types

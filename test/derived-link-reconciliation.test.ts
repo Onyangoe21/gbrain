@@ -1,8 +1,16 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { reconcileSourceLinks } from '../src/core/link-reconciliation.ts';
+import { loadLinkPageMetadata, makeIndexedLinkResolver, reconcileSourceLinks } from '../src/core/link-reconciliation.ts';
 import { parseSchemaPackManifest } from '../src/core/schema-pack/manifest-v1.ts';
+import { loadResolvedPackByName } from '../src/core/schema-pack/load-active.ts';
+import { inspectCompanyBrain } from '../src/core/company-brain/inspection.ts';
+import { readCommittedBlob } from '../src/core/company-brain/revision.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 
 const pack = parseSchemaPackManifest({
@@ -144,6 +152,70 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
       const result = await reconcileSourceLinks(engine, sourceId, { pack });
       expect(result.unresolved[0].reason).toBe('missing_target');
       expect(await graph()).toHaveLength(0);
+    });
+
+    test('inspection and reconciliation agree on aliases, basenames, ambiguity and unsupported bare Markdown', async () => {
+      const profile = await loadResolvedPackByName('company-brain');
+      const root = mkdtempSync(join(tmpdir(), 'company-reference-parity-'));
+      const markdown = (type: string, title: string, metadata = '', body = '') =>
+        `---\ntype: ${type}\ntitle: ${title}\n${metadata}---\n${body}\n`;
+      const files = {
+        'people/operator-key.md': markdown('person', 'Different Person Title', 'aliases: [Duty owner, Common name]\n'),
+        'people/peer-key.md': markdown('person', 'Another Person', 'aliases: [Common name]\n'),
+        'customers/by-alias.md': markdown('customer', 'Alias Account', 'owner: Duty owner\n'),
+        'customers/by-basename.md': markdown('customer', 'Basename Account', 'owner: operator-key\n'),
+        'customers/by-title.md': markdown('customer', 'Title Account', 'owner: Different Person Title\n'),
+        'customers/ambiguous.md': markdown('customer', 'Ambiguous Account', 'owner: Common name\n'),
+        'customers/bare-body.md': markdown('customer', 'Body Account', '', 'See [[operator-key]] and [[Duty owner]].'),
+        'customers/foreign.md': markdown('customer', 'Foreign Account', 'owner: Offsource alias\n'),
+        'decisions/old.md': markdown('decision', 'Historical Decision'),
+        'meetings/constrained.md': markdown('meeting', 'Constrained Meeting', 'attendees: ["[[decisions/old]]"]\n'),
+      };
+      try {
+        for (const [path, content] of Object.entries(files)) {
+          mkdirSync(dirname(join(root, path)), { recursive: true });
+          writeFileSync(join(root, path), content);
+        }
+        const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-C', root, ...args],
+          { stdio: 'pipe' });
+        git('init', '-q'); git('add', '.'); git('commit', '-qm', 'Create synthetic reference parity fixture');
+        const plan = await inspectCompanyBrain({ path: root, profile: 'company-brain', pack: profile });
+        expect(plan.ready).toBe(true);
+        const references = (path: string) => plan.manifest.find(entry => entry.path === path)!.page!.references;
+        for (const path of ['by-alias', 'by-basename', 'by-title']) {
+          expect(references(`customers/${path}.md`)).toMatchObject([
+            { kind: 'frontmatter', resolution: 'resolved', resolved_slug: 'people/operator-key', link_type: 'owned_by' },
+          ]);
+        }
+        expect(references('customers/ambiguous.md')[0].resolution).toBe('ambiguous');
+        expect(references('customers/bare-body.md').map(ref => ref.resolution)).toEqual(['unresolved', 'unresolved']);
+        expect(references('customers/foreign.md')[0].resolution).toBe('unresolved');
+        expect(references('meetings/constrained.md')[0].resolution).toBe('unresolved');
+        expect(plan.findings.some(item => item.code === 'target_type_mismatch')).toBe(true);
+        for (const entry of plan.manifest) {
+          if (entry.disposition !== 'included') continue;
+          const parsed = parseMarkdown((await readCommittedBlob(plan.revision!, entry)).toString('utf8'), entry.path, { activePack: profile.manifest });
+          await engine.putPage(entry.page!.slug, { type: parsed.type, title: parsed.title, compiled_truth: parsed.compiled_truth,
+            timeline: parsed.timeline, frontmatter: parsed.frontmatter }, { sourceId });
+        }
+        await seed('people/offsource', 'person', '', { aliases: ['Offsource alias'] }, otherSource);
+        await seed('people/operator-key', 'decision', '', { aliases: ['Duty owner'] }, otherSource);
+        const resolver = makeIndexedLinkResolver(await loadLinkPageMetadata(engine), sourceId);
+        expect(await resolver.resolve('Duty owner')).toBe('people/operator-key');
+        expect(await resolver.resolve('Offsource alias')).toBeNull();
+        expect(await resolver.resolve(`${otherSource}:people/operator-key`)).toBeNull();
+        expect(await resolver.resolve('Common name')).toBeNull();
+        const result = await reconcileSourceLinks(engine, sourceId, { pack: profile.manifest });
+        expect(result.ok).toBe(true);
+        expect((await graph()).map(row => [row.from_slug, row.to_slug, row.link_type])).toEqual([
+          ['customers/by-alias', 'people/operator-key', 'owned_by'],
+          ['customers/by-basename', 'people/operator-key', 'owned_by'],
+          ['customers/by-title', 'people/operator-key', 'owned_by'],
+        ]);
+        expect(result.unresolved.some(ref => ref.originSlug === 'customers/ambiguous')).toBe(true);
+        expect(result.unresolved.some(ref => ref.originSlug === 'customers/foreign')).toBe(true);
+        expect(result.unresolved.some(ref => ref.originSlug === 'meetings/constrained' && ref.reason === 'target_type_mismatch')).toBe(true);
+      } finally { rmSync(root, { recursive: true, force: true }); }
     });
 
     test('failed insert rolls back deletion and returns failure without a freshness stamp', async () => {
