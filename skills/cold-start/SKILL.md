@@ -171,8 +171,8 @@ the exact protocol.
 
 ## Phase 1: Existing Markdown / Obsidian Import
 
-For an existing company Git repository, route to the company workflow in
-`skills/migrate/SKILL.md` before the generic import below. Start with
+For an existing company Git repository, use the migrate (host-side) company
+workflow instead of the generic import below. On the trusted brain host, start with
 `gbrain sources inspect <path> --profile company-brain`; confirm an initialized
 company brain and a new source, show the connect destination/access preview, and
 obtain approval before `--yes`. Do not flatten its vocabulary by activating or
@@ -206,7 +206,7 @@ done
 
 ```bash
 # Obsidian vaults are markdown directories — import directly, then wire wikilinks
-# (full flow: skills/migrate/SKILL.md)
+# (full flow: migrate (host-side))
 gbrain import /path/to/vault --no-embed --workers 4
 gbrain extract links --source db      # parses [[wikilinks]] natively
 

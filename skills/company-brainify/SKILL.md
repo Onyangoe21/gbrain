@@ -73,8 +73,11 @@ takes/facts, and history.
 
 Connecting or indexing an existing company repository without editing it is not
 sanitization. For “connect our company brain” or “import an existing company
-brain,” use the company workflow in `skills/migrate/SKILL.md`. Do not strip
-metadata or purge history merely to make an existing repository searchable.
+brain,” use the migrate (host-side) company workflow. On the trusted brain host,
+start with `gbrain sources inspect <path> --profile company-brain`; follow
+`docs/guides/company-brain-ingestion.md` for destination preview and approval.
+Do not strip metadata or purge history merely to make an existing repository
+searchable.
 
 - Standing up a shared company brain from a founder/exec's personal brain
 - Auditing an existing shared brain for sensitive content that shouldn't be there
