@@ -6,11 +6,12 @@ import { execFileSync } from 'node:child_process';
 import { parseCompanyBrainInspectionArgs } from '../src/commands/company-brain-inspect.ts';
 import { sourcesOperations } from '../src/core/ops/sources.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const cli = resolve(import.meta.dir, '../src/cli.ts');
 const temporary: string[] = [];
 
-function fixture() {
+async function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'company-inspect-cli-'));
   temporary.push(root);
   const repo = join(root, 'repo');
@@ -19,7 +20,7 @@ function fixture() {
   mkdirSync(join(home, '.gbrain'), { recursive: true });
   writeFileSync(join(home, '.gbrain/config.json'), JSON.stringify({ engine: 'postgres', database_url: 'postgresql://invalid.invalid:1/not_a_brain' }));
   writeFileSync(join(repo, 'customers/acme-example.md'), '---\ntype: customer\ntitle: Acme Example\n---\nA fictional account.\n');
-  execFileSync('git', ['init', '-q', repo]);
+  await makeGitFixture(repo);
   execFileSync('git', ['-C', repo, 'add', '.']);
   execFileSync('git', ['-C', repo, 'commit', '-qm', 'Fictional company fixture']);
   return { root, repo, home };
@@ -48,8 +49,8 @@ describe('company repository inspection CLI', () => {
     }
   });
 
-  test('inspects without opening a configured unreachable database or changing source content', () => {
-    const f = fixture();
+  test('inspects without opening a configured unreachable database or changing source content', async () => {
+    const f = await fixture();
     const original = readFileSync(join(f.repo, 'customers/acme-example.md'));
     const config = readFileSync(join(f.home, '.gbrain/config.json'));
     const result = run(f.home, ['inspect', f.repo, '--profile', 'company-brain', '--json']);
@@ -64,8 +65,8 @@ describe('company repository inspection CLI', () => {
     expect(execFileSync('git', ['-C', f.repo, 'status', '--porcelain'], { encoding: 'utf8' })).toBe('');
   }, 30_000);
 
-  test('writes only an explicitly requested private plan and never overwrites it', () => {
-    const f = fixture();
+  test('writes only an explicitly requested private plan and never overwrites it', async () => {
+    const f = await fixture();
     const out = join(f.root, 'plans', 'review.json');
     const args = ['inspect', f.repo, '--profile', 'company-brain', '--json', '--out', out];
     expect(run(f.home, args).code).toBe(0);
@@ -81,8 +82,8 @@ describe('company repository inspection CLI', () => {
     expect(readFileSync(out, 'utf8')).toBe(saved);
   }, 30_000);
 
-  test('reports blocked sources and usage errors as clean JSON', () => {
-    const f = fixture();
+  test('reports blocked sources and usage errors as clean JSON', async () => {
+    const f = await fixture();
     writeFileSync(join(f.repo, 'customers/acme-example.md'), 'Uncommitted replacement.');
     const blocked = run(f.home, ['inspect', f.repo, '--profile', 'company-brain', '--json']);
     expect(blocked.code).toBe(1);
@@ -92,8 +93,8 @@ describe('company repository inspection CLI', () => {
     expect(JSON.parse(usage.out).code).toBe('invalid_params');
   }, 30_000);
 
-  test('help is database-free and thin clients refuse before inspection', () => {
-    const f = fixture();
+  test('help is database-free and thin clients refuse before inspection', async () => {
+    const f = await fixture();
     expect(run(f.home, ['inspect', '--help']).out).toContain('No database');
     writeFileSync(join(f.home, '.gbrain/config.json'), JSON.stringify({ engine: 'mcp', remote_mcp: { mcp_url: 'https://example.invalid/mcp' } }));
     const denied = run(f.home, ['inspect', f.repo, '--json']);
@@ -101,8 +102,8 @@ describe('company repository inspection CLI', () => {
     expect(JSON.parse(denied.out).code).toBe('permission_denied');
   }, 30_000);
 
-  test('unknown flags keep the same versioned JSON and usage exit contract', () => {
-    const f = fixture();
+  test('unknown flags keep the same versioned JSON and usage exit contract', async () => {
+    const f = await fixture();
     const json = run(f.home, ['inspect', f.repo, '--banana', '--json']);
     expect(json.code).toBe(2);
     expect(JSON.parse(json.out)).toMatchObject({ schema_version: 1, status: 'blocked', code: 'invalid_params' });

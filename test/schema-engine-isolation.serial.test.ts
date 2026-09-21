@@ -21,6 +21,7 @@ import { operations, type OperationContext } from '../src/core/operations.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
 import { findExperts } from '../src/commands/whoknows.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'schema-engine-isolation-'));
 const configDir = join(home, '.gbrain');
@@ -51,7 +52,7 @@ async function fixture(id: string, managed = false) {
   mkdirSync(join(root, 'initiatives'), { recursive: true });
   const bytes = '---\ntitle: Example initiative\n---\nQuasar initiative ownership belongs to the example team.\n';
   writeFileSync(join(root, 'initiatives', 'example.md'), bytes);
-  git(root, 'init', '-q');
+  await makeGitFixture(root);
   git(root, 'add', '.');
   git(root, 'commit', '-qm', 'Synthetic schema isolation fixture');
   await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
