@@ -75,6 +75,17 @@ function snapshot(root: string): Record<string, string> {
 }
 
 describe('company-brain committed inspection', () => {
+  test.each(['quarantine', 'embed_skip'])('blocks a search-hiding marker: %s', async marker => {
+    const root = repo({ 'notes/hidden.md': page('note', `${marker}: null\n`) });
+    const before = snapshot(root);
+    const plan = await inspect(root);
+    expect(plan.ready).toBe(false);
+    expect(codes(plan)).toContain('hidden_input');
+    expect(plan.counts.included).toBe(0);
+    expect(plan.counts.unsupported).toBe(1);
+    expect(snapshot(root)).toEqual(before);
+  });
+
   test('accounts for every tracked file and preserves typed ownership without writes', async () => {
     const root = repo({
       'customers/account.md': page('customer', 'owner: "[[people/operator]]"\naudience: internal\naliases: [Account, ＡＣＣＯＵＮＴ]\nlast_verified: 2026-09-10\n', '# Account\nSee [[people/operator]].\n'),

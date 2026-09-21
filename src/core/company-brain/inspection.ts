@@ -7,6 +7,8 @@ import { normalizeAliasList } from '../search/alias-normalize.ts';
 import { buildSourceLocalReferenceIndex, frontmatterReferenceHints } from '../source-local-reference-index.ts';
 import { slugifyPath } from '../sync.ts';
 import { OperationError } from '../ops/contract.ts';
+import { QUARANTINE_KEY } from '../quarantine.ts';
+import { EMBED_SKIP_KEY } from '../embed-skip.ts';
 import { loadResolvedPackByName } from '../schema-pack/load-active.ts';
 import { invalidatePackCache, type ResolvedPack } from '../schema-pack/registry.ts';
 import { SchemaPackManifestSchema } from '../schema-pack/manifest-v1.ts';
@@ -97,6 +99,11 @@ function readPage(content: string, entry: InspectionEntry, plan: CompanyBrainPla
   const path = entry.path;
   const raw = parseDataFrontmatter(content).data;
   canonical(raw, Math.min(plan.limits.maxMetadataBytes, 256 * 1024));
+  if (Object.hasOwn(raw, QUARANTINE_KEY) || Object.hasOwn(raw, EMBED_SKIP_KEY)) {
+    entry.disposition = 'unsupported';
+    entry.reason = 'hidden_input';
+    finding(plan, 'error', 'hidden_input', 'A reserved search-hiding marker is present. Review it or exclude this file before connecting; markers are never cleared automatically.', path);
+  }
   const slug = slugifyPath(path);
   const parsed = parseMarkdown(content, path, { validate: true, expectedSlug: slug, activePack: pack?.manifest });
   for (const error of parsed.errors ?? []) {
