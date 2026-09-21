@@ -12,8 +12,9 @@ import { QUARANTINE_KEY } from '../quarantine.ts';
 import { EMBED_SKIP_KEY } from '../embed-skip.ts';
 
 export async function companyBrainGraphStamp(engine: BrainEngine, sourceId: string): Promise<string> {
-  const [row] = await engine.executeRaw<{ stamp: string }>(`SELECT md5(COALESCE(string_agg(l.id::text||':'||l.from_page_id::text||':'||l.to_page_id::text||':'||l.link_type||':'||l.link_source||':'||COALESCE(l.origin_field,''),',' ORDER BY l.id),'')) AS stamp
-    FROM links l JOIN pages p ON p.id=l.origin_page_id WHERE p.source_id=$1 AND l.link_source IN ('markdown','frontmatter','wikilink-resolved')`, [sourceId]);
+  const [row] = await engine.executeRaw<{ stamp: string }>(`SELECT md5(COALESCE(string_agg(l.id::text||':'||l.from_page_id::text||':'||l.to_page_id::text||':'||p.id::text||':'||l.link_type||':'||l.link_source||':'||COALESCE(l.origin_field,''),',' ORDER BY l.id),'')) AS stamp
+    FROM links l JOIN pages p ON p.id=COALESCE(l.origin_page_id,CASE WHEN l.link_source IN ('markdown','wikilink-resolved') THEN l.from_page_id END)
+    WHERE p.source_id=$1 AND l.link_source IN ('markdown','frontmatter','wikilink-resolved')`, [sourceId]);
   return row.stamp;
 }
 
@@ -56,7 +57,8 @@ export async function verifyCompanyBrain(engine: BrainEngine, sourceId: string, 
     const actual = await engine.executeRaw<{ from_slug: string; to_slug: string; from_source: string; to_source: string; link_type: string; link_source: string; origin_field: string | null }>(
       `SELECT f.slug AS from_slug,t.slug AS to_slug,f.source_id AS from_source,t.source_id AS to_source,l.link_type,l.link_source,l.origin_field FROM links l
        JOIN pages f ON f.id=l.from_page_id JOIN pages t ON t.id=l.to_page_id
-       WHERE l.origin_page_id=$1 AND l.link_source IN ('markdown','frontmatter','wikilink-resolved')`, [page.id]);
+       WHERE (l.origin_page_id=$1 OR (l.origin_page_id IS NULL AND l.from_page_id=$1 AND l.link_source IN ('markdown','wikilink-resolved')))
+         AND l.link_source IN ('markdown','frontmatter','wikilink-resolved')`, [page.id]);
     const actualKeys = new Map(actual.map(link => [JSON.stringify([link.from_slug, link.to_slug, link.link_type, link.link_source]), link.origin_field]));
     if (keys.size !== actualKeys.size || actual.some(link => link.from_source !== sourceId || link.to_source !== sourceId) ||
       [...keys].some(([key, field]) => !actualKeys.has(key) || actualKeys.get(key) !== field)) failures++;

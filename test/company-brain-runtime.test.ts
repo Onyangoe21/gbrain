@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -19,6 +19,7 @@ import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { submitEmbedBackfill } from '../src/core/embed-backfill-submit.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { makeGitFixture } from './helpers/git-fixture.ts';
+import * as verification from '../src/core/company-brain/verification.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-company-runtime-'));
 const engines: BrainEngine[] = [];
@@ -162,6 +163,32 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
       };
       let result;
       try { result = await connectCompanyBrain(engine, input); } finally { engine.replaceDerivedLinks = original; }
+      expect(result).toMatchObject({ ok: false, code: 'verification_failed', receipt: { phase: 'VERIFY', outcome: 'incomplete' } });
+      expect((await resumeCompanyBrain(engine, input)).ok).toBe(true);
+    }
+  }), 120_000);
+  test('same-source frontmatter reattribution cannot cross the completion fence', async () => withEnv({ GBRAIN_HOME: home }, async () => {
+    for (const engine of engines) {
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
+      const root = await fixture();
+      const input = { brainId: 'company-example', sourceId: `company-${randomUUID().slice(0, 8)}`, path: root,
+        plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false, requestId: randomUUID() };
+      const original = verification.companyBrainGraphStamp;
+      let reads = 0;
+      const stamps: string[] = [];
+      const probe = spyOn(verification, 'companyBrainGraphStamp').mockImplementation(async (tx, sourceId) => {
+        if (sourceId === input.sourceId && ++reads === 2) {
+          await tx.executeRaw(`UPDATE links l SET origin_page_id=l.to_page_id FROM pages p
+            WHERE p.id=l.from_page_id AND p.source_id=$1 AND l.link_source='frontmatter'`, [sourceId]);
+        }
+        const stamp = await original(tx, sourceId);
+        stamps.push(stamp);
+        return stamp;
+      });
+      let result;
+      try { result = await connectCompanyBrain(engine, input); } finally { probe.mockRestore(); }
+      expect(stamps).toHaveLength(2);
+      expect(stamps[0]).not.toBe(stamps[1]);
       expect(result).toMatchObject({ ok: false, code: 'verification_failed', receipt: { phase: 'VERIFY', outcome: 'incomplete' } });
       expect((await resumeCompanyBrain(engine, input)).ok).toBe(true);
     }
