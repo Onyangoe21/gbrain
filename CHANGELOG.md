@@ -2,6 +2,62 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.53.0.0] - 2026-09-21
+
+**Keep a company's vocabulary and relationships tied to the right brain.**
+
+Typed imports and queries now use the selected database's schema rather than
+quietly relying on an unrelated host configuration. If that schema cannot be
+read, typed retrieval refuses instead of answering under another vocabulary.
+The company preset also checks both sides of its relationship rules, so a link
+to a decision does not become meeting attendance.
+
+Database link extraction replaces only the derived relationships owned by each
+page. Changed owners and targets no longer leave old derived edges behind;
+manual links remain. A failed replacement rolls back, and a target changed
+during extraction cannot be stamped as freshly processed.
+
+### Use the existing commands
+
+```bash
+gbrain schema active
+gbrain extract links --source db --source-id wiki --include-frontmatter
+```
+
+Before importing an existing company checkout, preview its committed contents
+without a database or source edits:
+
+```bash
+gbrain sources inspect ./company-wiki --profile company-brain --json
+```
+
+Use the source that actually holds the repository. Legacy frontmatter links
+without origin metadata stop for review rather than being guessed away or
+deleted. This release does not automatically retype pages, activate the company
+preset, or import a repository.
+
+## To take advantage of v0.53.0.0
+
+Run `gbrain upgrade`. If schema application was interrupted, run
+`gbrain apply-migrations --yes` on the intended brain host, then `gbrain doctor`.
+The new receipt table is passive until a company ingestion run is explicitly
+approved. Existing source files and access grants are unchanged.
+
+### Itemized changes
+
+- Resolve engine-backed schema and type closure against the selected brain,
+  with explicit empty type filters and schema-read failures failing closed.
+- Enforce page/target/phrase constraints together, align filesystem type
+  inference, and reconcile derived links with origin and endpoint revision fences.
+  Filesystem typing incorporates the behavior proposed in #5153, contributed by
+  @mattzimak.
+- Add committed-repository inspection primitives and share source-local alias,
+  title, and basename resolution with graph reconciliation. Ambiguous or
+  unsupported references remain visible gaps.
+- Migration 160 adds source-scoped durable ingestion receipts with immutable
+  approval fingerprints and protected incomplete checkpoints. This is the storage
+  foundation, not automatic source connection.
+
 ## [0.52.0.0] - 2026-09-21
 
 **Keep the vocabulary of a company knowledge repository.**
