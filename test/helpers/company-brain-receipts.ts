@@ -24,7 +24,7 @@ export function sourceIngestionReceiptTests(label: string, getEngine: () => Brai
       const incarnation = randomUUID();
       await engine.executeRaw('INSERT INTO sources(id,name,incarnation) VALUES ($1,$1,$2::uuid)', [sourceId, incarnation]);
       input = { id: randomUUID(), sourceId, sourceIncarnation: incarnation, approvedRevision: 'a'.repeat(40), profile: 'company',
-        schemaFingerprint: 'b'.repeat(64), extractorVersion: '1', lifecycleRequestIds: [randomUUID()], fence: { mode: 'unmanaged' } };
+        schemaFingerprint: 'b'.repeat(64), policyFingerprint: 'c'.repeat(64), extractorVersion: '1', lifecycleRequestIds: [randomUUID()], fence: { mode: 'unmanaged' } };
       checkpoints = ['content', 'manifest', 'managed_cursor'].map(kind => ({ op: `fixture-${kind}`, fingerprint: input.id, kind: kind as SourceIngestionCheckpoint['kind'] }));
     });
     afterEach(async () => {
@@ -56,13 +56,23 @@ export function sourceIngestionReceiptTests(label: string, getEngine: () => Brai
       expect(indexes.map(row => row.indexname)).toContain('source_ingestion_receipts_retention');
       expect(Number(await engine.getConfig('version'))).toBeGreaterThanOrEqual(160);
       expect((await beginSourceIngestionReceipt(engine, input)).schemaFingerprint).toBe(input.schemaFingerprint);
+      expect((await read())?.policyFingerprint).toBe(input.policyFingerprint);
+    });
+
+    test('idempotent receipt DDL retains old unbound metadata without fabricating policy approval', async () => {
+      await beginSourceIngestionReceipt(engine, input);
+      await engine.executeRaw('ALTER TABLE source_ingestion_receipts DROP COLUMN policy_fingerprint');
+      for (const sql of SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL.split(';').filter(sql => sql.trim())) await engine.executeRaw(sql);
+      expect((await read())?.policyFingerprint).toBeNull();
+      await expect(beginSourceIngestionReceipt(engine, input)).rejects.toMatchObject({ code: 'receipt_identity_mismatch' });
+      await expect(beginSourceIngestionReceipt(engine, { ...input, id: randomUUID(), policyFingerprint: '' })).rejects.toMatchObject({ code: 'invalid_receipt' });
     });
 
     test('duplicate receipt IDs load exact approved identity without resetting progress', async () => {
       const first = await beginSourceIngestionReceipt(engine, input);
       const progressed = await transitionSourceIngestionReceipt(engine, { ...mutation(first), phase: 'CONTENT', counts: { importedPages: 3 } });
       expect(await beginSourceIngestionReceipt(engine, input)).toEqual(progressed);
-      for (const changed of [{ approvedRevision: 'c'.repeat(40) }, { schemaFingerprint: 'd'.repeat(64) }, { extractorVersion: '2' }, { profile: 'other' }, { lifecycleRequestIds: [randomUUID()] }]) {
+      for (const changed of [{ approvedRevision: 'c'.repeat(40) }, { schemaFingerprint: 'd'.repeat(64) }, { policyFingerprint: 'e'.repeat(64) }, { extractorVersion: '2' }, { profile: 'other' }, { lifecycleRequestIds: [randomUUID()] }]) {
         await expect(beginSourceIngestionReceipt(engine, { ...input, ...changed })).rejects.toMatchObject({ code: 'receipt_identity_mismatch' });
       }
       expect((await read())?.counts.importedPages).toBe(3);

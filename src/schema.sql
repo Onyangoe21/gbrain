@@ -1966,6 +1966,8 @@ CREATE TABLE IF NOT EXISTS source_ingestion_receipts (
   CHECK ((completed_at IS NOT NULL) = (outcome = 'complete')),
   CHECK ((discarded_at IS NOT NULL) = (outcome = 'discarded'))
 );
+ALTER TABLE source_ingestion_receipts ADD COLUMN IF NOT EXISTS policy_fingerprint text
+  CHECK (policy_fingerprint ~ '^[a-f0-9]{64}$');
 CREATE INDEX IF NOT EXISTS source_ingestion_receipts_source
   ON source_ingestion_receipts(source_id, source_incarnation, created_at DESC);
 CREATE INDEX IF NOT EXISTS source_ingestion_receipts_retention

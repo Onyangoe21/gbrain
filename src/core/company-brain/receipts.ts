@@ -38,6 +38,7 @@ export interface SourceIngestionIdentity extends SourceIngestionScope {
   profile: string;
   schemaFingerprint: string;
   extractorVersion: string;
+  policyFingerprint: string | null;
 }
 export interface SourceIngestionReceipt extends SourceIngestionIdentity {
   revision: number;
@@ -53,6 +54,7 @@ export interface SourceIngestionReceipt extends SourceIngestionIdentity {
   discardedAt: string | null;
 }
 export interface BeginSourceIngestionReceiptInput extends SourceIngestionIdentity {
+  policyFingerprint: string;
   fence: SourceIngestionFence;
   lifecycleRequestIds?: string[];
 }
@@ -70,7 +72,7 @@ const phases: SourceIngestionPhase[] = ['ADMITTED', 'CONTENT', 'GRAPH', 'VERIFY'
 const diagnostics = new Set<SourceIngestionDiagnostic>(['interrupted', 'content_incomplete', 'graph_incomplete', 'verification_failed', 'pending_writes', 'source_changed', 'checkpoint_missing', 'operation_failed']);
 const emptyCounts: SourceIngestionCounts = { eligibleFiles: 0, importedPages: 0, skippedFiles: 0, failedFiles: 0, graphPages: 0, links: 0, unresolvedLinks: 0, pendingWrites: 0, verificationFailures: 0 };
 const columns = `id, source_id AS "sourceId", source_incarnation AS "sourceIncarnation", approved_revision AS "approvedRevision",
-  profile, schema_fingerprint AS "schemaFingerprint", extractor_version AS "extractorVersion", revision, phase, outcome, counts,
+  profile, schema_fingerprint AS "schemaFingerprint", extractor_version AS "extractorVersion", policy_fingerprint AS "policyFingerprint", revision, phase, outcome, counts,
   lifecycle_request_ids AS "lifecycleRequestIds", checkpoint_refs AS "checkpointRefs", diagnostic,
   created_at AS "createdAt", updated_at AS "updatedAt", completed_at AS "completedAt", discarded_at AS "discardedAt"`;
 type ReceiptRow = Omit<SourceIngestionReceipt, 'createdAt' | 'updatedAt' | 'completedAt' | 'discardedAt'> & {
@@ -152,7 +154,7 @@ export async function readSourceIngestionState(db: BrainEngine, input: SourceIng
 
 export async function beginSourceIngestionReceipt(db: BrainEngine, input: BeginSourceIngestionReceiptInput): Promise<SourceIngestionReceipt> {
   validateId(input.id);
-  if (!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(input.approvedRevision) || !/^[a-f0-9]{64}$/.test(input.schemaFingerprint)
+  if (!/^([a-f0-9]{40}|[a-f0-9]{64})$/.test(input.approvedRevision) || !/^[a-f0-9]{64}$/.test(input.schemaFingerprint) || !/^[a-f0-9]{64}$/.test(input.policyFingerprint)
     || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(input.profile) || !/^[a-zA-Z0-9][a-zA-Z0-9._+:-]{0,127}$/.test(input.extractorVersion)) {
     fail('invalid_receipt', 'Receipts require a full approved revision, resolved-schema SHA-256, profile ID, and extractor version.');
   }
@@ -160,13 +162,13 @@ export async function beginSourceIngestionReceipt(db: BrainEngine, input: BeginS
   return db.transaction(async tx => {
     await lockScope(tx, input);
     const [inserted] = await tx.executeRaw<ReceiptRow>(`INSERT INTO source_ingestion_receipts
-      (id, source_id, source_incarnation, approved_revision, profile, schema_fingerprint, extractor_version, lifecycle_request_ids)
-      VALUES ($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8::uuid[]) ON CONFLICT (id) DO NOTHING RETURNING ${columns}`,
-    [input.id, input.sourceId, input.sourceIncarnation, input.approvedRevision, input.profile, input.schemaFingerprint, input.extractorVersion, requests]);
+      (id, source_id, source_incarnation, approved_revision, profile, schema_fingerprint, extractor_version, lifecycle_request_ids, policy_fingerprint)
+      VALUES ($1::uuid,$2,$3::uuid,$4,$5,$6,$7,$8::uuid[],$9) ON CONFLICT (id) DO NOTHING RETURNING ${columns}`,
+    [input.id, input.sourceId, input.sourceIncarnation, input.approvedRevision, input.profile, input.schemaFingerprint, input.extractorVersion, requests, input.policyFingerprint]);
     if (inserted) return receipt(inserted);
     const prior = await getSourceIngestionReceipt(tx, { ...input, receiptId: input.id });
     if (!prior || prior.approvedRevision !== input.approvedRevision || prior.profile !== input.profile || prior.schemaFingerprint !== input.schemaFingerprint
-      || prior.extractorVersion !== input.extractorVersion || requests.some(id => !prior.lifecycleRequestIds.includes(id))) {
+      || prior.extractorVersion !== input.extractorVersion || prior.policyFingerprint !== input.policyFingerprint || requests.some(id => !prior.lifecycleRequestIds.includes(id))) {
       fail('receipt_identity_mismatch', 'The receipt ID is already bound to different approved ingestion metadata.');
     }
     return prior;

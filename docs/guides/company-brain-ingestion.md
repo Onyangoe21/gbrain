@@ -123,6 +123,12 @@ commit objects are gone or the approved schema changed, inspect again; GBrain
 does not substitute current HEAD silently. Managed brains retain their native
 writer, source-incarnation, and revision conflict checks.
 
+Semantic schema/extractor upgrades do not silently renew an old approval. This
+first version has no in-place reapproval command. Review the old registration's
+removal impact and obtain explicit destructive approval before reconnecting the
+same checkout, or use a separate authorized checkout/destination. Do not remove
+a source automatically merely to make an upgrade succeed.
+
 Ordinary sync remembers this source's profile and selection. It remains keyless
 and does not pull, enqueue embeddings, or edit repository housekeeping files.
 Changes to target pages also refresh references from unchanged pages in the same

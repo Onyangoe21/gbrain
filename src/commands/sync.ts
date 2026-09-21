@@ -2,7 +2,7 @@ import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-gua
 import { readSourceFileSync, hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal, assertSourceFilesystemActive } from '../core/minions/source-filesystem.ts';
 import { currentJobSignal } from '../core/minions/submission-authority.ts';
 import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, realpathSync } from 'fs';
-import { companyBrainProfile, currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile, softDeleteSyncPages } from '../core/company-brain/profile.ts';
+import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile, softDeleteSyncPages } from '../core/company-brain/profile.ts';
 import { join, relative, resolve as pathResolve } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
@@ -5041,7 +5041,13 @@ See also:
     // the floor, non-interactive runs keep importing (never exit 2), but the
     // delivery statement is capability-aware: background queue only when a
     // worker can drain it, otherwise an exact manual command.
-    const embedPlan = await resolveSyncAllEmbedPlan(engine, runnableSources.filter(src => !companyBrainProfile(src.config)), {
+    const companyPolicies = new Map<string, Awaited<ReturnType<typeof getCompanyBrainProfile>>>();
+    const policyFailures = new Map<string, unknown>();
+    for (const source of runnableSources) {
+      try { companyPolicies.set(source.id, await getCompanyBrainProfile(engine, source.id)); }
+      catch (error) { policyFailures.set(source.id, error); }
+    }
+    const embedPlan = await resolveSyncAllEmbedPlan(engine, runnableSources.filter(src => !policyFailures.has(src.id) && !companyPolicies.get(src.id)), {
       v2Enabled, serialFlag, noEmbed: noEmbed || !!embeddingCredentialError, noAutoEmbed, dryRun, jsonOut, yesFlag, full, includeGitignored,
     });
     if (embedPlan.stop) return;
@@ -5078,7 +5084,8 @@ See also:
     const onAllSigint = () => { try { allInterrupt.abort(new Error('SIGINT')); } catch { /* */ } };
 
     const runOne = async (src: typeof sources[number]): Promise<SyncResult> => {
-      const companyPolicy = companyBrainProfile(src.config);
+      if (policyFailures.has(src.id)) throw policyFailures.get(src.id);
+      const companyPolicy = companyPolicies.get(src.id);
       if (!companyPolicy && embeddingCredentialError) throw embeddingCredentialError;
       const cfg = (src.config || {}) as { strategy?: 'markdown' | 'code' | 'auto' };
       // D18/#2139: planned fan-out or a cost-gate auto-defer skips inline

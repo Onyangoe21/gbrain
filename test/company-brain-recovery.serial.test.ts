@@ -98,6 +98,7 @@ test('preview refuses missing migration 160 without creating any database object
 test('mixed sync --all continues the keyless profile while reporting missing credentials for ordinary sources', async () => {
   const root = fixture();
   const other = fixture();
+  const missingPolicy = fixture();
   const dir = mkdtempSync(join(home, 'all-'));
   const database = join(dir, 'db');
   await withEnv({ GBRAIN_HOME: dir, DATABASE_URL: undefined, GBRAIN_DATABASE_URL: undefined }, async () => {
@@ -105,6 +106,9 @@ test('mixed sync --all continues the keyless profile while reporting missing cre
     try {
       await admitCompanyBrain(engine, { brainId: 'company-example', sourceId: 'wiki', path: root,
         plan: await inspectCompanyBrain({ path: root, profile: 'company-brain' }), remote: false });
+      await admitCompanyBrain(engine, { brainId: 'company-example', sourceId: 'policy-missing', path: missingPolicy,
+        plan: await inspectCompanyBrain({ path: missingPolicy, profile: 'company-brain' }), remote: false });
+      await engine.executeRaw("UPDATE sources SET config=config-'company_brain' WHERE id='policy-missing'");
       await engine.executeRaw("INSERT INTO sources(id,name,local_path,config) VALUES('ordinary','ordinary',$1,'{}')", [other]);
     } finally { await engine.disconnect(); }
   });
@@ -123,6 +127,8 @@ test('mixed sync --all continues the keyless profile while reporting missing cre
   const result = JSON.parse(stdout);
   expect(result.sources.find((source: { source_id: string }) => source.source_id === 'wiki')).toMatchObject({ status: 'ok' });
   expect(result.sources.find((source: { source_id: string }) => source.source_id === 'ordinary')).toMatchObject({ status: 'error' });
+  expect(result.sources.find((source: { source_id: string }) => source.source_id === 'policy-missing')).toMatchObject({ status: 'error' });
+  expect(result.sources.find((source: { source_id: string }) => source.source_id === 'policy-missing').error).toContain('durable company approval');
   expect(existsSync(join(root, '.gitignore'))).toBe(false);
 }, 120_000);
 

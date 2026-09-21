@@ -11,6 +11,7 @@ import { inspectCompanyBrain, validateCompanyBrainPlan } from './inspection.ts';
 import { companyBrainGraphStamp, verifyCompanyBrain } from './verification.ts';
 import { loadLinkPageMetadata } from '../link-reconciliation.ts';
 import { digest } from '../persistence/digest.ts';
+import { assertCompanyBrainPolicy, assertCompanyBrainExtractor, companyBrainPolicyFingerprint, companyBrainRepository } from './policy.ts';
 import { admitCompanyBrain, assertCompanyBrainCaller, checkCompanyBrainDestination, ingestionFence,
   type CompanyBrainConnectInput, type CompanyBrainDestination } from './admission.ts';
 import { companyBrainProfile, getCompanyBrainProfile, readCompanyBrainPlan, withCompanyBrainSync } from './profile.ts';
@@ -31,33 +32,34 @@ export interface CompanyBrainResult {
 }
 
 export async function connectCompanyBrain(engine: BrainEngine, input: CompanyBrainConnectInput): Promise<CompanyBrainResult> {
-  await admitCompanyBrain(engine, input);
-  return resumeCompanyBrain(engine, input);
+  const admitted = await admitCompanyBrain(engine, input);
+  return resumeCompanyBrain(engine, input, {}, admitted);
 }
 
-export async function resumeCompanyBrain(engine: BrainEngine, input: CompanyBrainDestination, opts: SyncOpts = {}): Promise<CompanyBrainResult> {
+export async function resumeCompanyBrain(engine: BrainEngine, input: CompanyBrainDestination, opts: SyncOpts = {}, expected?: Awaited<ReturnType<typeof admitCompanyBrain>>): Promise<CompanyBrainResult> {
   assertCompanyBrainCaller(input);
   if (opts.workingTree || opts.noSchemaPack || opts.includeGitignored || opts.skipFailed || opts.srcSubpath ||
     opts.strategy && opts.strategy !== 'markdown' || opts.exclude?.length || opts.includeHidden?.length) {
     throw new OperationError('profile_incompatible', 'The connected source uses its approved committed selection and schema; inspect a new selection instead of overriding its sync policy.');
   }
   return withRefreshingLock(engine, `company-brain:${input.sourceId}`, signal => execute(engine, input, { ...opts,
-    signal: opts.signal ? AbortSignal.any([opts.signal, signal]) : signal }));
+    signal: opts.signal ? AbortSignal.any([opts.signal, signal]) : signal }, expected));
 }
 
-async function execute(engine: BrainEngine, input: CompanyBrainDestination, opts: SyncOpts): Promise<CompanyBrainResult> {
+async function execute(engine: BrainEngine, input: CompanyBrainDestination, opts: SyncOpts, expected?: Awaited<ReturnType<typeof admitCompanyBrain>>): Promise<CompanyBrainResult> {
   const [source] = await engine.executeRaw<{ incarnation: string; local_path: string; archived: boolean; config: unknown }>(
     'SELECT incarnation,local_path,archived,config FROM sources WHERE id=$1', [input.sourceId]);
   if (!source || source.archived) throw new OperationError('source_changed', 'The connected source is unavailable.');
   if (opts.repoPath && realpathSync(resolve(opts.repoPath)) !== source.local_path) throw new OperationError('source_changed', 'The requested path does not match the approved source.');
   let profile = companyBrainProfile(source.config);
   if (!profile || profile.brainId !== input.brainId) throw new OperationError('destination_not_ready', 'The source does not belong to this approved company destination.');
+  if (expected && (source.incarnation !== expected.sourceIncarnation || profile.receiptId !== expected.receiptId)) throw new OperationError('source_changed', 'The admitted source or receipt changed before execution.');
   let receipt = await getSourceIngestionReceipt(engine, { sourceId: input.sourceId, sourceIncarnation: source.incarnation, receiptId: profile.receiptId });
   if (!receipt || receipt.outcome === 'discarded') throw new OperationError('checkpoint_missing', 'The active source receipt is missing or discarded.');
-  if (profile.approvedRevision !== receipt.approvedRevision || profile.schema.resolved_digest !== receipt.schemaFingerprint ||
-    profile.extractorVersion !== receipt.extractorVersion || receipt.profile !== 'company-brain') {
-    throw new OperationError('profile_incompatible', 'The source policy and ingestion receipt disagree.');
-  }
+  const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
+  assertCompanyBrainPolicy(profile, receipt, brain?.brain_id, source.local_path);
+  assertCompanyBrainExtractor(receipt.extractorVersion, input);
+  const policyFingerprint = companyBrainPolicyFingerprint(profile, input.sourceId);
   let plan = receipt.outcome === 'complete'
     ? await inspectCompanyBrain({ path: source.local_path, profile: 'company-brain', include: profile.selection.include, exclude: profile.selection.exclude, limits: profile.limits })
     : await readCompanyBrainPlan(engine, receipt.id);
@@ -69,6 +71,7 @@ async function execute(engine: BrainEngine, input: CompanyBrainDestination, opts
     if (!validation.valid) throw new OperationError(validation.code, 'The approved source or schema changed; inspect it before resuming.');
   }
   const schema = profile.schema;
+  if (plan.revision && digest(companyBrainRepository(plan.revision)) !== digest(profile.repository)) throw new OperationError('source_changed', 'The approved repository identity changed; reconnect explicitly.');
   const { pack } = await checkApprovedSchemaForEngine(engine, { name: schema.name, identity: schema.identity, resolvedManifestHash: schema.resolved_digest },
     { sourceId: input.sourceId, remote: false });
   const fence = await ingestionFence(engine, input.sourceId);
@@ -83,11 +86,13 @@ async function execute(engine: BrainEngine, input: CompanyBrainDestination, opts
     if (opts.dryRun) return { ok: true, code: 'dry_run', receipt };
     await engine.transaction(async tx => {
       await tx.executeRaw('SELECT singleton FROM persistence_brain WHERE singleton=1 FOR UPDATE');
-      const [current] = await tx.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id=$1 AND incarnation=$2::uuid AND NOT archived FOR UPDATE', [input.sourceId, source.incarnation]);
+      const [current] = await tx.executeRaw<{ config: unknown; local_path: string }>('SELECT config,local_path FROM sources WHERE id=$1 AND incarnation=$2::uuid AND NOT archived FOR UPDATE', [input.sourceId, source.incarnation]);
       if (!current || companyBrainProfile(current.config)?.receiptId !== receipt!.id) throw new OperationError('source_changed', 'The source approval changed.');
+      assertCompanyBrainPolicy(companyBrainProfile(current.config)!, receipt!, brain.brain_id, current.local_path);
+      assertCompanyBrainExtractor(receipt!.extractorVersion, input);
       const nextId = randomUUID();
       const next = await beginSourceIngestionReceipt(tx, { id: nextId, sourceId: input.sourceId, sourceIncarnation: source.incarnation,
-        approvedRevision: fresh.revision!.commit, profile: 'company-brain', schemaFingerprint: fresh.schema!.resolved_digest, extractorVersion: fresh.extractor_version, fence });
+        approvedRevision: fresh.revision!.commit, profile: 'company-brain', schemaFingerprint: fresh.schema!.resolved_digest, extractorVersion: fresh.extractor_version, policyFingerprint, fence });
       receipt = await linkSourceIngestionCheckpoints(tx, { ...mutation(), receiptId: nextId, expectedRevision: next.revision, expectedPhase: next.phase,
         checkpoints: [{ op: 'company-brain-plan', fingerprint: nextId, kind: 'manifest' }] });
       profile = { ...profile!, receiptId: nextId, planDigest: fresh.plan_digest, approvedRevision: fresh.revision!.commit };
@@ -104,7 +109,7 @@ async function execute(engine: BrainEngine, input: CompanyBrainDestination, opts
       eligibleFiles: plan.counts.included, skippedFiles: plan.counts.excluded + plan.counts.unsupported } });
     if (receipt.phase === 'CONTENT') {
       const context: CompanyBrainSyncContext = { sourceId: input.sourceId, sourceIncarnation: source.incarnation, receiptId: receipt.id, plan, pack,
-        entries: new Map(plan.manifest.map(entry => [entry.path, entry])),
+        entries: new Map(plan.manifest.map(entry => [entry.path, entry])), policyFingerprint,
         protect: async checkpoints => { receipt = await linkSourceIngestionCheckpoints(engine, { ...mutation(), checkpoints }); } };
       sync = await withCompanyBrainSync(context,
       () => performSync(engine, { ...opts, sourceId: input.sourceId, repoPath: source.local_path, noEmbed: true, noPull: true, noExtract: true,

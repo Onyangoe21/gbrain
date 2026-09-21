@@ -22,9 +22,10 @@ import type { WriteRequest } from './model.ts';
 import { loadActivePackForEngine, checkApprovedSchemaForEngine } from '../schema-pack/engine-resolution.ts';
 import type { CompanyBrainPlan } from '../company-brain/types.ts';
 import { companyBrainProfile } from '../company-brain/profile.ts';
+import { companyBrainPolicyFingerprint } from '../company-brain/policy.ts';
 
 export interface SyncIntent extends Record<string, unknown> {
-  companyApproval?: { schema: NonNullable<CompanyBrainPlan['schema']>; planDigest: string; extractorVersion: string };
+  companyApproval?: { schema: NonNullable<CompanyBrainPlan['schema']>; planDigest: string; extractorVersion: string; policyFingerprint: string };
   kind: 'managed_sync_import' | 'managed_sync_delete' | 'managed_sync_checkpoint';
   expected_revision: string | null; sourcePath: string | null; path: string | null;
   rawHash: string | null; content: string | null; ownerEpoch: string;
@@ -46,7 +47,8 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
     if (p.companyApproval) {
       const [source] = await tx.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id=$1', [row.source_id]);
       const policy = companyBrainProfile(source?.config);
-      if (!policy || policy.planDigest !== p.companyApproval.planDigest || policy.extractorVersion !== p.companyApproval.extractorVersion || policy.approvedRevision !== p.target) {
+      if (!policy || policy.planDigest !== p.companyApproval.planDigest || policy.extractorVersion !== p.companyApproval.extractorVersion || policy.approvedRevision !== p.target ||
+        companyBrainPolicyFingerprint(policy, row.source_id) !== p.companyApproval.policyFingerprint) {
         throw new OperationError('source_changed', 'The company source approval changed.');
       }
       const schema = p.companyApproval.schema;

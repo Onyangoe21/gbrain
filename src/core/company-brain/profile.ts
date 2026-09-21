@@ -2,7 +2,6 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { basename, relative } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
-import { parseSourceConfig } from '../sources-load.ts';
 import { importFromContent } from '../import-file.ts';
 import { readCommittedBlob } from './revision.ts';
 import { parseMarkdown } from '../markdown.ts';
@@ -11,40 +10,18 @@ import { digest } from '../persistence/digest.ts';
 import type { ResolvedPack } from '../schema-pack/registry.ts';
 import type { CompanyBrainPlan, InspectionEntry } from './types.ts';
 import type { SourceIngestionCheckpoint } from './receipts.ts';
-
-export interface CompanyBrainProfile {
-  version: 1;
-  profile: 'company-brain';
-  brainId: string;
-  receiptId: string;
-  planDigest: string;
-  selection: CompanyBrainPlan['selection'];
-  limits: CompanyBrainPlan['limits'];
-  schema: NonNullable<CompanyBrainPlan['schema']>;
-  extractorVersion: string;
-  approvedRevision: string;
-  committedOnly: true;
-  noPull: true;
-  noEmbed: true;
-  noBackfill: true;
-  noWriteback: true;
-}
-
-export function companyBrainProfile(config: unknown): CompanyBrainProfile | null {
-  const value = parseSourceConfig(config).company_brain;
-  if (value === undefined) return null;
-  const p = value as CompanyBrainProfile;
-  if (!p || p.version !== 1 || p.profile !== 'company-brain' || !p.brainId || !p.receiptId || !p.planDigest ||
-      !p.selection || !p.limits || !p.schema || !p.extractorVersion || !p.approvedRevision ||
-      [p.committedOnly, p.noPull, p.noEmbed, p.noBackfill, p.noWriteback].some(flag => flag !== true)) {
-    throw new OperationError('profile_incompatible', 'The persisted company profile is invalid; inspect its source policy before syncing.');
-  }
-  return p;
-}
+import { companyBrainProfile, companyBrainPolicyFingerprint, type CompanyBrainProfile } from './policy.ts';
+export { companyBrainProfile, type CompanyBrainProfile } from './policy.ts';
 
 export async function getCompanyBrainProfile(engine: BrainEngine, sourceId: string): Promise<CompanyBrainProfile | null> {
-  const [source] = await engine.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id=$1', [sourceId]);
-  return source ? companyBrainProfile(source.config) : null;
+  const [source] = await engine.executeRaw<{ config: unknown; incarnation: string }>('SELECT config,incarnation FROM sources WHERE id=$1', [sourceId]);
+  if (!source) return null;
+  const profile = companyBrainProfile(source.config);
+  if (!profile) {
+    const [receipt] = await engine.executeRaw("SELECT id FROM source_ingestion_receipts WHERE source_id=$1 AND source_incarnation=$2::uuid AND profile='company-brain' LIMIT 1", [sourceId, source.incarnation]);
+    if (receipt) throw new OperationError('profile_incompatible', 'The durable company approval has no source policy. Reconnect explicitly; sync cannot fall back to an unrestricted profile.');
+  }
+  return profile;
 }
 
 export interface CompanyBrainSyncContext {
@@ -54,6 +31,7 @@ export interface CompanyBrainSyncContext {
   plan: CompanyBrainPlan;
   entries: ReadonlyMap<string, InspectionEntry>;
   pack: ResolvedPack;
+  policyFingerprint: string;
   failureCode?: string;
   protect(checkpoints: SourceIngestionCheckpoint[]): Promise<void>;
 }
@@ -68,8 +46,10 @@ export async function withCompanyBrainSource<T>(engine: BrainEngine, sourceId: s
   const context = currentCompanyBrainSync(sourceId);
   if (!context) return run(engine);
   return engine.transaction(async tx => {
-    const [source] = await tx.executeRaw<{ incarnation: string; config: unknown }>('SELECT incarnation,config FROM sources WHERE id=$1 AND NOT archived FOR SHARE', [sourceId!]);
-    if (!source || source.incarnation !== context.sourceIncarnation || companyBrainProfile(source.config)?.receiptId !== context.receiptId) {
+    const [source] = await tx.executeRaw<{ incarnation: string; local_path: string; config: unknown }>('SELECT incarnation,local_path,config FROM sources WHERE id=$1 AND NOT archived FOR SHARE', [sourceId!]);
+    const profile = source ? companyBrainProfile(source.config) : null;
+    if (!source || source.incarnation !== context.sourceIncarnation || !profile || source.local_path !== profile.repository.root || profile.receiptId !== context.receiptId ||
+      companyBrainPolicyFingerprint(profile, sourceId!) !== context.policyFingerprint) {
       throw new OperationError('source_changed', 'The source incarnation or approved ingestion changed before publication.');
     }
     return run(tx);

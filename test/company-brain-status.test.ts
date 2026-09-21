@@ -24,7 +24,7 @@ describe('company ingestion status', () => {
     await engine.executeRaw('INSERT INTO sources(id,name,incarnation,local_path,config) VALUES($1,$1,$2::uuid,$3,$4::text::jsonb)',
       ['company-status', incarnation, '/private/example-checkout', JSON.stringify({ company_brain: { receiptId: id } })]);
     await beginSourceIngestionReceipt(engine, { id, sourceId: 'company-status', sourceIncarnation: incarnation,
-      approvedRevision: 'a'.repeat(40), profile: 'company-brain', schemaFingerprint: 'b'.repeat(64),
+      approvedRevision: 'a'.repeat(40), profile: 'company-brain', schemaFingerprint: 'b'.repeat(64), policyFingerprint: 'c'.repeat(64),
       extractorVersion: '2026-09-21T00:00:00Z', fence: { mode: 'unmanaged' } });
     const result = await readCompanyBrainSourceStatus(engine, 'company-status');
     expect(result).toMatchObject({ state: 'incomplete', phase: 'ADMITTED', receipt_id: id });
