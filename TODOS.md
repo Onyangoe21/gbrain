@@ -7253,7 +7253,7 @@ keeping both skills' triggers intact for chaining.
 
 - [x] **v0.42+: `bun run ci:local` should run `bun run verify`** (codex finding #10 from /plan-eng-review).
   **Original task:** ci:local ran guards + typecheck + unit + E2E but NOT verify, so the new `check:resolver` gate (and others added to verify) did not fire in local pre-push. Deferred as a separate UX decision after measuring how often verify-only failures landed in CI.
-  **Completed:** v0.51.1.0 (2026-09-17). Every code-running local CI mode now runs the authoritative `bun run verify` once before tests, plus the test-timeout guard. The doc-only `--diff` fast path remains secrets-scan-only; `test/scripts/ci-local-rendering.test.ts` checks phase order in all four mode combinations and rejects failed stages.
+  **Completed:** v0.51.4.0 (2026-09-21). Every code-running local CI mode now runs the authoritative `bun run verify` once before tests, plus the test-timeout guard. The doc-only `--diff` fast path remains secrets-scan-only; `test/scripts/ci-local-rendering.test.ts` checks phase order in all four mode combinations and rejects failed stages.
 
 ### ~~Report returned import failures accurately in the human summary~~
 **Completed:** v0.50.0.0 (2026-09-10)
