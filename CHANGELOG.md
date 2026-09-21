@@ -2,6 +2,59 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.52.0.0] - 2026-09-21
+
+**Keep the vocabulary of a company knowledge repository.**
+
+GBrain now includes an optional company-brain schema adapted from
+@mattzimak's company-brain project. It declares customers, competitors,
+suppliers, decisions, weekly briefs, and company reference pages alongside the
+existing base vocabulary. Products remain distinct from companies when inferred
+from their folders or selected by type.
+
+The preset has no normalization rules or automatic maintenance phases. Installing
+or upgrading GBrain does not activate it, rewrite existing pages, install agent
+skills, or change who can access a brain. Existing personal brains keep their
+current schema.
+
+### Inspect the preset
+
+```bash
+gbrain schema validate company-brain
+gbrain schema show company-brain
+```
+
+The schema is included in compiled binaries as well as source installs. There is
+no second repository to clone or schema file to copy. Owners who deliberately
+choose this vocabulary for a dedicated GBrain home can activate it with
+`gbrain schema use company-brain`; this changes the home's active vocabulary,
+not the contents of a company repository. It is not a source registration or
+an automatic import command.
+
+| Company knowledge | Preserved vocabulary |
+| --- | --- |
+| Customer and competitor pages | Separate customer and competitor types |
+| Product and company pages | Separate types and query aliases |
+| Ownership and decision history | Owner, supersedes, and attendee field mappings |
+| Existing page types | No inherited catch-all normalization rules |
+
+## To take advantage of v0.52.0.0
+
+Run `gbrain upgrade`, then `gbrain schema validate company-brain` to verify that
+the optional preset is available. Existing brains require no migration or
+configuration change. Do not change an existing personal brain's schema merely
+to inspect the preset.
+
+### Itemized changes
+
+- Bundle the optional `company-brain` schema with the normal schema registry and
+  compiled assets. Contributed by @mattzimak; adapted with MIT attribution.
+- Separate product aliases and folder inference from the inherited company type
+  without changing `gbrain-base-v2` for other users.
+- Add a generic fictional fifteen-page compatibility sample and tests for exact
+  type distribution, relationship references, inherited schema lint, and the
+  bundled preset's read-only mutation guard.
+
 ## [0.51.4.0] - 2026-09-21
 
 **Queued writes move sooner, and contributor checks spend less time repeating work.**

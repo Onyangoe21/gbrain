@@ -1,5 +1,7 @@
 # Key files — per-file index (gbrain repo)
 
+- `src/core/schema-pack/base/company-brain.yaml` — optional company vocabulary extending `gbrain-base-v2` without normalization rules or maintenance phases. Overrides company aliases and prefixes so product stays a distinct query and path type. Bundled through `schema-pack/bundled.ts` and `bundled-assets.ts`; attribution is in `third-party/company-brain/`. The generic fictional sample in `src/core/company-brain/sample/` preserves the upstream layout and relationship metadata. `test/company-brain-schema.test.ts` pins inherited lint, type closure, folder inference, read-only bundling, and sample references.
+
 On-demand reference. CLAUDE.md (the always-loaded orientation file) routes here
 via its Reference map. **Read a file's entry before editing that file.**
 
