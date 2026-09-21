@@ -7,18 +7,23 @@ establish that a native harness loaded a skill or that a proposed tool call ran.
 For a fresh-context run, provide the current contents of:
 
 - `skills/setup/SKILL.md`
+- `skills/remote-mcp/SKILL.md`
 - `skills/RESOLVER.md`
 - `skills/_AGENT_README.md`
 - `skills/signal-detector/SKILL.md`
 - `skills/brain-ops/SKILL.md`
 - `docs/tutorials/connect-coding-agent.md`
 
-For MCP administration and native OAuth cases (11 onward), additionally provide:
+For MCP administration and native OAuth cases (11–20), additionally provide:
 
 - `skills/mcp-access/SKILL.md`
 - `docs/mcp/README.md`
 - `docs/mcp/ADMIN.md`
 - `docs/guides/hosted-harness-access.md`
+
+For publication cases (21–22), also provide `docs/guides/remote-mcp.md`,
+`docs/mcp/CLAUDE_DESKTOP.md`, and the MCP administration/native OAuth files above.
+These cases preserve the upstream Tailscale publishing and client-install boundaries.
 
 The case context supplies fictional endpoints, credential locations, and client
 metadata. These are sufficient for a proposed command; never discover or use

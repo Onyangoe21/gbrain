@@ -6,36 +6,51 @@ over HTTP and reachable at a public HTTPS URL. Perplexity does not run
 
 ```
 Perplexity Computer
-  → ngrok tunnel (https://YOUR-DOMAIN.ngrok.app/mcp)
+  → https://your-machine.your-tailnet.ts.net/mcp   (Tailscale Funnel; ngrok alternative)
   → gbrain serve --http   (built-in OAuth 2.1 transport)
   → Postgres / PGLite
 ```
 
-## 1. Serve GBrain over HTTP (host side)
+## 1. Publish GBrain over HTTPS (host side)
+
+Perplexity's runtime is in the vendor's cloud, so it needs the public shape:
 
 ```bash
-gbrain serve --http --port 3131 --bind 0.0.0.0 \
-  --public-url https://YOUR-DOMAIN.ngrok.app
+gbrain mcp expose --funnel
 ```
 
-- **`--bind 0.0.0.0` is required.** `--http` defaults to `127.0.0.1`, so
-  without it the tunnel reaches the server but the connection is refused
-  (`ECONNREFUSED`).
-- **`--public-url` must match the tunnel.** The OAuth issuer in the discovery
-  metadata has to line up with the URL Perplexity actually hits (RFC 8414 §3.3),
-  or OAuth client-credentials auth fails.
+**Say to your agent:** *"expose my brain over mcp"* — *"put my brain on tailscale"*.
 
-Full detail on both flags (and the rest of the server setup) lives in
-[DEPLOY.md — Expose the server](DEPLOY.md#3-expose-the-server).
+This starts `gbrain serve --http` as a user service on the default loopback
+bind, publishes it with Tailscale Funnel at
+`https://your-machine.your-tailnet.ts.net`, and sets `--public-url` to match —
+the OAuth issuer in the discovery metadata lines up with the URL Perplexity
+actually hits (RFC 8414 §3.3). Consent prompt, flags and troubleshooting:
+[remote MCP guide](../guides/remote-mcp.md).
 
-## 2. Expose it with a tunnel
+## 2. Alternative: ngrok
+
+Run the server yourself with the ngrok issuer and start the tunnel on the same
+machine (ngrok connects to loopback, so the default bind is right). Start the
+tunnel in one terminal:
 
 ```bash
 ngrok http 3131 --url YOUR-DOMAIN.ngrok.app
 ```
 
-See the [ngrok-tunnel recipe](../../recipes/ngrok-tunnel.md) for a persistent
-tunnel.
+Keep it running, then start the brain server once in another terminal:
+
+```bash
+gbrain serve --http --port 3131 --public-url https://YOUR-DOMAIN.ngrok.app
+```
+
+Only when the tunnel agent or reverse proxy runs on a different host does the
+server need `--bind 0.0.0.0` (otherwise the front reaches the machine but the
+connection is refused, `ECONNREFUSED`). Full detail in
+[DEPLOY.md — Expose the server](DEPLOY.md#3-expose-the-server) and the
+[ngrok-tunnel recipe](../../recipes/ngrok-tunnel.md). The examples below use
+the Tailscale name and expose-managed owner credential file; substitute your
+configured endpoint and protected owner credential for another deployment.
 
 ## 3. Create credentials
 
@@ -51,8 +66,8 @@ administrator provisions a scoped handoff through the existing server:
 ```bash
 gbrain mcp grant perplexity-example --harness perplexity \
   --profile memory-writer --source default \
-  --url https://brain.example.com/mcp \
-  --admin-token-file /absolute/private/admin-token \
+  --url https://your-machine.your-tailnet.ts.net/mcp \
+  --admin-token-file ~/.gbrain/serve/admin-token \
   --credentials-out /absolute/private/perplexity-example.json --json
 ```
 
@@ -61,8 +76,8 @@ registration:
 
 ```bash
 gbrain mcp admin setup CLIENT_ID --harness perplexity --flow client-credentials \
-  --url https://brain.example.com/mcp \
-  --admin-token-file /absolute/private/admin-token --json
+  --url https://your-machine.your-tailnet.ts.net/mcp \
+  --admin-token-file ~/.gbrain/serve/admin-token --json
 ```
 
 Keep the client secret in the private handoff and enter it only in the intended
@@ -72,14 +87,22 @@ Perplexity. For legacy bearer connections, see [legacy setup](DEPLOY.md#legacy-b
 The generic/manual adapter produces instructions; it does not claim to install
 or activate Perplexity's native settings.
 
+For legacy bearer settings on PGLite, mint a scoped token before the server
+runs (`gbrain auth create perplexity-example --scopes read,write`), or provision
+through the running server's owner API. `gbrain auth create` opens the database
+and fails with `live_serve` while the service holds its single-writer lock.
+Postgres allows concurrent local maintenance commands.
+
 ## 4. Add the connector in Perplexity
 
 1. Open Perplexity (requires Pro subscription).
 2. Go to **Settings → Connectors** (or **MCP Servers**).
 3. Add a new remote connector:
-   - **URL:** `https://YOUR-DOMAIN.ngrok.app/mcp`
-   - **Authentication:** API Key / Bearer Token, or OAuth client credentials
-   - Paste the token (bearer) or `client_id` + `client_secret` (OAuth).
+   - **URL:** `https://your-machine.your-tailnet.ts.net/mcp`
+   - **Authentication:** the supported method selected in step 3.
+   - For native OAuth, enter the owner-issued client metadata, initiate PKCE in
+     Perplexity, and obtain owner consent. For machine client credentials or a
+     bearer connection, enter the corresponding private handoff fields.
 4. Save.
 
 ## Verify
@@ -92,6 +115,9 @@ Use my GBrain to search for [topic]
 
 Have it call `get_brain_identity` (whose brain this is), then `list_skills`
 (everything it can do).
+
+Observe an authenticated call in the actual Perplexity session. A generated
+setup file or a successful server probe does not establish native activation.
 
 ## Notes
 

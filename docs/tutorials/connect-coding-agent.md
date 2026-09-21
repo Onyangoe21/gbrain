@@ -24,8 +24,10 @@ before initializing. Start keyless, relay the required search-mode matrix, and
 confirm my choice. Save only explicit requests to remember unless I opt into
 automatic capture. Do not add paid enrichment, connectors, or schedules implicitly.
 Verify a unique memory write/readback and report native activation and recall in
-a new conversation separately. If my brain is hosted, provision there and install
-the private handoff here using the actual harness adapter.
+a new conversation separately. If my brain is hosted, use its existing endpoint
+and select this harness's native OAuth/PKCE flow when supported; otherwise have
+the owner provision the chosen machine connection and install its private handoff
+here using the actual harness adapter.
 ```
 
 ## Path B: start from nothing (local brain, local agent)
@@ -128,8 +130,10 @@ environment. Dashboard access and client management use the separate
 
 ### A1. On the host, grant memory access
 
-Start from the host's existing HTTPS MCP deployment. Preview or create a
-separate `memory-writer` client for each intended agent:
+Start from the host's existing HTTPS MCP deployment (on your own computer,
+`gbrain mcp expose` provides one; see [use your brain from anywhere over
+MCP](../guides/remote-mcp.md)). Preview or create a separate `memory-writer`
+client for each intended agent:
 
 ```bash
 gbrain mcp grant coding-example --harness codex --profile memory-writer \

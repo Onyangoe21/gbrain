@@ -45,6 +45,7 @@ Run `gbrain upgrade` on the server host and on machines using the CLI, then rest
 - Support public and confidential PKCE registration with exact redirect URIs, method-aware setup, explicit mixed-grant flow selection, and private recovery verified against the live registration.
 - Keep lifecycle changes atomic with grant revisions and audit records. Preserve accounting and distinguish deleted-client denial from retryable database failures in delegated work.
 - Preserve pending consent across owner login in a fresh browser. Separate authentication failure, total authentication, and session consent limits.
+- Connect Tailscale publishing guidance to owner login and separate native OAuth from machine setup. Independently managed servers keep using their own configured owner credential.
 - Publish the role router, administration runbook, `mcp-access` skill, adapter guidance, and matching initialization/discovery instructions. Improve dashboard errors, loading states, keyboard access, and connection verification wording.
 
 - Clarify owner login, fresh authorization after scope expansion, consent after OAuth setup recovery, and safe synthetic memory verification with cleanup.
@@ -54,6 +55,39 @@ Run `gbrain upgrade` on the server host and on machines using the CLI, then rest
 - Add a required pinned Chromium browser lane exercising shipped embedded assets, plus HTTP, credential-redaction, lifecycle-race, and instruction coverage.
 - Stabilize native Codex test fixtures with explicit per-tool approval and bounded MCP startup waiting; isolate provider credentials and home directories in keyless fixtures. Preserve behavioral and security assertions.
 - Update existing HTTP message assertions to check the owner-specific authentication and retry remedies.
+
+## [0.51.3.0] - 2026-09-20
+
+**Use your brain from every device, app and cloud agent you have, without moving it off your own computer.** `gbrain mcp expose` publishes `gbrain serve --http` on your Tailscale tailnet with HTTPS, keeps it running as a user service, and hands you the grant command for each client. Tailnet-only by default; `--funnel` is the explicit opt-in for agents that run in a vendor's cloud (Grok Bot, Muse, ChatGPT, Claude.ai / Cowork, Perplexity). ngrok and cloud hosts stay documented as alternatives, and Grok Bot and Muse now recommend this shape first.
+
+**Say to your agent:** *"use my brain over mcp"* — *"put my brain on tailscale"* — *"connect grok bot to my brain"* / *"connect muse to my brain"* — *"reach my brain from my phone"*.
+
+### Added
+
+- **`gbrain mcp expose [--port N] [--funnel] [--surface verbs|starter|full] [--enable-dcr] [--no-tailscale] [--no-service] [--no-install] [--force] [--dry-run] [--yes] [--json]`**, plus `--status` and `--remove`. It never opens the database, so it works while a PGLite brain's server holds the write lock, and it is local-CLI only. Every step is a named check: plan → consent (one prompt; non-interactive runs need `--yes`, exit 2) → Tailscale (found, or installed after consent: Homebrew cask on macOS, the official installer on Linux; sign-in via the Tailscale CLI, with `sudo` used only for a system-installed binary) → identity (your MagicDNS name; HTTPS certificates or the Funnel attribute not yet enabled on the tailnet stops the run at exit 2 with the admin-console link, before anything is published) → publish (`tailscale serve --bg`, or `funnel --bg` with `--funnel`; a handler that belongs to someone else is refused without `--force`) → admin token (a private file the service reads at start, never printed) → service (launchd user agent on macOS, systemd user unit on Linux, or the exact foreground command where no supervisor exists) → local and tailnet health → receipt. Anything already listening on the port is refused before publishing. `--status` re-checks the service, the publish config and both health URLs, and reports leftovers from an interrupted run. `--remove` undoes only gbrain's own handler and service, keeps the admin token unless `--force`, recovers even without a receipt, and never reports success while the handler is still live. `--json` emits one document with every check.
+- **`remote-mcp` skill.** Detect (engine status, `expose --status`, thin client → stop), publish after the operator confirms the printed plan (Funnel only when named), grant one least-privilege client per consumer through the running server, install inside the client (`gbrain connect … --install`; Grok Bot at `/workspace/gbrain`, Muse at its verified durable root, Claude Desktop through its GUI; local agents through `gbrain bootstrap harness` on Postgres, or a pre-minted token or scoped grant on PGLite), and verify with `gbrain mcp verify` plus a randomized fact round trip. Routed from the resolver and from the `setup` skill's path table.
+- **Docs.** New guide `docs/guides/remote-mcp.md` (steps, decision table, command surface, grant/connect/verify hand-off, PGLite note, troubleshooting, security posture, alternatives). `docs/mcp/DEPLOY.md` leads with Tailscale; `docs/mcp/ALTERNATIVES.md` ranks it first. The Grok Bot and Muse guides put "your brain on your computer, reached over MCP" first with a paste-in prompt, keeping the in-agent install as the no-host alternative. The Claude Desktop, Cowork, Codex, Claude Code, Perplexity and ChatGPT pages use the tailnet URL with ngrok as the alternative. Hosted harness access explains how the owner gets the HTTPS endpoint; README, INSTALL_FOR_AGENTS and SECURITY point at the new shape.
+
+### Changed
+
+- The default recommendation for reaching a self-hosted brain is Tailscale via `gbrain mcp expose`; ngrok recipes remain and are labeled as alternatives.
+- Hosted-access grant examples use `--admin-token-file ~/.gbrain/serve/admin-token`, the file `expose` maintains; it is required on a running PGLite server and works on Postgres too.
+- `SECURITY.md` no longer describes `serve --http` as Postgres-only. Both engines are supported; while the service holds a PGLite brain, host-side commands that open the database fail fast with `live_serve` (`gbrain sync` and `gbrain sweep --once` delegate into the server), so mint tokens before the service starts or grant through the server.
+
+### To take advantage of v0.51.3.0
+
+```bash
+gbrain upgrade
+gbrain mcp expose --dry-run        # see the plan: Tailscale install/login, publish, service
+gbrain mcp expose                  # your devices (tailnet-only)
+gbrain mcp expose --funnel         # cloud agents such as Grok Bot, Muse, ChatGPT
+gbrain mcp grant <name> --harness <id> --profile memory-writer --source default \
+  --url https://your-machine.your-tailnet.ts.net/mcp \
+  --admin-token-file ~/.gbrain/serve/admin-token --credentials-out /private/<name>.json
+gbrain mcp expose --status
+```
+
+**Say to your agent:** *"use my brain over mcp"* — the `remote-mcp` skill shows the plan, asks before installing Tailscale or a service, publishes, grants each client least-privilege access, installs the connection inside the client, and verifies. Nothing is published to the public internet unless you say `--funnel`. Real-tailnet, macOS app-bundle CLI and cloud-agent verification are documented as remaining manual checks in `docs/guides/remote-mcp.md`.
 
 ## [0.51.0.0] - 2026-09-16
 
