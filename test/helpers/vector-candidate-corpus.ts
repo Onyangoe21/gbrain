@@ -19,7 +19,10 @@ export async function seedVectorCandidateCorpus(engine: BrainEngine): Promise<vo
     SELECT p.id, c, 'candidate ' || repeat(md5((p.id * 10 + c)::text), 32), 'compiled_truth', 'typescript', 'function',
       ARRAY[cos((p.id * 10 + c) * 2.399963229728653)::real, sin((p.id * 10 + c) * 2.399963229728653)::real, 0.1, 0, 0, 0, 0, 0]::vector
     FROM pages p CROSS JOIN generate_series(0, 9) c WHERE p.slug LIKE 'notes/ann-%'`);
-  await engine.executeRaw(`CREATE INDEX IF NOT EXISTS idx_chunks_candidate_fixture ON content_chunks USING hnsw (embedding_candidate_fixture vector_cosine_ops)`);
+  await engine.transaction(async tx => {
+    if (engine.kind === 'postgres') await tx.executeRaw('SET LOCAL max_parallel_maintenance_workers = 0');
+    await tx.executeRaw(`CREATE INDEX IF NOT EXISTS idx_chunks_candidate_fixture ON content_chunks USING hnsw (embedding_candidate_fixture vector_cosine_ops)`);
+  });
   await engine.executeRaw('ANALYZE content_chunks');
   await engine.executeRaw('ANALYZE pages');
   await engine.executeRaw('ANALYZE sources');
