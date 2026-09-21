@@ -262,6 +262,28 @@ const sources_status: Operation = {
   cliHints: { name: 'sources_status', hidden: true },
 };
 
+const sources_inspect: Operation = {
+  name: 'sources_inspect',
+  description: 'Inspect committed company Markdown on the trusted local host without importing, registering a source, changing access, or invoking providers.',
+  params: {
+    path: { type: 'string', required: true, description: 'Local committed Git repository directory.' },
+    profile: { type: 'string', description: 'Optional explicit company-brain profile; omission detects without activating.' },
+    include: { type: 'array', items: { type: 'string' }, description: 'Repository-relative include globs.' },
+    exclude: { type: 'array', items: { type: 'string' }, description: 'Repository-relative exclude globs.' },
+  },
+  scope: 'read',
+  localOnly: true,
+  mutating: false,
+  handler: async (ctx, params) => {
+    if (ctx.remote !== false) throw new OperationError('permission_denied', 'Repository inspection requires the trusted local CLI.');
+    const { inspectCompanyBrain } = await import('../company-brain/inspection.ts');
+    return inspectCompanyBrain({ path: params.path as string,
+      profile: params.profile as 'company-brain' | undefined,
+      include: params.include as string[] | undefined, exclude: params.exclude as string[] | undefined });
+  },
+  cliHints: { name: 'sources_inspect', hidden: true },
+};
+
 export const sourcesOperations: Operation[] = [
-  whoami, sources_add, sources_list, sources_remove, sources_status,
+  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect,
 ];

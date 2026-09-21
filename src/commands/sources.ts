@@ -1785,6 +1785,10 @@ async function runAudit(engine: BrainEngine, args: string[]): Promise<void> {
 export async function runSources(engine: BrainEngine, args: string[]): Promise<void> {
   const sub = args[0];
   const rest = args.slice(1);
+  if (sub === 'inspect') {
+    const { runCompanyBrainInspection } = await import('./company-brain-inspect.ts');
+    return runCompanyBrainInspection(rest);
+  }
   if (sub === 'writer') {
     const { runPersistenceAdminCli } = await import('./persistence-admin.ts');
     return runPersistenceAdminCli('writer', rest, engine);
@@ -1874,6 +1878,8 @@ function printHelp(): void {
   console.log(`gbrain sources — manage multi-source brain configuration (v0.26.5)
 
 Subcommands:
+  inspect <path> [--profile company-brain] [--json] [--out <file>]
+                                    Preview committed company Markdown without a database or source edits.
   add <id> --path <p> [--name <n>] [--federated|--no-federated] [--force]
                                     Register a new source. --path must be a git repo
                                     with committed files; --force skips that check.
