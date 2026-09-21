@@ -1,6 +1,6 @@
 {
   "RESOLVER.md": "9428582250a10ee3c1b47b31185336c8056944a26dc372569a877ddda93bb3e7",
-  "_AGENT_README.md": "19bfd2e33f627dfaeb6545eaf8b26a0d4f9844e3c7b95905f0d005f9fe91d8b6",
+  "_AGENT_README.md": "ffee56c1053ba8941d10ff9e46418b8a7165bc70db1d844dc10645c4d817b7c3",
   "_brain-filing-rules.json": "cf850df6a7425464c6d63b3ace71991cc93497fa0cc8cd21acd31883e17939c6",
   "_brain-filing-rules.md": "23f5d08d705eb975b69611dbfbe878b7e4f3d0eec2470a52160372df8b462ad1",
   "_friction-protocol.md": "51353207240142024ff1facc25f225712275ecdb4a034ffffdd83740c8d328e3",
@@ -20,7 +20,7 @@
   "brain-ingest-gate/routing-eval.jsonl": "281e94affbb8631ef7ff44203884cce1c03c468b27f893829da1e6e439401a33",
   "brain-link-discipline/SKILL.md": "489268f71a01abb6213df8a8bb5f4d16d587b09dd670ac3c47876a8ed808b5ae",
   "brain-link-discipline/routing-eval.jsonl": "0adea4c6d72fdb849c12fe2cad718568b9ab704299b00b093c40c2284faf684c",
-  "brain-ops/SKILL.md": "e4bc71357893b9268048ce53d72e04db123b877f85fe0242bddaaa5bb6d344f2",
+  "brain-ops/SKILL.md": "a76ee75dba71c4aa534f252e35e355ae0a7530f961d43ffe7243a285f142adfc",
   "brain-pdf/SKILL.md": "13c3e3162763a4503685db0a10663475d3687c4874b5f04d539af83a990f643e",
   "brain-pdf/routing-eval.jsonl": "119e4fa113ea45783cee4499e63a729fdeecb4d9a45d47497754b4f5b21d0734",
   "brain-taxonomist/SKILL.md": "dea4557b540868ec2c56bf43ee7f63c5d03a22d4047cd0dfbeaf19adef334f60",
