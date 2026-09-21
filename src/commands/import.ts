@@ -266,22 +266,6 @@ export async function runImport(
       throw e;
     }
   }
-  // v0.39 T1.5: load active pack ONCE at runImport entry; thread to every
-  // per-file importFile call below. Codex perf finding #7 — never per-file.
-  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
-  try {
-    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const resolved = await loadActivePack({
-      cfg: loadConfig(),
-      remote: false, // CLI import is trusted
-      sourceId: opts.sourceId,
-    });
-    importActivePack = { page_types: resolved.manifest.page_types };
-  } catch {
-    importActivePack = undefined;
-  }
-
   // v0.30.x follow-up to PR #707: programmatic sourceId support so internal
   // callers (performFullSync, future Step 6 paths) can route to a named
   // source.
@@ -382,6 +366,15 @@ export async function runImport(
       }
     }
   }
+  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
+  try {
+    const { loadActivePackForEngine } = await import('../core/schema-pack/engine-resolution.ts');
+    const resolved = await loadActivePackForEngine(engine, { remote: false, sourceId });
+    importActivePack = { page_types: resolved.manifest.page_types };
+  } catch {
+    importActivePack = undefined;
+  }
+
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input

@@ -1332,10 +1332,8 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       serr('[sync] --no-schema-pack: skipping schema pack; pages use legacy prefix typing');
       throw new Error('schema-pack-skipped');
     }
-    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const resolved = await loadActivePack({
-      cfg: loadConfig(),
+    const { loadActivePackForEngine } = await import('../core/schema-pack/engine-resolution.ts');
+    const resolved = await loadActivePackForEngine(engine, {
       remote: false, // sync is always a trusted CLI / autopilot caller
       sourceId: opts.sourceId,
     });
