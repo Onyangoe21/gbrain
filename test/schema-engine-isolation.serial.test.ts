@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +19,7 @@ import { expandEngineTypeFilters } from '../src/core/schema-pack/query-types.ts'
 import { hybridSearch, hybridSearchCached } from '../src/core/search/hybrid.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
 import { OperationError } from '../src/core/ops/contract.ts';
+import { findExperts } from '../src/commands/whoknows.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'schema-engine-isolation-'));
@@ -99,6 +100,62 @@ test('all engine-backed loaders use the selected brain without changing host con
   expect((await loadActivePackForLocalEngine(host))?.manifest.name).toBe('host-pack');
   expect(readFileSync(join(configDir, 'config.json'), 'utf8')).toBe(configBytes);
 }));
+
+test('absent brain and source keys still permit ordinary file fallback', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SCHEMA_PACK: undefined }, async () => {
+  const absent = { getConfig: async () => null };
+  expect((await loadActivePackForEngine(absent, { remote: false, sourceId: 'default' })).manifest.name).toBe('host-pack');
+  expect((await expandEngineTypeFilters(absent, { types: ['company'], sourceId: 'default' })).types).toEqual(['company', 'host-initiative']);
+  const noSourceOverride = { getConfig: async (key: string) => key === 'schema_pack' ? 'target-pack' : null };
+  expect((await loadActivePackForEngine(noSourceOverride, { remote: false, sourceId: 'default' })).manifest.name).toBe('target-pack');
+}));
+
+for (const failedKey of ['schema_pack', 'schema_pack.source.default']) {
+  test(`failed ${failedKey} lookup never uses host vocabulary in typed reads`, async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SCHEMA_PACK: undefined }, async () => {
+    const failure = new Error(`Cannot read ${failedKey}`);
+    const originalGetConfig = engine.getConfig.bind(engine);
+    const configRead = spyOn(engine, 'getConfig').mockImplementation(async key => {
+      if (key === failedKey) throw failure;
+      if (key === 'search.mcp_keyword_only') return 'true';
+      return originalGetConfig(key);
+    });
+    const keywordRead = spyOn(engine, 'searchKeyword');
+    const vectorRead = spyOn(engine, 'searchVector');
+    const opts = { sourceId: 'default', types: ['company'], expansion: false, useCache: false };
+    try {
+      await expect(loadActivePackForEngine(engine, { remote: false, sourceId: 'default' })).rejects.toBe(failure);
+      await expect(loadActivePackForOp(ctx(), {})).rejects.toBe(failure);
+      expect(await loadActivePackBestEffort(ctx())).toBeNull();
+      expect(await loadActivePackForLocalEngine(engine, { sourceId: 'default' })).toBeNull();
+      expect(await loadActivePackForWriteVocabulary(ctx())).toBeNull();
+      await expect(expandEngineTypeFilters(engine, opts)).rejects.toBe(failure);
+      await expect(hybridSearch(engine, 'quasar', opts)).rejects.toBe(failure);
+      await expect(hybridSearchCached(engine, 'quasar', opts)).rejects.toBe(failure);
+      await expect(operations.find(op => op.name === 'search')!.handler(ctx(), { query: 'quasar', source_id: 'default', types: ['company'] })).rejects.toBe(failure);
+      await expect(operations.find(op => op.name === 'query')!.handler(ctx(), { query: 'quasar', source_id: 'default', types: ['company'], expand: false })).rejects.toBe(failure);
+      await expect(operations.find(op => op.name === 'query')!.handler(ctx(), { image: 'c3ludGhldGlj', image_mime: 'image/png', source_id: 'default', types: ['company'] })).rejects.toBe(failure);
+      expect(keywordRead).not.toHaveBeenCalled();
+      expect(vectorRead).not.toHaveBeenCalled();
+    } finally {
+      vectorRead.mockRestore();
+      keywordRead.mockRestore();
+      configRead.mockRestore();
+    }
+  }));
+}
+
+test('explicit empty type sets deny hybrid and expert reads before any engine or cache access', async () => {
+  const access = new Proxy({} as PGLiteEngine, { get() { throw new Error('Empty filters must not access the engine'); } });
+  for (const type of [undefined, 'company']) {
+    expect(await expandEngineTypeFilters(access, { type, types: [] })).toEqual({ type: undefined, types: [] });
+    expect(await hybridSearch(access, 'quasar', { type, types: [] })).toEqual([]);
+    expect(await hybridSearchCached(access, 'quasar', { type, types: [], useCache: true })).toEqual([]);
+  }
+  expect(await findExperts(access, { topic: 'quasar', types: [] })).toEqual([]);
+  expect(await expandEngineTypeFilters(access, {})).toEqual({});
+  for (const name of ['search', 'query']) {
+    await expect(operations.find(op => op.name === name)!.handler(ctx(access), { query: 'quasar', types: [] })).rejects.toThrow('no usable page-type strings');
+  }
+});
 
 test('general CLI/env precedence remains intact while strict approval rejects conflicts', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SCHEMA_PACK: 'host-pack' }, async () => {
   const approved = approvedSchemaIdentity(await loadResolvedPackByName('target-pack'));

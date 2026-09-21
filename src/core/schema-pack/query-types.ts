@@ -8,6 +8,7 @@ export async function expandEngineTypeFilters(
   engine: Pick<BrainEngine, 'getConfig'>,
   options: { type?: string; types?: string[]; sourceId?: string; sourceIds?: string[] },
 ): Promise<{ type?: undefined; types?: string[] }> {
+  if (options.types?.length === 0) return { type: undefined, types: [] };
   if (!options.type && !options.types?.length) return {};
   const sourceIds = options.sourceIds?.length ? options.sourceIds : [options.sourceId];
   const inputs = await Promise.all(sourceIds.map(sourceId => engineSchemaInput(engine, { remote: true, sourceId })));

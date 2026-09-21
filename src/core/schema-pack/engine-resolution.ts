@@ -10,11 +10,7 @@ export type EngineSchemaOptions = Omit<LoadActivePackInput, 'cfg' | 'dbConfig' |
 export async function readDbSchemaPack(
   engine: Pick<BrainEngine, 'getConfig'> | null | undefined,
 ): Promise<string | undefined> {
-  try {
-    return (await engine?.getConfig?.('schema_pack'))?.trim() || undefined;
-  } catch {
-    return undefined;
-  }
+  return (await engine?.getConfig('schema_pack'))?.trim() || undefined;
 }
 
 export async function engineSchemaInput(
@@ -24,10 +20,8 @@ export async function engineSchemaInput(
   const dbConfig = await readDbSchemaPack(engine);
   const perSourceDb = new Map<string, string>();
   if (options.sourceId) {
-    try {
-      const value = (await engine?.getConfig?.(`schema_pack.source.${options.sourceId}`))?.trim();
-      if (value) perSourceDb.set(options.sourceId, value);
-    } catch {}
+    const value = (await engine?.getConfig(`schema_pack.source.${options.sourceId}`))?.trim();
+    if (value) perSourceDb.set(options.sourceId, value);
   }
   return { ...options, cfg: loadConfigFileOnly(), dbConfig, perSourceDb };
 }
