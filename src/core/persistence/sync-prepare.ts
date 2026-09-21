@@ -19,6 +19,7 @@ import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
+import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 
 export interface SyncIntent extends Record<string, unknown> {
   kind: 'managed_sync_import' | 'managed_sync_delete' | 'managed_sync_checkpoint';
@@ -72,7 +73,8 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
       return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop: !snapshot || snapshot.page.deleted_at != null };
     } };
   if (typeof p.content !== 'string' || typeof p.sourcePath !== 'string' || typeof p.path !== 'string') throw new OperationError('storage_error', 'The frozen import content is missing.');
-  const parsedInput = parseMarkdown(p.content, row.slug);
+  const activePack = (await loadActivePackForEngine(engine, { remote: row.authority.remote, sourceId: row.source_id }).catch(() => null))?.manifest;
+  const parsedInput = parseMarkdown(p.content, row.slug, { activePack });
   const expectedSlug = resolveSlugForPath(p.sourcePath);
   if (expectedSlug && parsedInput.slug !== expectedSlug && slugifyPath(parsedInput.slug) !== expectedSlug) {
     throw new OperationError('invalid_params', 'The file frontmatter slug conflicts with its physical origin.');
@@ -90,7 +92,7 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
     }
   }
   let prepared: PreparedContentImport | undefined;
-  const result = await importFromContent(engine, row.slug, importContent, { ...source, noEmbed: true, remote: row.authority.remote,
+  const result = await importFromContent(engine, row.slug, importContent, { ...source, noEmbed: true, remote: row.authority.remote, activePack,
     filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true,
     prepare: async value => { prepared = value; return value.result; } });
   if (!prepared) throw new OperationError('invalid_params', result.error ?? 'The sync file could not be prepared.');
@@ -101,7 +103,7 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
     // guarded proof about the other identity. Keep the cursor explicitly blocked.
     throw new OperationError('revision_conflict', 'A different page already owns this file identity; resolve the duplicate before syncing.');
   }
-  const parsed = parseMarkdown(p.content, row.slug);
+  const parsed = parseMarkdown(p.content, row.slug, { activePack });
   const tags = [...new Set([...(snapshot?.tags ?? []), ...ready.parsedPage.tags])].sort();
   const renderedPage = { ...(snapshot?.page ?? { id: 0, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }), ...ready.parsedPage } as Page;
   const canonical = (page: Pick<typeof parsed, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>, tags: string[]) => ({ type: page.type, title: page.title, body: page.compiled_truth,
