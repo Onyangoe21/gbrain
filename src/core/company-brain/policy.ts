@@ -45,7 +45,7 @@ export function companyBrainProfile(config: unknown): CompanyBrainProfile | null
   const source = parseSourceConfig(config);
   if (source.company_brain === undefined) return null;
   const parsed = profileSchema.safeParse(source.company_brain);
-  if (!parsed.success || source.federated !== false || source.strategy !== 'markdown' || source.slug_root_mode !== 'source-root' || source.kind != null || source.remote_url != null) {
+  if (!parsed.success || typeof source.federated !== 'boolean' || source.strategy !== 'markdown' || source.slug_root_mode !== 'source-root' || source.kind != null || source.remote_url != null) {
     throw new OperationError('profile_incompatible', 'The persisted company profile is invalid. Reinspect and reconnect explicitly; missing policy values are never defaulted.');
   }
   return parsed.data;

@@ -2,6 +2,70 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.54.0.0] - 2026-09-21
+
+**Connect an existing company repository without rewriting it.**
+
+GBrain can now take a reviewed, committed company knowledge repository through
+source registration, keyless indexing, relationship reconciliation, and readback
+verification. You choose the initialized company brain and a new source explicitly.
+The command shows its destination and access implications before it writes.
+
+**Say to your agent:** “Connect our existing company brain, preserve its files,
+and show me the plan before importing.”
+
+### Try it, then connect
+
+```bash
+gbrain sources demo company-brain
+gbrain sources inspect ./company-wiki --profile company-brain --json --out ./company-plan.json
+gbrain sources connect --plan ./company-plan.json --brain company-example --source wiki
+```
+
+The demo runs fictional data through the real pipeline without keys or a saved
+brain. A successful real connection returns a durable receipt and example
+ownership/supersession evidence from the imported source, with citations. Missing
+examples remain explicit gaps. This is not an automatic privacy audit or a grant
+to share sensitive knowledge.
+
+| Situation | What GBrain does |
+| --- | --- |
+| Interrupted indexing or graph work | Retains the approved revision and resumes the missing stage |
+| A response is lost | Replays the exact request ID instead of duplicating the source |
+| Source selection or extractor approval changes | Refuses rather than silently broadening or changing the run |
+| A source page would need rewriting | Stops for an explicit source correction |
+| Existing clients have broad access | Shows that implication; changes no client grants |
+
+Embeddings, schedules, curation, imported skills, and sharing stay opt-in. Ordinary
+sync remembers the source's approved selection and remains keyless and writeback-free.
+Use the existing source-scoped sharing controls only after separately approving them.
+
+## To take advantage of v0.54.0.0
+
+Run `gbrain upgrade`, then `gbrain doctor` on the intended brain host. If migration
+160 did not complete, run `gbrain apply-migrations --yes` before connecting.
+Existing personal brains require no schema switch. Company connect requires a
+trusted local host; ordinary remote OAuth access is not administration authority.
+
+Read [the company ingestion guide](docs/guides/company-brain-ingestion.md) for
+non-interactive approval, request replay, recovery, and the first release's scope:
+committed Markdown, a new source, and a compatible dedicated company brain.
+Mixed-schema federation and in-place semantic reapproval are not enabled.
+
+### Itemized changes
+
+- Add guided `sources connect`, a real-pipeline offline company demo, source-scoped
+  completion evidence, and durable receipt status.
+- Integrate committed-only input with existing managed and legacy sync. Preserve
+  writer ownership, source incarnation, revision guards, and canonical consistency.
+- Pin selection, limits, schema, extraction identity, and repository identity to
+  immutable approval metadata; keep incomplete checkpoint references through cleanup.
+- Keep JSON results separate from progress, require explicit destinations and
+  non-interactive approval, and refuse stale plans and unsupported privacy labels.
+- Route company imports through migration/cold-start guidance without triggering
+  personal-brain sanitization, automatic source edits, or Git history changes.
+- Build on the company vocabulary and fictional corpus contributed by @mattzimak.
+
 ## [0.53.0.0] - 2026-09-21
 
 **Keep a company's vocabulary and relationships tied to the right brain.**

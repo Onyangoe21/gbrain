@@ -1,7 +1,7 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -13,6 +13,8 @@ import { admitCompanyBrain, previewCompanyBrain } from '../src/core/company-brai
 import { connectCompanyBrain, resumeCompanyBrain } from '../src/core/company-brain/runtime.ts';
 import { companyBrainProfile, companyBrainPolicyFingerprint } from '../src/core/company-brain/policy.ts';
 import { performSync } from '../src/commands/sync.ts';
+import { runSources } from '../src/commands/sources.ts';
+import { submitEmbedBackfill } from '../src/core/embed-backfill-submit.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { registerLocalWriter } from '../src/core/persistence/identity.ts';
@@ -77,7 +79,7 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
         await expect(performSync(engine, { sourceId: request.sourceId, full: true })).rejects.toBeDefined();
         expect(await state(engine, request.sourceId)).toEqual(before);
       }
-      for (const config of [{ ...row.config, federated: true }, { ...row.config, strategy: 'auto' }, { ...row.config, company_brain: undefined }]) {
+      for (const config of [{ ...row.config, federated: 'true' }, { ...row.config, federated: null }, { ...row.config, federated: undefined }, { ...row.config, strategy: 'auto' }, { ...row.config, company_brain: undefined }]) {
         await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1', [request.sourceId, JSON.stringify(config)]);
         const before = await state(engine, request.sourceId);
         await expect(performSync(engine, { sourceId: request.sourceId })).rejects.toMatchObject({ code: 'profile_incompatible' });
@@ -87,6 +89,45 @@ for (const managed of [false, true]) describe(`immutable company approval (${man
       expect((await resumeCompanyBrain(engine, request)).ok).toBe(true);
       expect((await state(engine, request.sourceId)).pages).toHaveLength(1);
     }
+  }), 120_000);
+
+  test('explicit federation preserves keyless import approval and cannot enqueue automatic enrichment', async () => withEnv({
+    GBRAIN_HOME: home, OPENAI_API_KEY: 'synthetic-unused-company-key',
+  }, async () => {
+    let providerCalls = 0;
+    const rejectProvider = () => { providerCalls++; throw new Error('Provider calls are prohibited for this profile'); };
+    const providerFetch = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(async () => rejectProvider(), { preconnect: rejectProvider }));
+    try {
+      for (const engine of engines) {
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=$1 WHERE singleton=1', [managed]);
+        await engine.setConfig('sync.federated_v2', 'true');
+        const request = await input(fixture());
+        const connected = await connectCompanyBrain(engine, request);
+        expect(connected.ok).toBe(true);
+        const [initial] = await engine.executeRaw<{ config: Record<string, unknown> }>('SELECT config FROM sources WHERE id=$1', [request.sourceId]);
+        expect(initial.config.federated).toBe(false);
+        const approval = companyBrainPolicyFingerprint(companyBrainProfile(initial.config)!, request.sourceId);
+        expect(connected.receipt.policyFingerprint).toBe(approval);
+        await runSources(engine, ['federate', request.sourceId]);
+        const [shared] = await engine.executeRaw<{ config: Record<string, unknown> }>('SELECT config FROM sources WHERE id=$1', [request.sourceId]);
+        expect(shared.config.federated).toBe(true);
+        expect(companyBrainPolicyFingerprint(companyBrainProfile(shared.config)!, request.sourceId)).toBe(approval);
+        if (engine.kind === 'pglite') expect(await submitEmbedBackfill(engine, request.sourceId, { reason: 'federation_flip' })).toMatchObject({ status: 'no_worker_surface' });
+        else await expect(submitEmbedBackfill(engine, request.sourceId, { reason: 'federation_flip' })).rejects.toMatchObject({ code: 'source_profile_no_backfill' });
+        const file = join(request.path, 'people/person-01.md');
+        const content = readFileSync(file, 'utf8') + '\nAn explicitly committed update after sharing.\n';
+        writeFileSync(file, content); git(request.path, 'add', '.'); git(request.path, 'commit', '-qm', 'Synthetic shared source update');
+        expect(await performSync(engine, { sourceId: request.sourceId })).toMatchObject({ status: 'synced', embedded: 0 });
+        const [after] = await engine.executeRaw<{ config: Record<string, unknown> }>('SELECT config FROM sources WHERE id=$1', [request.sourceId]);
+        expect(after.config.federated).toBe(true);
+        expect((await resumeCompanyBrain(engine, request)).receipt.policyFingerprint).toBe(approval);
+        expect((await state(engine, request.sourceId)).pages).toHaveLength(1);
+        expect(readFileSync(file, 'utf8')).toBe(content);
+        expect(existsSync(join(request.path, '.gitignore'))).toBe(false);
+        expect(await engine.executeRaw("SELECT id FROM minion_jobs WHERE name='embed-backfill' AND data->>'sourceId'=$1", [request.sourceId])).toHaveLength(0);
+      }
+      expect(providerCalls).toBe(0);
+    } finally { providerFetch.mockRestore(); }
   }), 120_000);
 
   test('old extractor approval refuses same-commit, changed-commit, and full sync without a new receipt', async () => withEnv({ GBRAIN_HOME: home }, async () => {
