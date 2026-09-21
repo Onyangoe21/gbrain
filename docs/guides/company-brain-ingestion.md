@@ -93,16 +93,20 @@ requirement instead of waiting on stdin. `--yes` authorizes the listed import; i
 does not bypass source, schema, identity, or access checks. A saved plan is not an
 authorization token. Changed input requires another inspection.
 
-Keep the displayed request ID when a connect response is interrupted. Retry the
-same approved connection with `--request-id <uuid>` instead of creating another
-source; a different request or changed approval does not bypass a collision.
+Keep the displayed request ID and the original plan when a connect response is
+interrupted. Retry the same approved connection with `--request-id <uuid>` and
+the same destination and selection instead of creating another source. A
+different request or changed approval does not bypass a collision. If the
+checkout has advanced since admission, use source-scoped sync below to recover
+the stored receipt rather than replacing the approved plan with current HEAD.
 
 `--out` creates a private file and refuses to overwrite an existing one. The
 inspection JSON envelope also contains the raw plan under `plan`; connect accepts
 either representation. Plans and receipts may expose private filenames, so do
 not post them publicly. Repeat `--include <glob>` and `--exclude <glob>` during
 inspection to choose repository-relative paths; re-inspect to change a saved
-selection. No repository hooks, filters, scripts, submodules, or LFS downloads run.
+selection. No network Git operations, provider calls, repository hooks, filters,
+scripts, submodules, or LFS downloads run.
 
 New commands write one versioned JSON result to stdout with `--json`; progress
 and prompts go to stderr. Exit 0 means a completed command, 2 means invalid usage
@@ -124,10 +128,12 @@ does not substitute current HEAD silently. Managed brains retain their native
 writer, source-incarnation, and revision conflict checks.
 
 Semantic schema/extractor upgrades do not silently renew an old approval. This
-first version has no in-place reapproval command. Review the old registration's
-removal impact and obtain explicit destructive approval before reconnecting the
-same checkout, or use a separate authorized checkout/destination. Do not remove
-a source automatically merely to make an upgrade succeed.
+first version has no in-place reapproval command. Preview the old registration's
+removal impact with `gbrain sources remove wiki --brain company-example --dry-run`.
+Removal requires separate destructive consent and `--confirm-destructive` before
+reinspecting and reconnecting the same checkout. Alternatively, use a separate
+authorized checkout/destination. Do not remove a source automatically merely to
+make an upgrade succeed, or edit persisted approval/policy fields to bypass refusal.
 
 Ordinary sync remembers this source's profile and selection. It remains keyless
 and does not pull, enqueue embeddings, or edit repository housekeeping files.
@@ -141,10 +147,11 @@ correction separately; the import does not waive canonical checks or make that
 edit for you. A lock or ownership change may require waiting for the registered
 owner or following the existing writer recovery procedure.
 
-Source status distinguishes incomplete, complete, missing, and unavailable receipt
-state. It does not claim a missing receipt means nothing was imported. Removing a
-source is a separate destructive action using the existing impact-preview and
-confirmation flow; original repository files remain untouched. Backups may remain.
+Source status distinguishes incomplete, complete, discarded, missing, and
+unavailable receipt state. It does not claim a missing receipt means nothing was
+imported. Removing a source is a separate destructive action using the
+impact-preview and `--confirm-destructive` flow above; original repository files
+remain untouched. Backups may remain.
 
 ## What stays opt-in
 
@@ -154,9 +161,17 @@ adopts a repository's “safe changes commit to main” policy automatically. It
 on the trusted brain host; ordinary MCP/OAuth access is not source-administration
 authority, and thin clients do not fall back to an empty local brain.
 
+After separate approval, `gbrain sources federate wiki --brain company-example`
+can include the source in default cross-source search. That does not change its
+immutable import policy: sync still performs no pull, embedding, or source
+writeback, and automatic embedding backfill remains blocked. Federation does not
+grant access or authorize enrichment; do not edit the stored profile to enable
+either.
+
 The first release does not connect into populated sources, support arbitrary
-export formats, or enable mixed-schema federation. Existing general migration
-tools remain available for those source formats.
+export formats, or mix different source schemas in one brain, even when federation
+is off. An occupied destination must already use the exact company schema.
+Existing general migration tools remain available for other source formats.
 
 The company vocabulary and fictional sample are adapted from
 [mattzimak/gbrain-company-brain](https://github.com/mattzimak/gbrain-company-brain)

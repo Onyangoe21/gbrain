@@ -179,6 +179,9 @@ obtain approval before `--yes`. Do not flatten its vocabulary by activating or
 normalizing an unrelated personal schema. The offline `gbrain sources demo
 company-brain` needs no keys or private data. Details:
 `docs/guides/company-brain-ingestion.md`.
+For this company path, stop after reporting the durable receipt; skip the generic
+import and post-bootstrap checklist below. Later enrichment or scheduling needs
+separate consent and must respect the source's immutable keyless sync policy.
 
 **The highest-leverage first import.** If the user already has a notes system, this
 is hundreds or thousands of structured pages ready to go.
