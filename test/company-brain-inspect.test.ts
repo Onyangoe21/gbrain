@@ -75,6 +75,13 @@ function snapshot(root: string): Record<string, string> {
 }
 
 describe('company-brain committed inspection', () => {
+  test('does not silently accept unsupported local-only visibility metadata', async () => {
+    const root = repo({ 'notes/local.md': page('note', 'visibility: local\n') });
+    const plan = await inspect(root);
+    expect(plan.ready).toBe(false);
+    expect(codes(plan)).toContain('restricted_audience');
+  });
+
   test.each(['quarantine', 'embed_skip'])('blocks a search-hiding marker: %s', async marker => {
     const root = repo({ 'notes/hidden.md': page('note', `${marker}: null\n`) });
     const before = snapshot(root);

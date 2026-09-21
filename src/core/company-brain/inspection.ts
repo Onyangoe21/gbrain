@@ -142,7 +142,7 @@ function readPage(content: string, entry: InspectionEntry, plan: CompanyBrainPla
       }
     }
   }
-  if (raw.visibility != null && !['private', 'public', 'world', 'local'].includes(String(raw.visibility))) {
+  if (raw.visibility != null && !['private', 'public', 'world'].includes(String(raw.visibility))) {
     finding(plan, 'error', 'restricted_audience', 'Unrecognized visibility metadata requires a destination-policy decision.', path);
   }
   if (raw.visibility === 'private') audience.push('private');
