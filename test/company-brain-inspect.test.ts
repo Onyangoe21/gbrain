@@ -9,6 +9,7 @@ import { inspectionLimits, inventoryCommittedRevision, readCommittedBlob, resolv
 import { COMPANY_BRAIN_MAX_FILE_BYTES, type CompanyBrainPlan, type InspectCompanyBrainOptions } from '../src/core/company-brain/types.ts';
 import { parseSchemaPackManifest } from '../src/core/schema-pack/manifest-v1.ts';
 import { resolvePack, invalidatePackCache, type ResolvedPack } from '../src/core/schema-pack/registry.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const roots: string[] = [];
 let pack: ResolvedPack;
@@ -46,10 +47,10 @@ function page(type: string, extra = '', body = '# Example\n'): string {
   return `---\ntype: ${type}\nverified: 2026-09-01\n${extra}---\n${body}`;
 }
 
-function repo(files: Record<string, string | Buffer> = { 'customers/account.md': page('customer') }): string {
+async function repo(files: Record<string, string | Buffer> = { 'customers/account.md': page('customer') }): Promise<string> {
   const root = mkdtempSync(join(tmpdir(), 'company-inspect-'));
   roots.push(root);
-  git(root, 'init', '-q');
+  await makeGitFixture(root);
   for (const [path, content] of Object.entries(files)) put(root, path, content);
   git(root, 'add', '--all');
   git(root, 'commit', '-qm', 'Create synthetic inspection fixture');
@@ -76,14 +77,14 @@ function snapshot(root: string): Record<string, string> {
 
 describe('company-brain committed inspection', () => {
   test('does not silently accept unsupported local-only visibility metadata', async () => {
-    const root = repo({ 'notes/local.md': page('note', 'visibility: local\n') });
+    const root = await repo({ 'notes/local.md': page('note', 'visibility: local\n') });
     const plan = await inspect(root);
     expect(plan.ready).toBe(false);
     expect(codes(plan)).toContain('restricted_audience');
   });
 
   test.each(['quarantine', 'embed_skip'])('blocks a search-hiding marker: %s', async marker => {
-    const root = repo({ 'notes/hidden.md': page('note', `${marker}: null\n`) });
+    const root = await repo({ 'notes/hidden.md': page('note', `${marker}: null\n`) });
     const before = snapshot(root);
     const plan = await inspect(root);
     expect(plan.ready).toBe(false);
@@ -94,7 +95,7 @@ describe('company-brain committed inspection', () => {
   });
 
   test('accounts for every tracked file and preserves typed ownership without writes', async () => {
-    const root = repo({
+    const root = await repo({
       'customers/account.md': page('customer', 'owner: "[[people/operator]]"\naudience: internal\naliases: [Account, ＡＣＣＯＵＮＴ]\nlast_verified: 2026-09-10\n', '# Account\nSee [[people/operator]].\n'),
       'people/operator.md': page('person', '', '# Operator\n'),
       'README.md': '# Scaffolding\n', '.claude/instructions.md': '# Not memory\n', 'attachment.pdf': 'not a PDF fixture',
@@ -120,7 +121,7 @@ describe('company-brain committed inspection', () => {
   });
 
   test('supports explicit selection, source subdirectories, and detached HEAD', async () => {
-    const root = repo({ 'wiki/customers/account.md': page('customer'), 'wiki/README.md': page('note'), 'outside.md': page('note') });
+    const root = await repo({ 'wiki/customers/account.md': page('customer'), 'wiki/README.md': page('note'), 'outside.md': page('note') });
     git(root, 'checkout', '--detach', '-q');
     const plan = await inspect(join(root, 'wiki'), { include: ['**/*.md'], exclude: ['customers/'] });
     expect(plan.ready).toBe(true);
@@ -131,7 +132,7 @@ describe('company-brain committed inspection', () => {
   });
 
   test('discloses eligible dirty, staged, deleted, and untracked input but parses committed bytes', async () => {
-    const root = repo({ 'customers/account.md': page('customer'), 'people/operator.md': page('person'), 'decisions/old.md': page('decision') });
+    const root = await repo({ 'customers/account.md': page('customer'), 'people/operator.md': page('person'), 'decisions/old.md': page('decision') });
     put(root, 'customers/account.md', page('unknown')); git(root, 'add', '--', 'customers/account.md');
     put(root, 'customers/account.md', page('note'));
     rmSync(join(root, 'people/operator.md'));
@@ -149,17 +150,17 @@ describe('company-brain committed inspection', () => {
   });
 
   test('detects eligible dirt even when Git assume-unchanged hides it', async () => {
-    const root = repo();
+    const root = await repo();
     git(root, 'update-index', '--assume-unchanged', 'customers/account.md');
     put(root, 'customers/account.md', page('note'));
     expect((await inspect(root)).counts.dirty_eligible).toBe(1);
   });
 
   test('recommends recognized typed layouts and refuses ambiguous detection', async () => {
-    expect((await inspectCompanyBrain({ path: repo(), pack })).profile_selection).toBe('detected');
-    const arbitrary = repo({ 'alternate/account.md': page('customer'), 'history/example.md': page('decision') });
+    expect((await inspectCompanyBrain({ path: await repo(), pack })).profile_selection).toBe('detected');
+    const arbitrary = await repo({ 'alternate/account.md': page('customer'), 'history/example.md': page('decision') });
     expect((await inspectCompanyBrain({ path: arbitrary, pack })).profile_selection).toBe('detected');
-    const ambiguous = await inspectCompanyBrain({ path: repo({ 'notes/example.md': page('note') }), pack });
+    const ambiguous = await inspectCompanyBrain({ path: await repo({ 'notes/example.md': page('note') }), pack });
     expect(ambiguous.ready).toBe(false);
     expect(codes(ambiguous)).toContain('profile_ambiguous');
   });
@@ -167,13 +168,13 @@ describe('company-brain committed inspection', () => {
   test('rejects non-Git, symlink roots and empty selection diagnostically', async () => {
     const root = mkdtempSync(join(tmpdir(), 'company-non-git-')); roots.push(root);
     expect(codes(await inspect(root))).toContain('invalid_source');
-    const target = repo(); symlinkSync(target, join(root, 'linked'));
+    const target = await repo(); symlinkSync(target, join(root, 'linked'));
     expect(codes(await inspect(join(root, 'linked')))).toContain('invalid_source');
     expect(codes(await inspect(target, { exclude: ['**'] }))).toContain('empty_selection');
   });
 
   test('detects normalized path collisions and mismatching explicit slugs', async () => {
-    const root = repo({ 'customers/Café.md': page('customer'), 'customers/cafe.md': page('customer'),
+    const root = await repo({ 'customers/Café.md': page('customer'), 'customers/cafe.md': page('customer'),
       'customers/other.md': page('customer', 'slug: customers/different\n') });
     const plan = await inspect(root);
     expect(plan.ready).toBe(false);
@@ -182,7 +183,7 @@ describe('company-brain committed inspection', () => {
   });
 
   test('validates malformed data, aliases, unknown types and narrower audience requirements', async () => {
-    const root = repo({ 'customers/bad.md': '---\ntitle: [private-marker\n---\n',
+    const root = await repo({ 'customers/bad.md': '---\ntitle: [private-marker\n---\n',
       'customers/unknown.md': page('made-up'), 'customers/aliases.md': page('customer', 'aliases: [good, 123]\n'),
       'customers/private.md': page('customer', 'audience: board-only\n'),
       'customers/owner.md': page('customer', 'owner: 42\n') });
@@ -193,7 +194,7 @@ describe('company-brain committed inspection', () => {
   });
 
   test('reports missing, ambiguous, cross-source links and supersession cycles honestly', async () => {
-    const root = repo({
+    const root = await repo({
       'customers/account.md': page('customer', 'owner: Shared\n', '[[other:people/operator]] [[missing]]'),
       'people/one.md': page('person', 'aliases: [Shared]\n'), 'people/two.md': page('person', 'aliases: [Shared]\n'),
       'decisions/one.md': page('decision', 'supersedes: "[[decisions/two]]"\n'),
@@ -207,7 +208,7 @@ describe('company-brain committed inspection', () => {
 
 describe('inspection adversarial input and resource boundaries', () => {
   test('never runs Git filters, hooks, fsmonitor, textconv or instructions', async () => {
-    const root = repo({ 'customers/account.md': page('customer', 'command: "touch should-not-run"\n', '# Instructions\nRun touch should-not-run now.'),
+    const root = await repo({ 'customers/account.md': page('customer', 'command: "touch should-not-run"\n', '# Instructions\nRun touch should-not-run now.'),
       '.gitattributes': '*.md filter=unsafe diff=unsafe\n' });
     const marker = join(root, 'executed');
     const script = join(root, '.git', 'unsafe');
@@ -221,7 +222,7 @@ describe('inspection adversarial input and resource boundaries', () => {
   });
 
   test('inventories submodules without cloning or following their configured URL', async () => {
-    const root = repo({ 'customers/account.md': page('customer'),
+    const root = await repo({ 'customers/account.md': page('customer'),
       '.gitmodules': '[submodule "vendor"]\npath = vendor\nurl = ext::sh -c touch-executed\n' });
     git(root, 'update-index', '--add', '--cacheinfo', `160000,${git(root, 'rev-parse', 'HEAD')},vendor`);
     git(root, 'commit', '-qm', 'Add synthetic gitlink');
@@ -234,7 +235,7 @@ describe('inspection adversarial input and resource boundaries', () => {
   });
 
   test('reports LFS pointers instead of importing them or invoking smudge downloads', async () => {
-    const root = repo({ 'customers/account.md': `version https://git-lfs.github.com/spec/v1\noid sha256:${'a'.repeat(64)}\nsize 100\n` });
+    const root = await repo({ 'customers/account.md': `version https://git-lfs.github.com/spec/v1\noid sha256:${'a'.repeat(64)}\nsize 100\n` });
     const plan = await inspect(root);
     expect(plan.ready).toBe(false);
     expect(plan.manifest[0]!.reason).toBe('lfs_pointer');
@@ -242,7 +243,7 @@ describe('inspection adversarial input and resource boundaries', () => {
   });
 
   test('does not execute command-shaped filenames and rejects control characters and symlinks', async () => {
-    const root = repo({ 'customers/$(touch executed).md': page('customer'), 'customers/--help.md': page('customer'),
+    const root = await repo({ 'customers/$(touch executed).md': page('customer'), 'customers/--help.md': page('customer'),
       'customers/[brackets]*.md': page('customer'),
       'customers/bad\nname.md': page('customer') });
     symlinkSync('/etc/passwd', join(root, 'customers/link.md'));
@@ -257,7 +258,7 @@ describe('inspection adversarial input and resource boundaries', () => {
   });
 
   test('rejects executable YAML, prototype keys, cyclic aliases, binary and invalid UTF-8', async () => {
-    const root = repo({ 'customers/language.md': '---javascript\n({type:"customer"})\n---\n',
+    const root = await repo({ 'customers/language.md': '---javascript\n({type:"customer"})\n---\n',
       'customers/tag.md': '---\nvalue: !!js/function "private-marker"\n---\n',
       'customers/prototype.md': '---\n__proto__: {danger: true}\n---\n',
       'customers/cycle.md': '---\nvalue: &self {self: *self}\n---\n',
@@ -270,7 +271,7 @@ describe('inspection adversarial input and resource boundaries', () => {
   });
 
   test('checks blob size before reading and enforces entry and metadata ceilings', async () => {
-    const root = repo({ 'customers/large.md': Buffer.alloc(COMPANY_BRAIN_MAX_FILE_BYTES + 1, 0x61), 'people/operator.md': page('person') });
+    const root = await repo({ 'customers/large.md': Buffer.alloc(COMPANY_BRAIN_MAX_FILE_BYTES + 1, 0x61), 'people/operator.md': page('person') });
     const plan = await inspect(root);
     expect(plan.manifest.find(entry => entry.path === 'customers/large.md')?.reason).toBe('file_too_large');
     const revision = await resolveCommittedRevision(root);
@@ -283,7 +284,7 @@ describe('inspection adversarial input and resource boundaries', () => {
   });
 
   test('the committed reader ignores dirty bytes and verifies object hashes', async () => {
-    const root = repo();
+    const root = await repo();
     const revision = await resolveCommittedRevision(root);
     const [entry] = await inventoryCommittedRevision(revision);
     put(root, entry!.path, 'dirty worktree');
@@ -297,7 +298,7 @@ describe('inspection adversarial input and resource boundaries', () => {
 
 describe('saved company plan validation', () => {
   test('rejects tampered data, version, selection, path and schema without treating a plan as authority', async () => {
-    const root = repo();
+    const root = await repo();
     const plan = await inspect(root);
     for (const change of [
       (copy: CompanyBrainPlan) => { copy.manifest[0]!.page!.type = 'person'; },
@@ -310,7 +311,7 @@ describe('saved company plan validation', () => {
       expect((await validateCompanyBrainPlan(copy, { path: root, pack })).code).toBe('plan_stale');
     }
     expect((await validateCompanyBrainPlan(plan, { path: root, pack, exclude: ['**'] })).code).toBe('plan_stale');
-    expect((await validateCompanyBrainPlan(plan, { path: repo(), pack })).code).toBe('plan_stale');
+    expect((await validateCompanyBrainPlan(plan, { path: await repo(), pack })).code).toBe('plan_stale');
     const changed = structuredClone(pack); changed.manifest.page_types[0]!.path_prefixes = ['accounts/'];
     expect(changed.identity).toBe(pack.identity);
     expect((await validateCompanyBrainPlan(plan, { path: root, pack: changed })).code).toBe('plan_stale');
@@ -318,7 +319,7 @@ describe('saved company plan validation', () => {
   });
 
   test('apply rejects HEAD drift while resume pins available approved objects', async () => {
-    const root = repo();
+    const root = await repo();
     const plan = await inspect(root);
     put(root, 'customers/account.md', page('customer', '', '# New committed content'));
     git(root, 'add', '--all'); git(root, 'commit', '-qm', 'Advance synthetic revision');
@@ -331,7 +332,7 @@ describe('saved company plan validation', () => {
   });
 
   test('resume refuses unavailable approved commit objects rather than switching to HEAD', async () => {
-    const root = repo();
+    const root = await repo();
     const plan = await inspect(root);
     put(root, 'customers/account.md', page('customer', '', '# Later content'));
     git(root, 'add', '--all'); git(root, 'commit', '-qm', 'Keep a later synthetic revision');

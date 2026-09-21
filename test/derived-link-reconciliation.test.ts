@@ -12,6 +12,7 @@ import { inspectCompanyBrain } from '../src/core/company-brain/inspection.ts';
 import { readCommittedBlob } from '../src/core/company-brain/revision.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 const pack = parseSchemaPackManifest({
   api_version: 'gbrain-schema-pack-v1', name: 'synthetic-reconcile', version: '1.0.0', extends: null,
@@ -178,7 +179,7 @@ for (const kind of ['pglite', ...(process.env.DATABASE_URL ? ['postgres'] : [])]
         }
         const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-C', root, ...args],
           { stdio: 'pipe' });
-        git('init', '-q'); git('add', '.'); git('commit', '-qm', 'Create synthetic reference parity fixture');
+        await makeGitFixture(root); git('add', '.'); git('commit', '-qm', 'Create synthetic reference parity fixture');
         const plan = await inspectCompanyBrain({ path: root, profile: 'company-brain', pack: profile });
         expect(plan.ready).toBe(true);
         const references = (path: string) => plan.manifest.find(entry => entry.path === path)!.page!.references;
