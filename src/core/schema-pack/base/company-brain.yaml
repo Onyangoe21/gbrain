@@ -133,15 +133,26 @@ link_types:
   - name: competes_with
     inverse: competes_with
     inference:
+      page_type: competitor
+      target_type: company
       regex: '\b([Cc]ompetes? with|[Cc]ompetitor (of|to)|[Rr]ivals?)\b'
   - name: decided_in
     inverse: decision_made
     inference:
+      page_type: decision
+      target_type: meeting
       regex: '\b([Aa]greed|[Dd]ecided|[Aa]pproved)\s+(in|at|during)\b'
   - name: champion
     inverse: champion_of
     inference:
+      page_type: customer
+      target_type: person
       regex: '\b([Cc]hampion|[Ss]ponsor|[Mm]ain contact|[Pp]oint of contact)\b'
+  - name: attended
+    inverse: attended_by
+    inference:
+      page_type: meeting
+      target_type: person
 
 frontmatter_links:
   - page_type: customer
