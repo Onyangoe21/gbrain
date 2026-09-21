@@ -55,6 +55,12 @@ to inspect the preset.
   type distribution, relationship references, inherited schema lint, and the
   bundled preset's read-only mutation guard.
 
+### For contributors
+
+- The Postgres contention fixture waits for setup lock ownership before creating
+  the contention it tests. Pending-receipt and same-ID replay assertions are
+  unchanged. Adapted from #5240, contributed by @Masashi-Ono0611.
+
 ## [0.51.4.0] - 2026-09-21
 
 **Queued writes move sooner, and contributor checks spend less time repeating work.**
