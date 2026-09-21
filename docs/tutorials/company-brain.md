@@ -1,5 +1,10 @@
 # Tutorial: Extend your personal brain into a company brain
 
+Already have a company Markdown repository and only want to index it? Start with
+[connecting an existing company brain](../guides/company-brain-ingestion.md).
+That local workflow offers an offline demo, read-only inspection, and a verified
+import without requiring the hosted team deployment described below.
+
 This tutorial picks up where the [personal brain tutorial](personal-brain.md) leaves off. You already have a working agent (OpenClaw on Render, talking to you on Telegram, with GBrain as memory and Supabase storing embeddings). Now you want your whole team to use it as shared institutional memory, with each person seeing only what they're allowed to see.
 
 **Time:** about 90 more minutes on top of the personal-brain install.

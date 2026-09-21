@@ -581,6 +581,22 @@ async function main() {
     if (await printSelfHelpWithoutEngine(command, subArgs)) return;
   }
 
+  if (command === 'sources' && subArgs[0] === 'inspect') {
+    const { runCompanyBrainInspection } = await import('./commands/company-brain-inspect.ts');
+    await runCompanyBrainInspection(subArgs.slice(1));
+    return;
+  }
+  if (command === 'sources' && subArgs[0] === 'connect') {
+    const { runCompanyBrainConnect } = await import('./commands/company-brain-connect.ts');
+    await runCompanyBrainConnect(subArgs.slice(1), () => connectEngine({ probeOnly: true }));
+    return;
+  }
+  if (command === 'sources' && subArgs[0] === 'demo' && subArgs[1] === 'company-brain') {
+    const { runCompanyBrainDemoCli } = await import('./commands/company-brain-demo.ts');
+    await runCompanyBrainDemoCli(subArgs.slice(2));
+    return;
+  }
+
   // #2185: strict unknown-flag validation — pre-dispatch, pre-engine. A flag
   // no handler consults (the repro: `init --migrate-only --dry-run` applying
   // REAL migrations while the user asked for a rehearsal) fails loud here

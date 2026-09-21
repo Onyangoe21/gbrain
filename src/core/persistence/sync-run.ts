@@ -10,13 +10,15 @@ import { assertPersistenceAccepting, foregroundWriteCompletions, startPersistenc
 import { discoverManagedSync, resolveManagedSyncContext, readSyncContent, syncRawHash, type SyncDiscovery } from './sync-discovery.ts';
 import { managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, type SyncAuthority } from './sync-authority.ts';
 import type { SyncIntent } from './sync-prepare.ts';
+import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
+import { readCommittedBlob } from '../company-brain/revision.ts';
 
 interface Pending { requestId: string; slug: string; pageId: number | null; intent: SyncIntent; }
-interface Cursor extends SyncDiscovery { runId: string; index: number; authority: SyncAuthority; pending?: Pending; done?: boolean;
+interface Cursor extends SyncDiscovery { runId: string; index: number; authority: SyncAuthority; pending?: Pending; done?: boolean; companyReceiptId?: string;
   counts: { added: number; modified: number; deleted: number; chunks: number }; }
 const OP = 'managed-sync';
-type CursorHeader = Omit<Cursor, 'entries'> & { total: number };
-const header = ({ entries, ...value }: Cursor): CursorHeader => ({ ...value, total: entries.length });
+type CursorHeader = Omit<Cursor, 'entries' | 'companyPlan'> & { total: number };
+const header = ({ entries, companyPlan: _plan, ...value }: Cursor): CursorHeader => ({ ...value, total: entries.length });
 async function readCursor(engine: BrainEngine, key: string, cached?: Cursor): Promise<Cursor | null> {
   const [row] = await engine.executeRaw<{ completed_keys: [CursorHeader] }>('SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [OP, key]);
   const value = row?.completed_keys?.[0];
@@ -27,7 +29,8 @@ async function readCursor(engine: BrainEngine, key: string, cached?: Cursor): Pr
     entries = manifest?.completed_keys;
   }
   if (!entries || entries.length !== value.total) throw new OperationError('storage_error', 'The durable sync manifest is unavailable.');
-  return { ...value, entries };
+  const companyPlan = value.companyReceiptId ? cached?.companyPlan ?? await readCompanyBrainPlan(engine, value.companyReceiptId) : undefined;
+  return { ...value, entries, ...(companyPlan ? { companyPlan } : {}) };
 }
 async function saveCursor(engine: BrainEngine, key: string, before: Cursor | null, next: Cursor): Promise<Cursor> {
   return engine.transaction(async tx => {
@@ -56,7 +59,12 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string): Pr
   let content: string | null = null, rawHash: string | null = null;
   if (entry) {
     rawHash = syncRawHash(cursor.root, entry.path);
-    content = entry.action === 'import' ? readSyncContent(cursor, entry) : null;
+    if (entry.action === 'import' && cursor.companyPlan) {
+      const company = currentCompanyBrainSync(cursor.sourceId);
+      const blob = company?.entries.get(entry.path);
+      if (company?.receiptId !== cursor.companyReceiptId || !blob || blob.disposition !== 'included') throw new OperationError('plan_stale', 'The durable cursor does not match its approved content manifest.');
+      content = (await readCommittedBlob(cursor.companyPlan.revision!, blob, cursor.companyPlan.limits)).toString('utf8');
+    } else content = entry.action === 'import' ? readSyncContent(cursor, entry) : null;
     slug = entry.slug!; pageId = entry.pageId ?? null; revision = entry.revision ?? null;
     const snapshot = await engine.readPageSnapshot(slug, { sourceId: cursor.sourceId, includeDeleted: true });
     if ((snapshot?.page.id ?? null) !== pageId || (snapshot?.revision ?? null) !== revision ||
@@ -68,20 +76,31 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string): Pr
   return { requestId: randomUUID(), slug, pageId, intent: { kind: !entry ? 'managed_sync_checkpoint' : entry.action === 'import' ? 'managed_sync_import' : 'managed_sync_delete',
     expected_revision: revision, sourcePath: entry?.sourcePath ?? null, path: entry?.path ?? null, rawHash, content,
     ownerEpoch: String(cursor.binding.owner_epoch), syncAuthority: cursor.authority, cursorKey: key, runId: cursor.runId,
-    slugMode: cursor.slugMode, index: cursor.index, total: cursor.entries.length, from: cursor.from, target: cursor.target } };
+    slugMode: cursor.slugMode, index: cursor.index, total: cursor.entries.length, from: cursor.from, target: cursor.target,
+    ...(cursor.companyPlan ? { companyApproval: { schema: cursor.companyPlan.schema!, planDigest: cursor.companyPlan.plan_digest, extractorVersion: cursor.companyPlan.extractor_version } } : {}) } };
 }
 
 /** One immutable page is admitted at a time; foreground writes can never sit behind a whole scan. */
 export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
+  if (opts.sourceId && !currentCompanyBrainSync(opts.sourceId) && await getCompanyBrainProfile(engine, opts.sourceId)) {
+    return (await import('../company-brain/runtime.ts')).performCompanyBrainSync(engine, opts);
+  }
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
   const context = await resolveManagedSyncContext(engine, opts);
   const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, context.root);
-  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority,
+  const company = currentCompanyBrainSync(context.sourceId);
+  const key = digest({ source: context.incarnation, principal: authority.writer.principal, authority, ...(company ? { company: { receiptId: company.receiptId, planDigest: company.plan.plan_digest } } : {}),
     options: { full: opts.full ?? false, workingTree: opts.workingTree ?? false, srcSubpath: opts.srcSubpath ?? null,
       exclude: opts.exclude ?? [], includeHidden: opts.includeHidden ?? [], strategy: opts.strategy ?? null } });
   let cursor = await readCursor(engine, key);
-  if (cursor && opts.retryFailed && !opts.dryRun) {
+  if (company && opts.retryFailed && cursor?.pending && !opts.dryRun) {
+    const failed = await getWriteRequest(engine, cursor.authority.writer.principal, cursor.pending.requestId);
+    if (failed && ['failed', 'conflict', 'cancelled'].includes(failed.state)) {
+      cursor = await saveCursor(engine, key, cursor, { ...cursor, pending: await freezeEntry(engine, cursor, key) });
+    }
+  }
+  if (cursor && opts.retryFailed && !opts.dryRun && !company) {
     const unfinished = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE source_id=$1
       AND intent->>'runId'=$2 AND state IN ('queued','running','recovering') LIMIT 1`, [cursor.sourceId, cursor.runId]);
     if (!unfinished.length) {
@@ -90,15 +109,17 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
     }
   }
   if (cursor?.done && opts.dryRun) return result(cursor, 'dry_run');
+  if (cursor?.done && company) return result(cursor, cursor.from === null ? 'first_sync' : 'synced');
   if (cursor?.done) {
     await engine.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [OP, key, JSON.stringify([header(cursor)])]);
     cursor = await readCursor(engine, key);
   }
   if (!cursor) {
     const discovery = await discoverManagedSync(engine, opts, context);
-    const fresh: Cursor = { ...discovery, authority, runId: randomUUID(), index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } };
+    const fresh: Cursor = { ...discovery, authority, runId: randomUUID(), index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 }, ...(company ? { companyReceiptId: company.receiptId } : {}) };
     if (opts.dryRun) return result(fresh, 'dry_run');
     if (!fresh.entries.length && fresh.from === fresh.target) return result(fresh, 'up_to_date');
+    if (company) await company.protect([{ op: OP, fingerprint: key, kind: 'managed_cursor' }, { op: `${OP}-manifest`, fingerprint: fresh.runId, kind: 'manifest' }]);
     cursor = await saveCursor(engine, key, null, fresh);
   }
   if (cursor.incarnation !== context.incarnation || cursor.binding.worktree_id !== context.binding.worktree_id ||

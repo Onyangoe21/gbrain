@@ -171,6 +171,15 @@ the exact protocol.
 
 ## Phase 1: Existing Markdown / Obsidian Import
 
+For an existing company Git repository, route to the company workflow in
+`skills/migrate/SKILL.md` before the generic import below. Start with
+`gbrain sources inspect <path> --profile company-brain`; confirm an initialized
+company brain and a new source, show the connect destination/access preview, and
+obtain approval before `--yes`. Do not flatten its vocabulary by activating or
+normalizing an unrelated personal schema. The offline `gbrain sources demo
+company-brain` needs no keys or private data. Details:
+`docs/guides/company-brain-ingestion.md`.
+
 **The highest-leverage first import.** If the user already has a notes system, this
 is hundreds or thousands of structured pages ready to go.
 
