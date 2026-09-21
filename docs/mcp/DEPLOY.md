@@ -252,8 +252,9 @@ cannot be replayed, and is invalidated by a server restart. Successful redemptio
 establishes the admin browser session and redirects to `/admin/`.
 
 This logs the owner into the dashboard; it does not create, reveal, or rotate an
-MCP client credential. Register the intended OAuth client separately in the
-credential-reveal screen below. For unattended deployments, provision the
+MCP client credential. Register the intended OAuth client separately on the
+[Agents page](#2-register-oauth-clients), then use its setup instructions and
+explicit private download when needed. For unattended deployments, provision the
 bootstrap credential through the operator's protected configuration before
 starting the server; generated secrets are deliberately hidden in captured logs.
 
