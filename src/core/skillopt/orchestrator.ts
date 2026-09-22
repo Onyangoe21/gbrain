@@ -77,6 +77,7 @@
  * └────────────────────────────────────────────────────────────────────────┘
  */
 
+import { assertLegacySkillWriter } from '../skillpack/writer-guard.ts';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
@@ -120,6 +121,7 @@ export async function runSkillOpt(opts: SkillOptOpts): Promise<RunSkillOptResult
 
   // ── Pre-flight gates (fail-loud BEFORE any LLM spend) ───────────────────
   const skillFile = skillPath(skillsDir, skillName);
+  await assertLegacySkillWriter(engine, skillFile);
   if (!fs.existsSync(skillFile)) {
     throw errorFor({
       class: 'NoSkill',

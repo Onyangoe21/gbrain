@@ -3,6 +3,25 @@
 On-demand reference (see CLAUDE.md Reference map). Current behavior + invariants
 only.
 
+Shared-skill tests distinguish canonical publication, protocol delivery, installed
+files and native harness use. `test/shared-skills-transports.test.ts` and
+`test/e2e/shared-skills-transports.test.ts` use real HTTP authentication, OAuth
+issuance and a new stdio process; they do not prove vendor-native activation.
+`test/persistence-skill-bundles.serial.test.ts` and
+`test/persistence-skill-crash.slow.test.ts` exercise typed file-set CAS and
+independent-process publication/restoration kills on both engines through
+`test/e2e/persistence-skill-bundles-postgres.test.ts`.
+
+The required `shared-skills-compatibility` CI job builds the pinned pre-feature
+executable with `scripts/build-shared-skills-baseline.sh` and supplies
+`GBRAIN_TEST_OLD_BINARY` to `test/persistence-skill-old-binary.slow.test.ts`.
+An absent old executable is an explicit skip, never old-writer evidence.
+`test/shared-skills-catalog-performance.test.ts` runs the reproducible
+10/100/1,000-skill read benchmark when `GBRAIN_TEST_SHARED_SKILLS_BENCHMARK=1`;
+its timings are diagnostic, while query-count/bound assertions are deterministic.
+The shared-skills cases under `evals/harness-instructions/` test interpretation
+separately from executed calls and native sessions.
+
 Search reliability has real-planner and transport regressions in
 `test/e2e/vector-candidate-safety-postgres.test.ts`,
 `test/e2e/search-query-contract-postgres.test.ts`,

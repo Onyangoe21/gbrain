@@ -25,6 +25,8 @@ import {
 interface ApplyMigrationsArgs {
   list: boolean;
   dryRun: boolean;
+  json: boolean;
+  dbOnlyExport?: OrchestratorOpts['dbOnlyExport'];
   yes: boolean;
   nonInteractive: boolean;
   mode?: 'always' | 'pain_triggered' | 'off';
@@ -56,6 +58,11 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
   };
   const mode = val('--mode') as ApplyMigrationsArgs['mode'];
+  const exporting = has('--export-db-only');
+  if (exporting && !val('--content-root') || has('--backup-confirmed') && has('--acknowledge-no-backup')) {
+    console.error('DB-only export requires --content-root and exactly one explicit backup choice for a non-dry run.');
+    process.exit(2);
+  }
   if (mode && !['always', 'pain_triggered', 'off'].includes(mode)) {
     console.error(`Invalid --mode "${mode}". Allowed: always, pain_triggered, off.`);
     process.exit(2);
@@ -63,6 +70,10 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
   return {
     list: has('--list'),
     dryRun: has('--dry-run'),
+    json: has('--json'),
+    dbOnlyExport: exporting ? { root: val('--content-root')!, sourceId: val('--export-source') ?? 'default',
+      confirmQuiesced: has('--confirm-quiesced'),
+      backup: has('--backup-confirmed') ? 'operator_verified' : has('--acknowledge-no-backup') ? 'acknowledged_unprotected' : undefined } : undefined,
     yes: has('--yes'),
     nonInteractive: has('--non-interactive'),
     mode,
@@ -86,6 +97,14 @@ Usage:
   gbrain apply-migrations                Run all pending migrations interactively.
   gbrain apply-migrations --yes          Non-interactive; uses default mode (pain_triggered).
   gbrain apply-migrations --dry-run      Print the plan; take no action.
+  gbrain apply-migrations --dry-run --json
+                                        Include read-only content inventories and conflicts.
+  gbrain apply-migrations --migration 0.51.9 --export-db-only --content-root <path>
+    [--export-source <id>] --dry-run --json
+                                        Preview a lossless host-side DB-only content export.
+    --confirm-quiesced                   Attest old writers and skill servers are stopped.
+    --backup-confirmed                   Attest an operational backup was verified by you.
+    --acknowledge-no-backup               Explicitly proceed without a verified backup.
   gbrain apply-migrations --list         Show applied + pending migrations.
   gbrain apply-migrations --migration vX.Y.Z
                                          Force-run a specific migration by version.
@@ -297,6 +316,7 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
     dryRun: cli.dryRun,
     hostDir: cli.hostDir,
     noAutopilotInstall: cli.noAutopilotInstall,
+    dbOnlyExport: cli.dbOnlyExport,
   };
 }
 
@@ -315,7 +335,8 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // to migrate. Exit silently for --yes / --non-interactive so postinstall
   // stays quiet; mention the init step when invoked interactively.
   if (!loadConfig()) {
-    if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
+    if (cli.dryRun && cli.json) console.log(JSON.stringify({ status: 'unconfigured', previews: [] }));
+    else if (cli.list) console.log('No brain configured. Run `gbrain init` to set one up.');
     else if (cli.dryRun) console.log('No brain configured (run `gbrain init` first). Nothing to migrate.');
     return;
   }
@@ -466,14 +487,28 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // of a filesystem-only plan that renders identically to a clean database.
   const listExit = cli.requireDb && dbProbe.status === 'unreachable' ? 1 : 0;
   if (cli.list) { printList(plan, installed, dbProbe); process.exit(listExit); }
-  if (cli.dryRun) { printDryRun(plan, installed, dbProbe); process.exit(listExit); }
+  if (cli.dryRun) {
+    const previews: Array<{ version: string; preview?: unknown; error?: string }> = [];
+    for (const migration of [...plan.applied, ...plan.partial, ...plan.pending, ...plan.wedged]) {
+      if (!migration.preview) continue;
+      try { previews.push({ version: migration.version, preview: await migration.preview(orchestratorOptsFrom(cli)) }); }
+      catch (error) { previews.push({ version: migration.version, error: error instanceof Error ? error.message : 'Inventory unavailable.' }); }
+    }
+    if (cli.json) console.log(JSON.stringify({ installed, database: dbProbe, plan: Object.fromEntries(Object.entries(plan).map(([state, entries]) => [state, entries.map((migration: Migration) => migration.version)])), previews }));
+    else {
+      printDryRun(plan, installed, dbProbe);
+      for (const preview of previews) console.log(JSON.stringify(preview));
+    }
+    process.exit(listExit || (previews.some(preview => preview.error) ? 1 : 0));
+  }
   if (cli.requireDb && dbProbe.status === 'unreachable') {
     console.error(formatDbProbeLine(dbProbe));
     console.error('--require-db: database is unreachable; aborting before orchestrators run.');
     process.exit(1);
   }
 
-  const toRun: Migration[] = [...plan.partial, ...plan.pending];
+  const toRun: Migration[] = [...plan.partial, ...plan.pending, ...plan.applied.filter(migration => migration.reconcile)]
+    .sort((left, right) => compareVersions(left.version, right.version));
   if (toRun.length === 0) {
     if (schemaBehind) {
       console.error(
@@ -549,6 +584,8 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
       if (result.status === 'partial') {
         console.log(`Migration v${m.version} finished as PARTIAL. Re-run \`gbrain apply-migrations --yes\` after resolving any pending host-work items.`);
+      } else if (result.pending_host_work) {
+        console.log(`Migration v${m.version} mechanical checks complete; host publication or client actions remain pending.`);
       } else {
         console.log(`Migration v${m.version} complete.`);
       }

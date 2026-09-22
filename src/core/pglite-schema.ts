@@ -3,6 +3,7 @@ import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from './persistence/topology-schema.t
 import { PAGE_PROJECTION_SCHEMA_SQL } from './page-state/projection-schema.ts';
 import { LEASE_TOKEN_SCHEMA_SQL } from './lease-schema.ts';
 import { PAGE_STATE_SCHEMA_SQL } from './page-state/schema.ts';
+import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
 /**
  * PGLite schema — derived from schema-embedded.ts (Postgres schema).
  *
@@ -1263,6 +1264,7 @@ ${PAGE_STATE_SCHEMA_SQL}
 ${PERSISTENCE_SCHEMA_STATEMENTS.join(';\n')};
 ${PAGE_PROJECTION_SCHEMA_SQL}
 ${PERSISTENCE_TOPOLOGY_SCHEMA_SQL}
+${SHARED_SKILLS_SCHEMA_SQL}
 
 `;
 

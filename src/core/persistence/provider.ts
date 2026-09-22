@@ -2,7 +2,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { operations } from '../operations.ts';
 import { OperationError, type AuthInfo } from '../ops/contract.ts';
-import { hasScope } from '../scope.ts';
+import { hasScope, operationScopesAllowed } from '../scope.ts';
 import { resolveSourceId } from '../source-resolver.ts';
 import { dispatchToolCall } from '../../mcp/dispatch.ts';
 import { registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
@@ -27,6 +27,7 @@ export async function createPersistenceIpcProvider(engine: BrainEngine, config: 
     if (request.brain_id !== brain.brain_id) throw new OperationError('permission_denied', 'This registration belongs to a different brain.');
     const operation = operations.find(op => op.name === request.operation);
     if (!operation || !hasScope(verified.grant.scopes, operation.scope ?? 'read')
+      || (verified.remote && !operationScopesAllowed(verified.grant.scopes, operation))
       || (verified.grant.operations !== null && !verified.grant.operations.includes(operation.name))) {
       throw new OperationError('permission_denied', 'The local writer grant excludes this operation.');
     }

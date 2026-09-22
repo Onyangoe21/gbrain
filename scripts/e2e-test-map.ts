@@ -16,7 +16,10 @@
 
 export const E2E_TEST_MAP: Record<string, string[]> = {
   "src/core/minions/errors.ts": ["test/e2e/subagent-gateway-path.test.ts", "test/e2e/delegated-http-worker.test.ts", "test/e2e/subagent-crash-replay-multi-provider.test.ts"],
-  "src/core/harness/**": ["test/e2e/harness-access.test.ts"],
+  "src/core/harness/**": ["test/e2e/harness-access.test.ts", "test/e2e/shared-skills-transports.test.ts"],
+  "src/core/shared-skills/**": ["test/e2e/shared-skills-transports.test.ts", "test/e2e/persistence-skill-bundles-postgres.test.ts"],
+  "src/mcp/skill-resources.ts": ["test/e2e/shared-skills-transports.test.ts"],
+  "src/core/scope.ts": ["test/e2e/client-grants.test.ts", "test/e2e/shared-skills-transports.test.ts"],
   "src/core/grants/**": ["test/e2e/client-grants.test.ts", "test/e2e/harness-access.test.ts", "test/e2e/delegated-grants-withdrawal.test.ts", "test/e2e/delegated-http-worker.test.ts"],
   "src/core/facts/withdrawal*.ts": ["test/e2e/delegated-grants-withdrawal.test.ts"],
   "src/commands/mcp*.ts": ["test/e2e/harness-access.test.ts"],
@@ -157,7 +160,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // postgres.js bind paths + JSONB shapes + parity vs PGLite.
   "src/core/db-lock.ts": ["test/e2e/db-lock-acquisition-token.test.ts"],
   "src/core/lease-schema.ts": ["test/e2e/db-lock-acquisition-token.test.ts"],
-  "src/core/persistence/**": ["test/e2e/persistence-chaos.test.ts", "test/e2e/persistence-runtime-matrix.test.ts"],
+  "src/core/persistence/**": ["test/e2e/persistence-chaos.test.ts", "test/e2e/persistence-runtime-matrix.test.ts", "test/e2e/persistence-skill-bundles-postgres.test.ts", "test/e2e/shared-skills-transports.test.ts"],
   "src/core/pool-budget.ts": ["test/e2e/persistence-runtime-matrix.test.ts"],
   "src/core/connection-manager.ts": ["test/e2e/persistence-runtime-matrix.test.ts", "test/e2e/pgbouncer-teardown.test.ts"],
   "src/core/postgres-engine.ts": [

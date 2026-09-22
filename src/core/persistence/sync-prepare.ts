@@ -19,6 +19,7 @@ import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
+import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 
 export interface SyncIntent extends Record<string, unknown> {
   kind: 'managed_sync_import' | 'managed_sync_delete' | 'managed_sync_checkpoint';
@@ -34,10 +35,14 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
   const binding = await getWorktreeBinding(engine, row.source_id);
   if (!binding?.local_path || String(binding.owner_epoch) !== p.ownerEpoch) throw new OperationError('owner_unavailable', 'The accepted sync owner changed.');
   const root = join(binding.local_path, binding.relative_path);
+  if (p.kind !== 'managed_sync_checkpoint') await assertKnowledgePublicationAllowed(engine, row,
+    p.path === null ? undefined : { root, path: join(root, p.path) });
   const validate = async (tx: BrainEngine) => {
     await validateSyncAuthority(tx, p.syncAuthority, row.slug);
     const current = await getWorktreeBinding(tx, row.source_id);
     if (!current || String(current.owner_epoch) !== p.ownerEpoch) throw new OperationError('owner_unavailable', 'The accepted sync owner epoch changed.');
+    if (p.kind !== 'managed_sync_checkpoint') await assertKnowledgePublicationAllowed(tx, row,
+      p.path === null ? undefined : { root, path: join(root, p.path) });
     if (p.path !== null && syncRawHash(root, p.path) !== p.rawHash) throw new OperationError('source_changed', 'The imported file changed after sync admission.');
   };
   if (p.kind === 'managed_sync_checkpoint') return { sourceExclusive: true, observedRevision: null, validate, apply: async tx => {

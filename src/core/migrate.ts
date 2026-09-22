@@ -22,6 +22,7 @@ import { GRANT_COLUMNS_SQL, GRANT_AUDIT_SCHEMA_SQL, GRANT_SPEND_COLUMNS_SQL } fr
 import { FACT_WITHDRAWAL_SCHEMA_SQL, FACT_WITHDRAWAL_BACKFILL_SQL } from './facts/withdrawal-schema.ts';
 import { repairLegacyClientGrants } from './grants/migration.ts';
 import { PROJECTION_STATISTICS_SQL, verifyProjectionStatistics } from './search/projection-statistics.ts';
+import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
 
 /**
  * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
@@ -6590,6 +6591,20 @@ CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
         CREATE INDEX IF NOT EXISTS idx_pages_projection_pending
         ON pages(source_id, page_kind, slug)
         WHERE deleted_at IS NULL AND text_projection_revision IS DISTINCT FROM knowledge_revision;`,
+    },
+  },
+  {
+    version: 162,
+    name: 'shared_brain_skills_and_membership',
+    idempotent: true,
+    sql: SHARED_SKILLS_SCHEMA_SQL,
+    verify: async (engine) => {
+      const [row] = await engine.executeRaw<{ heads: string | null; members: string | null; protocol: boolean }>(
+        `SELECT to_regclass('shared_skill_heads')::text AS heads,
+          to_regclass('shared_skill_members')::text AS members,
+          EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+            AND table_name='persistence_requests' AND column_name='target_kind') AS protocol`);
+      return Boolean(row?.heads && row?.members && row?.protocol);
     },
   },
 ];

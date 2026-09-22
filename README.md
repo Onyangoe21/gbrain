@@ -2,6 +2,14 @@
 
 **Give the agent you already use a memory you control.** GBrain stores explicit facts with their sources, supports corrections and withdrawal, and makes the same memory available across your agents. Start with keyless memory and keyword retrieval; add semantic search, synthesis, and background enrichment when you need them.
 
+**Keep skills beside knowledge.** New local brains include a content root with
+memory skills. Connected agents can join its authorized skill catalog, and an
+explicitly approved editor can publish one version for peers and the parent to
+use. Managed coding-agent installs place an owned router in the native skill
+directory; restart and real task-use verification remain separate. Existing
+sharing choices and personal edits are preserved by the staged migration.
+See [shared brain skills and migration](docs/guides/shared-brain-skills.md).
+
 ## Choose your setup
 
 1. **Add GBrain to my existing agent — recommended.** Keep your agent's identity and save memory inside its environment. No new personal-agent identity or private repository is required. Start with the guide for **[Grok Bot](docs/guides/grok-bot.md)**, **[Muse](docs/guides/muse.md)**, or **[Codex / Claude Code](docs/tutorials/connect-coding-agent.md)**. [Other harnesses](#connect-gbrain-to-your-ai-client-mcp).

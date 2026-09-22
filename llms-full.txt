@@ -1176,6 +1176,9 @@ request another capability. Have the brain owner provision the private handoff o
 the host; install it here. Keep secrets out of chat, command arguments, and Git.
 Use the actual harness adapter, verify a unique memory round trip, and report
 server checks separately from observed recall in a new harness conversation.
+Explain that a new grant follows the brain's published skills by default; offer
+--skills memory-only. Preserve existing grants and publication opt-outs. Shared
+skills do not authorize scripts, additional tools, spending, or automatic capture.
 Do not claim that generated instructions or a job ID prove a working integration.
 ```
 
@@ -1200,6 +1203,17 @@ Replace `codex` with the actual adapter identifier. `--admin-token-file` provisi
 
 Use `--dry-run` first to inspect a proposed grant without creating a client. Default output is redacted. The credential handoff is written with private permissions before any optional client installation or verification. Transfer it through a private file channel, then retain only the copies you need. Uploading credentials or backups is never automatic.
 
+New grants default to **`--skills follow`** within their approved read sources.
+Use **`--skills memory-only`** to opt out of enrollment; catalog reads can still
+be available. Following adds the explicit `skills_member_self` scope and
+catalog/membership operations, not `skill_editor` or `skill_publisher` authority.
+Fresh owned-root setup approves a limited prose-only follow policy for the
+packaged memory skills when publication is enabled. Existing brains still need
+owner approval of their source's follow/disclosure policy; migration and grant
+creation do not expand existing publication consent. Give each independent harness,
+including the parent, its own principal and private handoff. Shared credentials
+are one principal. See [shared brain skills](shared-brain-skills.md).
+
 | Profile | Access | Native MCP surface |
 | --- | --- | --- |
 | `memory-reader` | Read selected memory | Starter |
@@ -1209,7 +1223,7 @@ Use `--dry-run` first to inspect a proposed grant without creating a client. Def
 | `delegating-agent` | Memory plus explicitly bound delegation | Starter |
 | `full` | All eligible remote capabilities at grant time, including bound delegation | Full |
 
-A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
+A **profile grants authority**. A **surface selects visible tools**. Full surface does not bypass a grant, and `admin` does not imply delegation or the named shared-skill scopes. Starter includes authorized skill discovery and membership; the exact seven-tool `verbs` surface is memory-only. Thin CLI adapters use the full surface while retaining their source, operation, and write restrictions. Direct local CLI access is trusted access to the local computer; OAuth profiles do not confine a local shell.
 
 New grants snapshot operation names and source access. A later server upgrade does not silently give a snapshot-bound client new operations. Explicitly regrant to include them. Archived sources are excluded. Legacy clients with a `NULL` operation snapshot retain their prior operation behavior.
 
@@ -1229,6 +1243,14 @@ For Grok Bot, Muse, or another supported thin CLI adapter, also supply `--root /
 The installer preserves unrelated configuration and refuses an unowned or edited connection. Codex, Claude Code, and opencode receive private managed configuration. Generic adapters supply endpoint/authentication guidance; there is no universal configuration file. [Adapter reference](harness-adapters.md) lists supported mechanisms and reload steps.
 
 A configured server is only one step. Follow the adapter's reload instructions and enable the GBrain standing instruction through the harness's actual controls. Thin CLI installations write that instruction to `<ROOT>/GBRAIN-INSTRUCTIONS.md`. Grok Bot/Muse native skill activation remains a separate, visible step until observed in that harness. Generated files alone do not activate a skill.
+
+With an approved follow handoff, managed Claude Code, Codex, and opencode
+connections also install an owned, namespaced shared-brain router. Successful
+installation reports `restart_required` and `native: unverified`, not universal
+activation. Manual clients remain pending native registration. Read the
+`shared_skills` result and its `next_action`; a policy, grant, server-version,
+or ownership conflict can leave memory working while skill enrollment is pending.
+The router's freshness instruction is advisory, not a vendor-enforced hook.
 
 ## 3. Prove a memory round trip
 
@@ -1282,6 +1304,16 @@ gbrain mcp grant agent-example --client CLIENT_ID --if-version REVISION \
 
 Review the before/after grant, then repeat without `--dry-run`. `--if-version` rejects a stale edit. The client ID and secret remain unchanged. When updating a client, omit `--profile` to preserve its profile, scopes, operation snapshot, and bindings while changing only the fields you supply. An explicit profile selection regrants its eligible operations. For advanced repairs, use `gbrain auth rescope-client CLIENT_ID --help`; omitted restrictions are retained.
 
+Omitting `--skills` preserves the existing follow choice, including previously
+approved membership when reapplying a profile. Explicit custom scope/operation
+lists are respected instead of silently repaired. To explicitly
+enroll an old memory client, preview `mcp grant` with its client ID, current
+revision, and `--skills follow`, without `--profile`. Apply the reviewed change,
+recover the current private handoff, issue a token carrying the added scope,
+and reconnect in the harness. Exact follow and dedicated-editor examples are
+in [shared-skills permissions](shared-brain-skills.md#connect-each-installation).
+Do not grant editing merely because the client can write memory.
+
 Scope removals affect existing tokens immediately. Added scopes need a newly issued access token; refresh cannot expand its original scope grant. Source, operation, fence, binding, and surface changes apply on the next authenticated request. Repairing bindings benefits an existing token that already carries `agent`. TTL changes apply only to newly issued tokens. New renewable connections use one-hour access tokens; static-token adapters use 30 days. Check the receipt for the selected expiry.
 
 ## Recover an interrupted handoff
@@ -1315,6 +1347,14 @@ recover it through the host's delivery procedure first.
 Before this security migration, stop old servers and workers and take a protected backup. Start only runtimes that enforce the migrated grants. If rollout fails, disable the affected entry points and restore a compatible runtime while preserving memory and the tightened grants; do not run an older authorization implementation against the migrated database. Local installations can be released independently of hosted delegation.
 
 Remove a managed native configuration with the same private handoff and `gbrain connect ... --remove`. Disable saved skills/routines through the harness controls. Revoke the client on the host when its authority should end. Removing configuration alone does not revoke access or delete memory.
+
+Managed removal also attempts to leave its shared-skills enrollment and removes
+only unchanged owned artifacts. `left_with_retained_files` requires review of
+the preserved edits and a native restart/disable step. A server-side
+`leave_brain` alone cannot remove files on the client. Back up operational DB
+state as well as canonical content; Git alone cannot restore memberships,
+policy history, revocations, or receipts. See
+[shared-skills recovery limits](shared-brain-skills.md#troubleshoot-leave-and-recover).
 
 | Symptom | Next action |
 | --- | --- |
@@ -1682,6 +1722,7 @@ detail on demand.)
 | google connector (Gmail/Calendar/Contacts, OAuth) / credential vault | `docs/guides/google-connect.md` + the `creds/*` + `google/*` entries in `KEY_FILES.md` |
 | open loops / `gbrain waiting` / commitment extraction | `docs/guides/open-loops.md` + the `loops*` entries in `KEY_FILES.md` |
 | skill routing | `skills/RESOLVER.md` |
+| shared skills, enrollment, source packs, native routers and content migration | `docs/guides/shared-brain-skills.md` + the shared-skills entries in `KEY_FILES.md` |
 | agent bootstrap (paste-in install, hooks, `gbrain bootstrap`, sweep, keyless) | `docs/guides/bootstrap.md` + `docs/designs/AGENT_BOOTSTRAP_PLAN.md` + the KEY_FILES bootstrap cluster |
 | shipping a release / CHANGELOG / PR conventions | `docs/RELEASING.md` (ship IRON RULES stay inline below) |
 
@@ -1855,16 +1896,18 @@ routing is narrowed to what the skill actually covers.
 **Skillify loop (v0.19):** skillify (the markdown orchestration), skillpack-check
 (agent-readable health report).
 
-**Brain-resident skillpacks + advisor (v0.42.47.0, #2180):** A brain repo can carry its
-own publishable skillpack (`brain_resident: true` in `skillpack.json` + `schema_pack`);
-`gbrain skillpack init-brain-pack` scaffolds one with a 5-section machine-parseable README.
-Connecting harnesses discover it on `gbrain sources add` (Topology A advisory, bounded nag
-via `nag-state.ts`) and over MCP via the source-scoped `list_brain_skillpack` op +
-`get_skill --source_id` (gated by `mcp.publish_skills`). The bundled `gbrain-advisor` skill
-+ `gbrain advisor` op compute a ranked, read-only list of high-leverage actions from brain
-state (8 collectors in `src/core/advisor/`); `--json`+exit codes for CI/cron, local-only
-`--apply <id>` behind confirm, exposed over MCP behind `mcp.publish_advisor` (default off,
-read-only on remote). Thin-client binary install stays deferred to PR2 `build_skillpack`.
+**Shared knowledge and skills:** new local initialization creates a recorded content
+root with knowledge and a useful memory skillpack. Canonical skill revisions and
+approved dependencies publish through typed, recoverable file-set mutations; MCP
+`list_skills` / `get_skill` version 2 and `get_skill_asset` serve sealed source-scoped
+content. `join_brain` / `sync_brain_skills` / `leave_brain` track own-principal enrollment,
+not native execution proof. `skill_editor`, `skill_publisher` and
+`skills_member_self` are explicit capabilities, never implied by memory write or
+admin. Existing prose consent cannot expose scripts/assets. Managed native routers
+retain ownership hashes, conflicts and restart requirements. See
+`docs/guides/shared-brain-skills.md` for migration, exact commands and evidence limits.
+`gbrain advisor` remains read-only remotely behind the separate default-off
+`mcp.publish_advisor` gate; local application still requires confirmation.
 
 **Routing-table compression (v0.32.3.0):** `skills/functional-area-resolver/` —
 two-layer dispatch pattern for shrinking large AGENTS.md / RESOLVER.md files
@@ -2580,8 +2623,21 @@ gbrain init                           # PGLite, no server needed
 gbrain doctor --json                  # verify all checks pass
 ```
 
-The user's markdown files (notes, docs, brain repo) are SEPARATE from this tool repo.
-Use the user's chosen notes directory, or a separate managed memory directory. A Git repository is optional; do not create a private personal-agent repo for a memory-only install.
+The user's markdown files and canonical skills are SEPARATE from this tool repo.
+Fresh local init creates a combined source at
+`configDir()/content/<persistent-brain-id>/default`, normally
+`~/.gbrain/content/<persistent-brain-id>/default`, with the release-pinned
+`gbrain-memory` pack. `GBRAIN_HOME` is the parent of `.gbrain`, not `.gbrain`
+itself. Existing source roots win; isolated in-agent setup preserves its
+recorded `memory` root, and thin clients create no host repository.
+
+Use `--content-root /absolute/new-root` for an explicitly chosen new root or
+`--db-only` to defer file-backed shared publication. Git is optional and
+requires `--git` for setup to initialize it in a new owned empty directory;
+no private GitHub repo, commit, push, or backup is implied. Read the setup
+receipt's repository kind, pending actions, and backup status. Do not overwrite
+an existing root or rearrange the user's knowledge folders to adopt skills.
+See [shared brain skills](docs/guides/shared-brain-skills.md).
 
 Read `~/gbrain/docs/GBRAIN_RECOMMENDED_SCHEMA.md` and set up the MECE directory
 structure (people/, companies/, concepts/, etc.) inside the user's brain repo,
@@ -2764,6 +2820,32 @@ rather than guessing a winner — review and prune the duplicates with
 
 ## Step 5: Load Skills
 
+For a shared-brain connection, use the canonical catalog instead of silently
+scaffolding another independent copy. New `gbrain mcp grant` connections follow
+published skills by default; disclose this and offer `--skills memory-only`.
+Existing grants and publication opt-outs stay unchanged. The host owner must
+approve the source's follow/disclosure policy on an existing brain. Fresh
+owned-root setup establishes a limited prose-only policy for the packaged
+memory skills when publication is enabled; it does not replace an existing
+policy. Memory write access is not
+`skill_editor` or `skill_publisher` authority. Each independent installation,
+including the parent, needs its own principal and private handoff.
+
+Discover with `list_skills` using `schema_version: 2`, then fetch only relevant
+`get_skill` revisions and approved `get_skill_asset` dependencies. Starter
+supports these tools subject to grants; the `--surface verbs` examples below
+are deliberately memory-only. MCP resources at `gbrain://skills` offer the same
+authorized catalog, not a promise that every client loads native skills.
+
+Managed Claude Code/Codex/opencode routers report `restart_required` and native
+unverified. Follow each adapter's pending action and verify a new conversation;
+generated files and server tests are not activation evidence. The
+[generated adapter reference](docs/guides/harness-adapters.md) covers all 13
+registry IDs without claiming identical native support. No shared skill enables
+scripts, additional tools, paid calls, or capture automatically. The remaining
+scaffolding instructions apply to explicitly independent local copies, not
+managed canonical skills or caches.
+
 If you're running an agent platform (OpenClaw, Hermes, or any repo with a workspace),
 scaffold the bundled skills into it:
 
@@ -2834,7 +2916,8 @@ memory permanently.
 
 The three most important skills to adopt immediately:
 
-1. **Signal detector** (`skills/signal-detector/SKILL.md`) — fire this on EVERY
+1. **Signal detector** (`skills/signal-detector/SKILL.md`) — only after explicit
+   automatic-capture opt-in, fire this on EVERY
    inbound message. It captures ideas and entities in parallel. The brain compounds.
 
 2. **Brain-ops** (`skills/brain-ops/SKILL.md`) — brain-first lookup on every response.
@@ -2900,6 +2983,16 @@ See "The onboard surface" below for what the recommendations mean and the
 consent gates around unattended remediation.
 
 ## Upgrade
+
+For v0.51.8.0, follow the
+[mechanical shared-skills migration](skills/migrations/v0.51.8.0.md) on the host,
+starting with `gbrain apply-migrations --dry-run --json`. Stop/exclude old writers
+before `gbrain sources writer activate --shared-skills --confirm-quiesced`;
+the flag records a real operator action, not automatic quiescence. Preserve
+operational DB and content backups, consent, edited files, and grant fences.
+DB-only export, explicit regrants, parent/client reconnection, and native
+verification are separate stages; report pending stages rather than claiming
+the whole migration completed.
 
 If you installed via `bun install -g`:
 

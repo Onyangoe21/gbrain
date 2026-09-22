@@ -167,6 +167,7 @@ detail on demand.)
 | google connector (Gmail/Calendar/Contacts, OAuth) / credential vault | `docs/guides/google-connect.md` + the `creds/*` + `google/*` entries in `KEY_FILES.md` |
 | open loops / `gbrain waiting` / commitment extraction | `docs/guides/open-loops.md` + the `loops*` entries in `KEY_FILES.md` |
 | skill routing | `skills/RESOLVER.md` |
+| shared skills, enrollment, source packs, native routers and content migration | `docs/guides/shared-brain-skills.md` + the shared-skills entries in `KEY_FILES.md` |
 | agent bootstrap (paste-in install, hooks, `gbrain bootstrap`, sweep, keyless) | `docs/guides/bootstrap.md` + `docs/designs/AGENT_BOOTSTRAP_PLAN.md` + the KEY_FILES bootstrap cluster |
 | shipping a release / CHANGELOG / PR conventions | `docs/RELEASING.md` (ship IRON RULES stay inline below) |
 
@@ -340,16 +341,18 @@ routing is narrowed to what the skill actually covers.
 **Skillify loop (v0.19):** skillify (the markdown orchestration), skillpack-check
 (agent-readable health report).
 
-**Brain-resident skillpacks + advisor (v0.42.47.0, #2180):** A brain repo can carry its
-own publishable skillpack (`brain_resident: true` in `skillpack.json` + `schema_pack`);
-`gbrain skillpack init-brain-pack` scaffolds one with a 5-section machine-parseable README.
-Connecting harnesses discover it on `gbrain sources add` (Topology A advisory, bounded nag
-via `nag-state.ts`) and over MCP via the source-scoped `list_brain_skillpack` op +
-`get_skill --source_id` (gated by `mcp.publish_skills`). The bundled `gbrain-advisor` skill
-+ `gbrain advisor` op compute a ranked, read-only list of high-leverage actions from brain
-state (8 collectors in `src/core/advisor/`); `--json`+exit codes for CI/cron, local-only
-`--apply <id>` behind confirm, exposed over MCP behind `mcp.publish_advisor` (default off,
-read-only on remote). Thin-client binary install stays deferred to PR2 `build_skillpack`.
+**Shared knowledge and skills:** new local initialization creates a recorded content
+root with knowledge and a useful memory skillpack. Canonical skill revisions and
+approved dependencies publish through typed, recoverable file-set mutations; MCP
+`list_skills` / `get_skill` version 2 and `get_skill_asset` serve sealed source-scoped
+content. `join_brain` / `sync_brain_skills` / `leave_brain` track own-principal enrollment,
+not native execution proof. `skill_editor`, `skill_publisher` and
+`skills_member_self` are explicit capabilities, never implied by memory write or
+admin. Existing prose consent cannot expose scripts/assets. Managed native routers
+retain ownership hashes, conflicts and restart requirements. See
+`docs/guides/shared-brain-skills.md` for migration, exact commands and evidence limits.
+`gbrain advisor` remains read-only remotely behind the separate default-off
+`mcp.publish_advisor` gate; local application still requires confirmation.
 
 **Routing-table compression (v0.32.3.0):** `skills/functional-area-resolver/` —
 two-layer dispatch pattern for shrinking large AGENTS.md / RESOLVER.md files

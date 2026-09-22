@@ -15,6 +15,7 @@ import { parseMutationPrecondition } from './preconditions.ts';
 import { assertPurgeParams } from './purge-params.ts';
 import type { Principal } from './model.ts';
 import { normalizeSubagentPageInput } from './page-input.ts';
+import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 
 export async function requestPrincipalForContext(ctx: OperationContext): Promise<Principal> {
   if (ctx.auth?.principal) return { ...ctx.auth.principal };
@@ -92,6 +93,7 @@ export async function submitPageMutation(ctx: OperationContext,
   intent.slug = slug;
   if (ctx.remote !== false) Object.assign(intent, { source_kind: `mcp:${input.operation}`, source_uri: null, ingested_via: `mcp:${input.operation}` });
   const authority = await submissionAuthority(ctx, input.operation, sourceId, source.incarnation, slug);
+  await assertKnowledgePublicationAllowed(ctx.engine, { source_id: sourceId, source_incarnation: source.incarnation, slug });
   const snapshot = await ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
   let binding = await getWorktreeBinding(ctx.engine, sourceId);
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
