@@ -1252,6 +1252,13 @@ activation. Manual clients remain pending native registration. Read the
 or ownership conflict can leave memory working while skill enrollment is pending.
 The router's freshness instruction is advisory, not a vendor-enforced hook.
 
+Inspect this connection's local skill receipt without credentials or a live
+host using `gbrain connect --harness codex --status --json`. Supply the actual
+adapter, connection `--name`, and the recorded `--root` for thin CLI adapters.
+It reports desired/installed/acknowledged views and pending cleanup, but keeps
+`current_authority: unprobed` and `native_use: unverified`; reconnect and test
+the native session separately.
+
 ## 3. Prove a memory round trip
 
 Run the server verifier from the harness environment:
@@ -1351,7 +1358,10 @@ Remove a managed native configuration with the same private handoff and `gbrain 
 Managed removal also attempts to leave its shared-skills enrollment and removes
 only unchanged owned artifacts. `left_with_retained_files` requires review of
 the preserved edits and a native restart/disable step. A server-side
-`leave_brain` alone cannot remove files on the client. Back up operational DB
+`leave_brain` alone cannot remove files on the client. Offline or revoked access
+does not prevent local following from being disabled: inspect
+`remote_membership_pending` to distinguish local cleanup from host-acknowledged
+departure and retry the latter when possible. Back up operational DB
 state as well as canonical content; Git alone cannot restore memberships,
 policy history, revocations, or receipts. See
 [shared-skills recovery limits](shared-brain-skills.md#troubleshoot-leave-and-recover).
@@ -2846,6 +2856,14 @@ scripts, additional tools, paid calls, or capture automatically. The remaining
 scaffolding instructions apply to explicitly independent local copies, not
 managed canonical skills or caches.
 
+Isolated Grok Bot/Muse setup uses its own installation-bound router and private
+CLI registration; existing/adopted roots require explicit follow approval in
+the upgraded setup helper. Native saved-skill loading stays manual. Legacy
+full/stub harness scaffolds return a pending migration plan for an active shared
+brain rather than making another bundled copy. Follow the
+[in-agent and bridge migration steps](docs/guides/shared-brain-skills.md#existing-in-agent-installations-and-legacy-bridges)
+and preserve edited files.
+
 If you're running an agent platform (OpenClaw, Hermes, or any repo with a workspace),
 scaffold the bundled skills into it:
 
@@ -2984,8 +3002,8 @@ consent gates around unattended remediation.
 
 ## Upgrade
 
-For v0.51.8.0, follow the
-[mechanical shared-skills migration](skills/migrations/v0.51.8.0.md) on the host,
+For v0.51.9.0, follow the
+[mechanical shared-skills migration](skills/migrations/v0.51.9.0.md) on the host,
 starting with `gbrain apply-migrations --dry-run --json`. Stop/exclude old writers
 before `gbrain sources writer activate --shared-skills --confirm-quiesced`;
 the flag records a real operator action, not automatic quiescence. Preserve
@@ -3214,6 +3232,7 @@ off until the user opts in, and paid enrichment is a separate choice.
 | "use my brain over mcp", "serve my brain over mcp", "expose my brain over mcp", "gbrain mcp server", "remote mcp access to my brain", "put my brain on tailscale", "gbrain mcp expose" | `skills/remote-mcp/SKILL.md` (publish the local `serve --http` on the tailnet; Funnel only for cloud agents) |
 | "connect grok bot to my brain", "connect muse to my brain", "connect claude desktop to my brain", "reach my brain from my phone" | `skills/remote-mcp/SKILL.md` (host-side publish + per-client grant; the client-side install then follows `skills/setup/SKILL.md` / hosted access) |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
+| "connect our company brain", "connect our existing company brain", "import an existing company brain" | `skills/migrate/SKILL.md` (company repository workflow; preview and approval before import, not sanitization) |
 | "Switch embedding provider" / "migrate my embeddings" / "switch reranker" / "ZeroEntropy" / "provider_sunset" / "search stopped working after a provider shutdown" | `skills/migrations/v0.46.3.0.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
 | "Extract links", "build link graph", "populate timeline" | `skills/maintain/SKILL.md` (extraction sections) |
@@ -3286,6 +3305,14 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/README.md
 # GBrain
 
 **Give the agent you already use a memory you control.** GBrain stores explicit facts with their sources, supports corrections and withdrawal, and makes the same memory available across your agents. Start with keyless memory and keyword retrieval; add semantic search, synthesis, and background enrichment when you need them.
+
+**Keep skills beside knowledge.** New local brains include a content root with
+memory skills. Connected agents can join its authorized skill catalog, and an
+explicitly approved editor can publish one version for peers and the parent to
+use. Managed coding-agent installs place an owned router in the native skill
+directory; restart and real task-use verification remain separate. Existing
+sharing choices and personal edits are preserved by the staged migration.
+See [shared brain skills and migration](docs/guides/shared-brain-skills.md).
 
 ## Choose your setup
 
@@ -3549,6 +3576,14 @@ before treating an empty result as proof that a page is missing.
 `gbrain agent run "..."` exposes the same surface to a sub-agent through the Minions queue, with crash-safe two-phase persistence. Same answers, durable.
 
 ## How to get data in
+
+**Already have a company knowledge repository?** Say to your agent: *“Connect our
+existing company brain, preserve its files, and show me the import plan first.”*
+Try `gbrain sources demo company-brain` without keys or private data, then inspect
+your committed Markdown with `gbrain sources inspect <path> --profile company-brain`.
+The [company-brain ingestion guide](docs/guides/company-brain-ingestion.md) covers
+explicit destination approval, typed relationships, and resumable verification.
+It does not enable embeddings, sharing, schedules, or curation automatically.
 
 One command, local or hosted, synchronous receipt:
 

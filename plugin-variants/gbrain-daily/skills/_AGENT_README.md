@@ -56,7 +56,7 @@ authorized publication or managed leave/removal instead. Leaving removes only
 unchanged owned artifacts and does not revoke credentials or erase history.
 The guide in the GBrain distribution is
 `docs/guides/shared-brain-skills.md`; existing installations follow
-`skills/migrations/v0.51.8.0.md` without changing unrelated consent.
+`skills/migrations/v0.51.9.0.md` without changing unrelated consent.
 
 ## Routing — your first job
 

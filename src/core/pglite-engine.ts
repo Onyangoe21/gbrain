@@ -1,4 +1,5 @@
 import { registerManagedFilesystemEngine } from './persistence/filesystem-guard.ts';
+import { replaceDerivedLinks, type DerivedLinkOrigin, type DerivedLinkReplacementOptions } from './derived-links.ts';
 import { trackPgliteDatabase, PgliteClosingError, notifyPgliteOpened } from './pglite-lifecycle.ts';
 import { mutatePageTag } from './page-state/tags.ts';
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
@@ -357,6 +358,7 @@ export function computeSnapshotSchemaHash(
     for (const file of [
       'migrate.ts', 'pglite-schema.ts', 'fts-language.ts', 'vector-index.ts', 'ai/defaults.ts',
       'search/projection-statistics.ts',
+      'company-brain/receipt-schema.ts',
       'shared-skills/schema-all.ts', 'shared-skills/schema.ts', 'shared-skills/membership-schema.ts', 'shared-skills/persistence-schema.ts',
       'timeline-dedup-repair.ts', 'pages-upsert-arbiter.ts', 'link-extraction.ts',
       'grants/schema.ts', 'grants/migration.ts', 'grants/model.ts', 'grants/service.ts', 'grants/profiles.ts',
@@ -3828,6 +3830,10 @@ export class PGLiteEngine implements BrainEngine {
   async addLinksBatch(links: LinkBatchInput[], opts?: BatchOpts): Promise<number> {
     if (links.length === 0) return 0;
     return this.batchRetry(opts?.auditSite ?? 'addLinksBatch', opts?.signal, () => this._addLinksBatchOnce(links), links.length);
+  }
+
+  async replaceDerivedLinks(origin: DerivedLinkOrigin, links: LinkBatchInput[], opts?: DerivedLinkReplacementOptions) {
+    return replaceDerivedLinks(this, origin, links, opts);
   }
 
   private async _addLinksBatchOnce(links: LinkBatchInput[]): Promise<number> {
