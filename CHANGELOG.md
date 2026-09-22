@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.51.8.1] - 2026-09-22
+## [0.52.1.1] - 2026-09-22
 
 **Your agent can now open administration and guide another agent through a working connection.**
 
@@ -33,7 +33,7 @@ Follow [MCP administration](docs/mcp/ADMIN.md) for registration, native OAuth/PK
 
 Owner administration requires the separate owner credential. An OAuth client's `admin` scope does not open the dashboard. After a server restart, open a fresh owner session and restart pending authorization in the native client. Token invalidation leaves accepted jobs subject to their existing grant checks; revocation or deletion denies them at their next authority check. Already admitted external work may complete.
 
-## To take advantage of v0.51.8.1
+## To take advantage of v0.52.1.1
 
 Run `gbrain upgrade` on the server host and on machines using the CLI, then restart the existing server through its usual service manager. Verify owner access with the read-only `mcp admin clients` command above, then open a fresh owner link. This release adds no database migration. Existing grants and token invalidations remain in effect. Keep the configured bootstrap credential private and stable across restarts; follow the runbook's headless recovery steps if it has been lost.
 
@@ -55,7 +55,97 @@ Run `gbrain upgrade` on the server host and on machines using the CLI, then rest
 - Add a required pinned Chromium browser lane exercising shipped embedded assets, plus HTTP, credential-redaction, lifecycle-race, and instruction coverage.
 - Stabilize native Codex test fixtures with explicit per-tool approval and bounded MCP startup waiting; isolate provider credentials and home directories in keyless fixtures. Preserve behavioral and security assertions.
 - Update existing HTTP message assertions to check the owner-specific authentication and retry remedies.
+- Preserve complete JSON audit reports in large-checkout tests and allow bounded cleanup of temporarily busy Windows test executables.
 
+## [0.52.1.0] - 2026-09-22
+
+**A search result opens the page it found, and routine repair stays routine.**
+
+If two sources contain a note with the same name, opening a search result now
+keeps the source that produced it. Old saved identifiers still work when there
+is one readable match. An ambiguous identifier asks you to search again instead
+of choosing another page. Current access permissions still apply when you open
+the result, including after an operator changes a grant.
+
+Maintenance can inspect a writer problem without changing who owns the brain's
+files. Deliberate ownership changes remain available to both human operators
+and provisioning scripts, but now require the particular action and the state
+the operator reviewed. If that state changed, the request stops for another look.
+
+Keyless installations also get a safer upgrade path. You can keep daemon
+installation and paid reindexing off while applying the remaining migrations.
+An older metadata migration preserves keyword retrieval for already-indexed
+pages, and diagnostics no longer prescribe a destructive embedding repair for
+a brain whose embeddings are disabled.
+
+### What to expect
+
+| Situation | Result |
+|---|---|
+| Two sources share a slug | Pass the search result's opaque `id` unchanged to `fetch`; it stays source-qualified. |
+| A saved ID becomes unavailable | Fetch refuses rather than substituting another source or a stale alias target. |
+| Routine maintenance hits an owner problem | Inspect writer status first; do not claim or activate a topology as a quick repair. |
+| Switching search modes | Query expansion defaults are unchanged: `query` requests it in every mode; `--no-expand` opts out. |
+
+The documentation now separates durable shared preferences from local harness
+configuration, describes when remote graph links need maintenance, and names
+which configured providers receive text. The large file index is split into
+linked subsystem references so agents can read the relevant contract without
+loading the entire index.
+
+## To take advantage of v0.52.1.0
+
+For a memory-only installation:
+
+```bash
+GBRAIN_NO_AUTOPILOT_INSTALL=1 GBRAIN_NO_REEMBED=1 gbrain upgrade --no-autopilot-install
+gbrain sources writer status --json
+gbrain search "a known phrase from your notes" --json
+```
+
+The two opt-outs are independent; they do not skip other migrations. Existing
+service deployments should follow their coordinated upgrade procedure instead.
+Read [the migration guide](skills/migrations/v0.52.1.0.md) before updating writer
+automation: claim, activation and transfer require an action-specific intent and
+the unchanged fingerprint from reviewed status. Do not automatically refresh that
+fingerprint just to make a refused request pass.
+
+### Itemized changes
+
+#### Correctness and recovery
+
+- Source-qualified search and query IDs use canonical versioned JSON/base64url
+  encoding. Fetch independently applies current grants, visibility and live-source
+  policy, rejects ambiguous legacy IDs, and keeps exact-address precedence over
+  stale aliases even when the exact page is hidden or soft-deleted.
+- Writer administration binds each mutation to reviewed topology state and checks
+  it again inside the transaction. Status does not create a host identity, and
+  CLI output safely renders PostgreSQL ownership epochs.
+- Upgrade propagates the no-autopilot option through package hooks and migration
+  orchestration. Metadata grandfathering preserves only already-valid text
+  projections under canonical guards and row locks; unsealed rows stay unsealed.
+- Disabled primary embeddings no longer trigger irrelevant resizing or sunset
+  advice. Explicit custom-column errors and independently enabled rerankers
+  remain diagnosable.
+
+#### Documentation and cost visibility
+
+- Primary guides align preference memory, local configuration, remote graph
+  extraction, provider disclosure and full-backup boundaries. Search-mode output
+  distinguishes retained bundle defaults from effective operation behavior.
+- README and agent entry points route to bounded subsystem references. Existing
+  historical material remains available, with an explicit warning on obsolete
+  installation commands.
+
+### For contributors
+
+- The heavy sync check coordinates overlapping ownership on real PostgreSQL
+  instead of counting eventual successes. Hermes fetches immutable reviewed
+  installer bytes with checksum enforcement; OpenCode keyless and opt-in
+  credentialed coverage are separate and report omitted coverage explicitly.
+- A bounded 3,600-page reindex fixture verifies transaction completion and crash
+  recovery. It did not reproduce the reported macOS aged-store hang and is not
+  presented as a fix or a performance improvement.
 ## [0.51.8.0] - 2026-09-22
 
 **Connect a company knowledge repository without rewriting its files.**

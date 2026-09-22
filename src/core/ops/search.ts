@@ -380,7 +380,7 @@ const query: Operation = {
     types: { type: 'array', items: { type: 'string' }, description: TYPES_PARAM_DESCRIPTION },
     // #3800: subagent token economy — per-call snippet cap.
     snippet_chars: { type: 'number', description: SNIPPET_CHARS_PARAM_DESCRIPTION },
-    expand: { type: 'boolean', description: 'Enable multi-query expansion (default: true)' },
+    expand: { type: 'boolean', description: 'Request multi-query expansion (default: true in every search mode, regardless of search.expansion). Set false to opt out. Requires configured embedding and expansion providers; a cloud expander receives the query and may charge for the call. Response metadata expansion_applied reports whether variants were actually used.' },
     detail: { type: 'string', description: 'Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)' },
     mode: { type: 'string', description: 'Search mode (conservative|balanced|tokenmax). Local callers only; remote uses configured mode.' },
     // v0.20.0 Cathedral II Layer 10 C1/C2: language + symbol-kind filters.
@@ -539,6 +539,7 @@ const query: Operation = {
             reason: info.reason === 'deadline' ? 'timeout' : info.reason ?? 'candidate_budget' }];
         },
       });
+      stampDeepResearchIds(results);
       imageMeta.retrieved_count = results.length;
       ctx.emitResponseMeta?.('retrieval', await buildRetrievalResponseMeta(ctx, querySourceScope, queryText ?? '', results, imageMeta, { types }));
       return applySnippetCap(results, snippetCap);
@@ -748,6 +749,8 @@ const query: Operation = {
       }
     }
     const latency_ms = Date.now() - startedAt;
+
+    stampDeepResearchIds(results);
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.
