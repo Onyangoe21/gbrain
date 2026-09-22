@@ -139,6 +139,7 @@
   "migrations/v0.50.0.0.md": "f221a6c907437a7500d2ad8ee9fdc5e14821514d4c1e72164b7aafac0bd5d89b",
   "migrations/v0.50.2.0.md": "ff1aab621479eeda5f210e026169ba584a1c402536cabddc7c387a617934b6f1",
   "migrations/v0.51.0.0.md": "c1f1f6ddcea71cdcfb4d9a85200564b59cc64e7d2ec29fda8c98335a8a7afdd5",
+  "migrations/v0.52.1.0.md": "3cf11cd1c131880d3feba3c4cf8a3202b22431170dd6d2381b784813ac4196a6",
   "migrations/v0.7.0.md": "97c2740445a10b1c5c7123c17dbd625fa27a94095b85d27c2b278da756c4c59a",
   "migrations/v0.8.0.md": "1919ff8b8f3680612ff888e7cfcc0d86ece5d5304ae19af4497bdf40b050561a",
   "migrations/v0.8.1.md": "fad7341cfb5e02545fb8a23221d12ab395fc3d8db15d1d8ee8a18844aea6563a",
