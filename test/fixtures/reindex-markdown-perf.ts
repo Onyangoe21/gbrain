@@ -37,9 +37,9 @@ if (mode === 'trace') {
         await lockPageKeys.call(this, keys);
       };
       const executeRaw = tx.executeRaw;
-      tx.executeRaw = async function<R = Record<string, unknown>>(this: BrainEngine, sql: string, params?: unknown[]): Promise<R[]> {
-        if (sql.trim().toUpperCase().startsWith('ANALYZE ')) statistics = true;
-        return await executeRaw.call(this, sql, params) as R[];
+      tx.executeRaw = async function<R = Record<string, unknown>>(this: BrainEngine, ...args: Parameters<BrainEngine['executeRaw']>): Promise<R[]> {
+        if (args[0].trim().toUpperCase().startsWith('ANALYZE ')) statistics = true;
+        return await executeRaw.apply(this, args) as R[];
       };
       const result = await fn(tx);
       bodyDone = performance.now();
