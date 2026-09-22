@@ -109,6 +109,8 @@ approved. Existing source files and access grants are unchanged.
 
 ### Itemized changes
 
+- Complete schema hashing before an idle CLI can exit, without changing existing
+  schema or alias fingerprints.
 - Resolve engine-backed schema and type closure against the selected brain,
   with explicit empty type filters and schema-read failures failing closed.
 - Enforce page/target/phrase constraints together, align filesystem type
