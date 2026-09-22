@@ -4,7 +4,7 @@
 
 **not-reproduced-with-evidence** on the synthetic Linux fixture below. This is
 not a fix or a claim that the reported macOS failure is resolved. No production
-reindex or engine behavior was changed.
+reindex or engine behavior was changed for this investigation.
 
 Issue #5284 reports PGLite 0.4.3 spinning inside COMMIT after approximately
 2,600–3,300 writes, with a stalled event loop and no recovery after 48 minutes.
@@ -19,6 +19,11 @@ diff in `reindex.ts`, `import-file.ts`, `pglite-engine.ts`, or
 `pglite-lifecycle.ts` between those revisions, or between the issue's
 `d13aa74` and current master. The persistence performance release is not
 evidence that this COMMIT failure was fixed.
+
+These measurements are pinned to the two revisions named above. Later upstream
+revisions, including `44f96ed` (v0.51.7.0), change projection recovery and related
+engine paths. The table below is not a performance measurement of those later
+revisions; the retained slow fixture's shipping validation is reported separately.
 
 ## Reproduction
 
@@ -112,9 +117,10 @@ All of these commands completed with exit status zero:
   `src` and `test`, not `scripts`).
 - `bash scripts/check-test-isolation.sh`: passed.
 
-The full CI, Postgres E2E suite, macOS runtime, embedding-enabled mode, and
-the reported large aged store were not exercised. This is focused local
-verification, not a claim that CI or the upstream issue is resolved.
+These measurement runs did not exercise the full CI, Postgres E2E suite, macOS
+runtime, embedding-enabled mode, or the reported large aged store. This is
+focused local evidence for the named revisions, not a claim that the upstream
+issue is resolved.
 
 ## Remaining prerequisite
 
