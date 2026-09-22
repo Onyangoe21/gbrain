@@ -71,6 +71,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     return { ...await runtime.connectCompanyBrain(engine, input) };
   }
   if (operation === 'writer_sync') return (await import('./sync-administration.ts')).runAuthenticatedSyncSlice(engine, params);
+  if (operation === 'writer_reindex_code') return (await import('./reindex-administration.ts')).runAuthenticatedCodeReindex(engine, params);
   if (operation === 'source_add' || operation === 'source_lifecycle') {
     const { managedPersistenceEnabled } = await import('./ownership.ts');
     if (!await managedPersistenceEnabled(engine)) throw new OperationError('writer_coordinator_required',

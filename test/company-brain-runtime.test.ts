@@ -86,6 +86,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
       expect(readFileSync(path, 'utf8')).toBe(body);
       expect(existsSync(join(root, '.gitignore'))).toBe(false);
       expect(await engine.getPage('readme', { sourceId })).toBeNull();
+      expect(await engine.executeRaw('SELECT slug FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND text_projection_revision IS DISTINCT FROM knowledge_revision', [sourceId])).toEqual([]);
       expect((await engine.getLinks('customers/account', { sourceId })).some(link => link.to_slug === 'people/operator' && link.link_type === 'owned_by')).toBe(true);
       expect(await engine.executeRaw('SELECT t.summary FROM timeline_entries t JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1', [sourceId])).toContainEqual({ summary: 'Account approved.' });
       const unchanged = await resumeCompanyBrain(engine, input);
@@ -98,6 +99,7 @@ for (const managed of [false, true]) describe(`company source lifecycle ${manage
       const links = await engine.getLinks('customers/account', { sourceId });
       expect(links.some(link => link.to_slug === 'people/replacement' && link.link_type === 'owned_by')).toBe(true);
       expect(links.some(link => link.to_slug === 'people/operator' && link.link_type === 'owned_by')).toBe(false);
+      expect(await engine.executeRaw('SELECT slug FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND text_projection_revision IS DISTINCT FROM knowledge_revision', [sourceId])).toEqual([]);
     }
   }), 120_000);
   test('graph failure retains real cursors beyond GC and zero-diff resume completes only missing phases', async () => withEnv({ GBRAIN_HOME: home }, async () => {

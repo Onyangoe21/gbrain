@@ -84,7 +84,7 @@ test('private administration delegates to the actual resident PGLite owner and r
   });
 }, 120_000);
 
-test('preview refuses missing migration 160 without creating any database objects', async () => {
+test('preview refuses missing receipt migration without creating any database objects', async () => {
   const root = await fixture();
   const engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
   try {

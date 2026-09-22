@@ -2,14 +2,22 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.54.0.0] - 2026-09-21
+## [0.51.8.0] - 2026-09-22
 
-**Connect an existing company repository without rewriting it.**
+**Connect a company knowledge repository without rewriting its files.**
 
-GBrain can now take a reviewed, committed company knowledge repository through
-source registration, keyless indexing, relationship reconciliation, and readback
-verification. You choose the initialized company brain and a new source explicitly.
-The command shows its destination and access implications before it writes.
+You can now preview a company's committed notes, review the import plan, and
+connect them to an explicitly chosen company brain and new source. The optional
+company vocabulary keeps customers, competitors, products, ownership, and decision
+history distinct. Connecting indexes the approved files without paid services,
+checks their relationships, and returns a durable receipt with cited evidence and
+visible gaps. A fictional demo lets you try the same pipeline without keys or a
+saved brain.
+
+Installing this release does not activate the company vocabulary, import a
+repository, rewrite pages, or change access grants. Existing personal brains keep
+their current schema. Embeddings, schedules, imported skills, and sharing remain
+separate opt-in choices.
 
 **Say to your agent:** “Connect our existing company brain, preserve its files,
 and show me the plan before importing.”
@@ -17,171 +25,96 @@ and show me the plan before importing.”
 ### Try it, then connect
 
 ```bash
+gbrain schema validate company-brain
 gbrain sources demo company-brain
 gbrain sources inspect ./company-wiki --profile company-brain --json --out ./company-plan.json
 gbrain sources connect --plan ./company-plan.json --brain company-example --source wiki
 ```
 
-The demo runs fictional data through the real pipeline without keys or a saved
-brain. A successful real connection returns a durable receipt and example
-ownership/supersession evidence from the imported source, with citations. Missing
-examples remain explicit gaps. This is not an automatic privacy audit or a grant
-to share sensitive knowledge.
+Connect requires an initialized, compatible dedicated company brain. Inspection
+needs no database and makes no source edits.
 
 | Situation | What GBrain does |
 | --- | --- |
-| Interrupted indexing or graph work | Retains the approved revision and resumes the missing stage |
+| Indexing or relationship extraction is interrupted | Resumes the missing stage from the approved revision |
 | A response is lost | Replays the exact request ID instead of duplicating the source |
-| Source selection or extractor approval changes | Refuses rather than silently broadening or changing the run |
-| A source page would need rewriting | Stops for an explicit source correction |
-| Existing clients have broad access | Shows that implication; changes no client grants |
+| Saved plan, selection, schema, or extractor approval no longer matches | Refuses rather than silently changing the run |
+| Ownership or decision history is unclear | Shows gaps rather than inventing relationships |
+| Existing clients have broad access | Shows that implication without changing their grants |
 
-Embeddings, schedules, curation, imported skills, and sharing stay opt-in. Ordinary
-sync remembers the source's approved selection and remains keyless and writeback-free.
-Use the existing source-scoped sharing controls only after separately approving them.
-
-## To take advantage of v0.54.0.0
+## To take advantage of v0.51.8.0
 
 Run `gbrain upgrade`, then `gbrain doctor` on the intended brain host. If migration
-160 did not complete, run `gbrain apply-migrations --yes` before connecting.
-Existing personal brains require no schema switch. Company connect requires a
-trusted local host; ordinary remote OAuth access is not administration authority.
+162 did not complete, run `gbrain apply-migrations --yes` before connecting. Do not
+switch an existing personal brain's schema merely to inspect the optional preset.
+Company connect requires a trusted local host; ordinary remote OAuth access is not
+administration authority.
 
 Read [the company ingestion guide](docs/guides/company-brain-ingestion.md) for
-non-interactive approval, request replay, recovery, and the first release's scope:
-committed Markdown, a new source, and a compatible dedicated company brain.
-Mixed-schema federation and in-place semantic reapproval are not enabled.
+explicit approval, request replay, and recovery. This release supports committed
+Markdown and a new source in a compatible dedicated company brain. It is not an
+automatic privacy audit; mixed-schema federation and in-place semantic reapproval
+are not enabled.
 
 ### Itemized changes
 
-- Add guided `sources connect`, a real-pipeline offline company demo, source-scoped
-  completion evidence, and durable receipt status.
-- Integrate committed-only input with existing managed and legacy sync. Preserve
-  writer ownership, source incarnation, revision guards, and canonical consistency.
-- Pin selection, limits, schema, extraction identity, and repository identity to
-  immutable approval metadata; keep incomplete checkpoint references through cleanup.
-- Keep JSON results separate from progress, require explicit destinations and
-  non-interactive approval, and refuse stale plans and unsupported privacy labels.
-- Route company imports through migration/cold-start guidance without triggering
-  personal-brain sanitization, automatic source edits, or Git history changes.
-- Build on the company vocabulary and fictional corpus contributed by @mattzimak.
+- Bundle the optional `company-brain` schema and fictional compatibility corpus,
+  adapted from @mattzimak's company-brain project with MIT attribution.
+- Resolve typed imports and queries against the selected brain's schema, refuse
+  unreadable schemas, and keep product aliases and folder inference distinct from
+  company types. Filesystem typing incorporates #5153, contributed by @mattzimak.
+- Reconcile only origin-attributed derived links, preserve manual links, and check
+  both relationship endpoints and their revisions. Legacy frontmatter links without origin
+  metadata stop for review rather than losing provenance.
+- Add committed-repository inspection, guided `sources connect`, and an offline
+  demo using the real ingestion pipeline. Completion evidence stays source-scoped
+  and cites imported pages; unsupported or ambiguous references remain gaps.
+- Migration 162 adds durable source-scoped ingestion receipts, immutable approval
+  fingerprints, and protected incomplete checkpoints for resumable imports.
+- Preserve approved file selection in managed and legacy sync without source
+  writeback or paid enrichment. Reject stale plans and unsupported privacy labels,
+  retain writer ownership and revision guards, and keep progress out of JSON output.
+- Complete schema hashing before CLI exit without changing existing fingerprints.
 
-## [0.53.0.0] - 2026-09-21
+## [0.51.7.0] - 2026-09-21
 
-**Keep a company's vocabulary and relationships tied to the right brain.**
+**Search can find your pages without quietly mistaking an unfinished index for an empty brain.** Large brains no longer rely on a misleading estimate that made vector search scan every chunk. Filtered searches can look beyond their first batch of candidates, and they tell you when their work limit still leaves the answer incomplete. Keyword results stay stable between repeated requests and adjacent pages.
 
-Typed imports and queries now use the selected database's schema rather than
-quietly relying on an unrelated host configuration. If that schema cannot be
-read, typed retrieval refuses instead of answering under another vocabulary.
-The company preset also checks both sides of its relationship rules, so a link
-to a decision does not become meeting attendance.
+Code and Markdown recovery now use the same guarded preparation as normal indexing. Code metadata can be repaired while the resident writer owns the database, without changing your original files or paying to embed them again. Existing vectors survive only when their content and model provenance still match. Search and doctor distinguish pending projections from a genuine miss, even when some results are already available.
 
-Database link extraction replaces only the derived relationships owned by each
-page. Changed owners and targets no longer leave old derived edges behind;
-manual links remain. A failed replacement rolls back, and a target changed
-during extraction cannot be stamped as freshly processed.
+**Say to your agent:** *"Check whether my search index is ready, and repair code metadata without spending on embeddings."*
 
-### Use the existing commands
+### How to use it
 
-```bash
-gbrain schema active
-gbrain extract links --source db --source-id wiki --include-frontmatter
-```
+Upgrade normally, then run `gbrain doctor`. Keep the upgraded resident `gbrain serve` running to drain queued projection rebuilds. For code metadata repair, use `gbrain reindex-code --force --no-embed`; use `--source <id>` to restrict the work. Authorize `gbrain embed --stale` separately if vectors are still missing.
 
-Before importing an existing company checkout, preview its committed contents
-without a database or source edits:
+| Situation | What you can now see |
+|---|---|
+| A filtered vector scan reaches its work limit | `vector_candidates_incomplete`, not a false clean miss. |
+| Some visible pages still need a current text projection | `projection_pending`, including alongside nonempty results. |
+| The readiness probe cannot run | `projection_status_unknown`, rather than an unsupported claim that everything is ready. |
+| A query starts or ends at an exact date boundary | Inclusive public bounds, including the final microseconds of a date-only upper bound. |
 
-```bash
-gbrain sources inspect ./company-wiki --profile company-brain --json
-```
+### Things to watch
 
-Use the source that actually holds the repository. Legacy frontmatter links
-without origin metadata stop for review rather than being guessed away or
-deleted. This release does not automatically retype pages, activate the company
-preset, or import a repository.
+HNSW remains approximate. Postgres can use a server-cancelled exact fallback within its remaining search budget; PGLite reports an unresolved shortfall rather than pretending a timer stopped its database work. A text-ready page may still need embeddings. CLI JSON keeps its result-array format and sends incompleteness notices to stderr; MCP exposes retrieval metadata in its response envelope.
 
-## To take advantage of v0.53.0.0
+## To take advantage of v0.51.7.0
 
-Run `gbrain upgrade`. If schema application was interrupted, run
-`gbrain apply-migrations --yes` on the intended brain host, then `gbrain doctor`.
-The new receipt table is passive until a company ingestion run is explicitly
-approved. Existing source files and access grants are unchanged.
+`gbrain upgrade` should apply the schema changes automatically. If schema maintenance failed, run `gbrain apply-migrations --yes` with an authorized database maintenance role, then run `gbrain doctor`. Statistics hidden by row-security policy are not treated as absent. Your agent can follow `skills/migrations/v0.51.7.0.md`; no global planner settings, vector-index rebuild, provider change or automatic embedding spend is required.
 
 ### Itemized changes
 
-- Complete schema hashing before an idle CLI can exit, without changing existing
-  schema or alias fingerprints.
-- Resolve engine-backed schema and type closure against the selected brain,
-  with explicit empty type filters and schema-read failures failing closed.
-- Enforce page/target/phrase constraints together, align filesystem type
-  inference, and reconcile derived links with origin and endpoint revision fences.
-  Filesystem typing incorporates the behavior proposed in #5153, contributed by
-  @mattzimak.
-- Add committed-repository inspection primitives and share source-local alias,
-  title, and basename resolution with graph reconciliation. Ambiguous or
-  unsupported references remain visible gaps.
-- Migration 160 adds source-scoped durable ingestion receipts with immutable
-  approval fingerprints and protected incomplete checkpoints. This is the storage
-  foundation, not automatic source connection.
-
-## [0.52.0.0] - 2026-09-21
-
-**Keep the vocabulary of a company knowledge repository.**
-
-GBrain now includes an optional company-brain schema adapted from
-@mattzimak's company-brain project. It declares customers, competitors,
-suppliers, decisions, weekly briefs, and company reference pages alongside the
-existing base vocabulary. Products remain distinct from companies when inferred
-from their folders or selected by type.
-
-The preset has no normalization rules or automatic maintenance phases. Installing
-or upgrading GBrain does not activate it, rewrite existing pages, install agent
-skills, or change who can access a brain. Existing personal brains keep their
-current schema.
-
-### Inspect the preset
-
-```bash
-gbrain schema validate company-brain
-gbrain schema show company-brain
-```
-
-The schema is included in compiled binaries as well as source installs. There is
-no second repository to clone or schema file to copy. Owners who deliberately
-choose this vocabulary for a dedicated GBrain home can activate it with
-`gbrain schema use company-brain`; this changes the home's active vocabulary,
-not the contents of a company repository. It is not a source registration or
-an automatic import command.
-
-| Company knowledge | Preserved vocabulary |
-| --- | --- |
-| Customer and competitor pages | Separate customer and competitor types |
-| Product and company pages | Separate types and query aliases |
-| Ownership and decision history | Owner, supersedes, and attendee field mappings |
-| Existing page types | No inherited catch-all normalization rules |
-
-## To take advantage of v0.52.0.0
-
-Run `gbrain upgrade`, then `gbrain schema validate company-brain` to verify that
-the optional preset is available. Existing brains require no migration or
-configuration change. Do not change an existing personal brain's schema merely
-to inspect the preset.
-
-### Itemized changes
-
-- Bundle the optional `company-brain` schema with the normal schema registry and
-  compiled assets. Contributed by @mattzimak; adapted with MIT attribution.
-- Separate product aliases and folder inference from the inherited company type
-  without changing `gbrain-base-v2` for other users.
-- Add a generic fictional fifteen-page compatibility sample and tests for exact
-  type distribution, relationship references, inherited schema lint, and the
-  bundled preset's read-only mutation guard.
+- Schema migrations 160 and 161 add verified current-projection expression statistics and the pending-projection lookup index. Bulk import, sync, reindex and drained recovery refresh statistics outside page locks.
+- Both engines separate candidate, iterative-scan and pagination limits; preserve scope and visibility filters; and surface incomplete candidate pools through hybrid search, CLI and MCP.
+- Postgres relaxed keyword retries prefer index access locally. Keyword candidate and result ordering are deterministic; caseless CJK terms use LIKE while case-sensitive alphabets retain ILIKE.
+- Public `since`/`until` comparisons preserve inclusivity and timestamp precision. Independent atoms no longer receive transcript-session demotions.
+- Managed-safe code reindexing and shared Markdown/code preparation preserve fenced metadata, valid vectors and incoming graph edges; rebuilt outgoing edges become eligible for resolution again. Resolver batches and projection replacement share ordered guards, so a concurrent old resolver cannot certify new edges. Code reads enforce current live projections, and recursive operations do not reuse stale traversal caches.
+- Contributed by @time-attack (#5126, keyword ordering), @morven-ai (#5169, CJK operator selection), @Laochaleun (#5245, Markdown projection preparation), and @tarush1989 (#5085, atom diversification). Thanks to the issue reporters for the planner and retrieval reproductions.
 
 ### For contributors
 
-- The Postgres contention fixture waits for setup lock ownership before creating
-  the contention it tests. Pending-receipt and same-ID replay assertions are
-  unchanged. Adapted from #5240, contributed by @Masashi-Ono0611.
+- Required PgBouncer execution checks no longer misclassify passing output when the summary reader exits early. Native-lock contention fixtures wait for setup ownership before asserting write exclusion, without changing the contention assertions.
 
 ## [0.51.6.0] - 2026-09-21
 

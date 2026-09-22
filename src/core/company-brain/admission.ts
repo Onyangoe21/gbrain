@@ -72,7 +72,7 @@ async function assertIngestionStorage(engine: BrainEngine): Promise<void> {
   const [storage] = await engine.executeRaw<{ receipts: string | null; persistence: string | null; policy: boolean }>(
     `SELECT to_regclass('source_ingestion_receipts')::text AS receipts,to_regclass('persistence_brain')::text AS persistence,
       EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='source_ingestion_receipts' AND column_name='policy_fingerprint') AS policy`);
-  if (!storage?.receipts || !storage.persistence || !storage.policy) throw new OperationError('destination_not_ready', 'The selected brain needs company ingestion migration 160 with immutable policy receipts.',
+  if (!storage?.receipts || !storage.persistence || !storage.policy) throw new OperationError('destination_not_ready', 'The selected brain needs company ingestion migration 162 with immutable policy receipts.',
     'Run gbrain apply-migrations --yes against the explicitly selected brain, then preview again.');
 }
 

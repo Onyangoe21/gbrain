@@ -54,7 +54,7 @@ export function sourceIngestionReceiptTests(label: string, getEngine: () => Brai
       }
       const indexes = await engine.executeRaw<{ indexname: string }>("SELECT indexname FROM pg_indexes WHERE tablename='source_ingestion_receipts'");
       expect(indexes.map(row => row.indexname)).toContain('source_ingestion_receipts_retention');
-      expect(Number(await engine.getConfig('version'))).toBeGreaterThanOrEqual(160);
+      expect(Number(await engine.getConfig('version'))).toBeGreaterThanOrEqual(162);
       expect((await beginSourceIngestionReceipt(engine, input)).schemaFingerprint).toBe(input.schemaFingerprint);
       expect((await read())?.policyFingerprint).toBe(input.policyFingerprint);
     });

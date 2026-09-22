@@ -27,7 +27,7 @@ description: Preserve existing company knowledge, ownership, and decision histor
 author: Matt Zimak and GBrain contributors
 license: MIT
 homepage: https://github.com/mattzimak/gbrain-company-brain
-gbrain_min_version: 0.52.0.0
+gbrain_min_version: 0.51.8.0
 extends: gbrain-base-v2
 borrow_from: []
 mapping_rules: []
