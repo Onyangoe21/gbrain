@@ -280,6 +280,14 @@ before treating an empty result as proof that a page is missing.
 
 Start with an explicit fact or a notes folder; opt into connectors, capture, and enrichment separately.
 
+**Already have a company knowledge repository?** Say to your agent: *“Connect our
+existing company brain, preserve its files, and show me the import plan first.”*
+Try `gbrain sources demo company-brain` without keys or private data, then inspect
+your committed Markdown with `gbrain sources inspect <path> --profile company-brain`.
+The [company-brain ingestion guide](docs/guides/company-brain-ingestion.md) covers
+explicit destination approval, typed relationships, and resumable verification.
+It does not enable embeddings, sharing, schedules, or curation automatically.
+
 **Say to your agent:** *"Remember this with its source"* — *"What should I import first?"*
 
 [Data ingestion guide](docs/guides/data-ingestion.md) covers files, conversations, connectors, Google data, and capture commands.

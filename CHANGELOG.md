@@ -91,6 +91,80 @@ fingerprint just to make a refused request pass.
 - A bounded 3,600-page reindex fixture verifies transaction completion and crash
   recovery. It did not reproduce the reported macOS aged-store hang and is not
   presented as a fix or a performance improvement.
+## [0.51.8.0] - 2026-09-22
+
+**Connect a company knowledge repository without rewriting its files.**
+
+You can now preview a company's committed notes, review the import plan, and
+connect them to an explicitly chosen company brain and new source. The optional
+company vocabulary keeps customers, competitors, products, ownership, and decision
+history distinct. Connecting indexes the approved files without paid services,
+checks their relationships, and returns a durable receipt with cited evidence and
+visible gaps. A fictional demo lets you try the same pipeline without keys or a
+saved brain.
+
+Installing this release does not activate the company vocabulary, import a
+repository, rewrite pages, or change access grants. Existing personal brains keep
+their current schema. Embeddings, schedules, imported skills, and sharing remain
+separate opt-in choices.
+
+**Say to your agent:** “Connect our existing company brain, preserve its files,
+and show me the plan before importing.”
+
+### Try it, then connect
+
+```bash
+gbrain schema validate company-brain
+gbrain sources demo company-brain
+gbrain sources inspect ./company-wiki --profile company-brain --json --out ./company-plan.json
+gbrain sources connect --plan ./company-plan.json --brain company-example --source wiki
+```
+
+Connect requires an initialized, compatible dedicated company brain. Inspection
+needs no database and makes no source edits.
+
+| Situation | What GBrain does |
+| --- | --- |
+| Indexing or relationship extraction is interrupted | Resumes the missing stage from the approved revision |
+| A response is lost | Replays the exact request ID instead of duplicating the source |
+| Saved plan, selection, schema, or extractor approval no longer matches | Refuses rather than silently changing the run |
+| Ownership or decision history is unclear | Shows gaps rather than inventing relationships |
+| Existing clients have broad access | Shows that implication without changing their grants |
+
+## To take advantage of v0.51.8.0
+
+Run `gbrain upgrade`, then `gbrain doctor` on the intended brain host. If migration
+162 did not complete, run `gbrain apply-migrations --yes` before connecting. Do not
+switch an existing personal brain's schema merely to inspect the optional preset.
+Company connect requires a trusted local host; ordinary remote OAuth access is not
+administration authority.
+
+Read [the company ingestion guide](docs/guides/company-brain-ingestion.md) for
+explicit approval, request replay, and recovery. This release supports committed
+Markdown and a new source in a compatible dedicated company brain. It is not an
+automatic privacy audit; mixed-schema federation and in-place semantic reapproval
+are not enabled.
+
+### Itemized changes
+
+- Bundle the optional `company-brain` schema and fictional compatibility corpus,
+  adapted from @mattzimak's company-brain project with MIT attribution.
+- Resolve typed imports and queries against the selected brain's schema, refuse
+  unreadable schemas, and keep product aliases and folder inference distinct from
+  company types. Filesystem typing incorporates #5153, contributed by @mattzimak.
+- Reconcile only origin-attributed derived links, preserve manual links, and check
+  both relationship endpoints and their revisions. Legacy frontmatter links without origin
+  metadata stop for review rather than losing provenance.
+- Add committed-repository inspection, guided `sources connect`, and an offline
+  demo using the real ingestion pipeline. Completion evidence stays source-scoped
+  and cites imported pages; unsupported or ambiguous references remain gaps.
+- Migration 162 adds durable source-scoped ingestion receipts, immutable approval
+  fingerprints, and protected incomplete checkpoints for resumable imports.
+- Preserve approved file selection in managed and legacy sync without source
+  writeback or paid enrichment. Reject stale plans and unsupported privacy labels,
+  retain writer ownership and revision guards, and keep progress out of JSON output.
+- Complete schema hashing before CLI exit without changing existing fingerprints.
+
 ## [0.51.7.0] - 2026-09-21
 
 **Search can find your pages without quietly mistaking an unfinished index for an empty brain.** Large brains no longer rely on a misleading estimate that made vector search scan every chunk. Filtered searches can look beyond their first batch of candidates, and they tell you when their work limit still leaves the answer incomplete. Keyword results stay stable between repeated requests and adjacent pages.
