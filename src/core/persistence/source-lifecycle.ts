@@ -18,6 +18,7 @@ import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from '.
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { flushTopologyDirectory } from './topology-filesystem.ts';
 import { claimPhysicalRoot } from './physical-root.ts';
+import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 
 export interface SourceLifecycleInput {
   operation:'add'|'claim'|'archive'|'restore'|'remove'|'purge'|'rebind'|'reclone';
@@ -27,6 +28,7 @@ export interface SourceLifecycleInput {
   createDirectory?:boolean;
   expiredOnly?:boolean;
   requireGitContent?:boolean;
+  expectedAdminState?:string;
 }
 interface SourceState {id:string;incarnation:string;archived:boolean;local_path:string|null;config:Record<string,unknown>;name:string;last_commit:string|null;}
 
@@ -106,6 +108,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       manifests.set(path,manifest);
     }
     return topologyTransaction(engine,async tx=>{
+    await assertWriterAdminState(tx,input.expectedAdminState);
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     const sources=await lockTopologyRows(tx,input.sourceId,bindings);
     const [source]=await tx.executeRaw<SourceState>('SELECT id,incarnation,archived,local_path,config,name,last_commit FROM sources WHERE id=$1',[input.sourceId]);
@@ -137,7 +140,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     if(input.operation==='rebind'){
       const binding=bindings.find(value=>value.source_id===input.sourceId);
       if(!binding&&source?.local_path===null)throw new OperationError('writer_registration_required','This source has no canonical filesystem binding.',
-        `Use gbrain sources writer claim ${input.sourceId} --path <directory> for its first binding.`);
+        WRITER_INSPECTION_HINT);
       if(!binding?.local_path || !existsSync(binding.local_path)) throw new OperationError('recovery_required','The original checkout is unavailable; recover its last verified manifest before rebinding.');
       if(manifests.get(binding.local_path)!.digest!==manifests.get(root!.worktree)!.digest) throw new OperationError('writer_manifest_mismatch','The new checkout differs from the current canonical manifest, including deletions.');
     }

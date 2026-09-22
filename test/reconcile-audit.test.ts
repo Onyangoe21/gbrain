@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -109,6 +109,16 @@ test('revocation during audit prevents returning the result', () => fixture(asyn
 test('audit never claims an owner for an unbound source', () => fixture(async (_root, source) => {
   await expect(auditCanonicalSource(engine, 'default')).rejects.toMatchObject({ code: 'owner_unavailable' });
   expect(await engine.executeRaw('SELECT source_id FROM persistence_source_bindings ORDER BY source_id')).toEqual([{ source_id: source }]);
+}), 60_000);
+
+test('audit without an existing host identity refuses without creating private state', () => fixture(async (_root, source) => {
+  const otherHome = mkdtempSync(join(tmpdir(), 'gbrain-reconcile-read-only-'));
+  try {
+    await withEnv({ GBRAIN_HOME: otherHome }, async () => {
+      await expect(auditCanonicalSource(engine, source)).rejects.toMatchObject({ code: 'owner_unavailable' });
+      expect(existsSync(join(otherHome, '.gbrain'))).toBe(false);
+    });
+  } finally { rmSync(otherHome, { recursive: true, force: true }); }
 }), 60_000);
 
 test('large sources remain bounded to one requested audit page without canonical churn', () => fixture(async (root, source) => {

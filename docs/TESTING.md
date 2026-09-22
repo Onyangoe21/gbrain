@@ -1,5 +1,14 @@
 # Testing (gbrain repo)
 
+`test/local-install-lifecycle.serial.test.ts` exercises isolated Bun-link install,
+keyless memory write/read/search, process reopen and migration/post-upgrade with
+service-command tripwires. `test/e2e/grandfather-projection-postgres.test.ts`
+checks guarded metadata-only grandfathering, duplicate source slugs, preserved
+valid text projections and refusal to seal previously unsealed rows on Postgres.
+`test/reindex-markdown-persistence.slow.test.ts` retains the bounded 3,600-page
+real-CLI reindex, SIGKILL and resume workload; the diagnostic benchmark launcher
+is `scripts/bench-reindex-markdown.ts`.
+
 On-demand reference (see CLAUDE.md Reference map). Current behavior + invariants
 only.
 
@@ -22,6 +31,13 @@ uses one file per activation state to stay within the unchanged per-file cap. Op
 `GBRAIN_CI_REQUIRE_PGBOUNCER=1` and proves repair followed by a new private memory
 write. The durable-persistence workflow runs these contracts on both supported
 Bun versions and uploads the crash manifests; local CI runs the slow and E2E lanes.
+
+`test/docs-navigation.test.ts` checks local links and fragments in the primary
+install/memory guides and all `docs/architecture/key-files/` references, requires
+every subsystem to be linked from `KEY_FILES.md`, and guards against blanket
+graph-write and preference-routing claims. The fixture suite
+`test/scripts/check-key-files-current-state.test.ts` covers history markers,
+cross-subsystem duplicate entries, and byte caps for the entry docs and references.
 
 Search reliability has real-planner and transport regressions in
 `test/e2e/vector-candidate-safety-postgres.test.ts`,

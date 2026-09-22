@@ -330,18 +330,28 @@ not rewrite an accepted mutation's authority snapshot.
 
 ## Local registrations and canonical ownership
 
-For a coordinated upgrade, update and stop older writers on every host first.
+Routine repair, startup and maintenance must not change writer topology in
+response to an ownership error. Inspect `gbrain sources writer status --json`
+first and obtain the operator's decision. See the
+[state-bound administration procedure](../architecture/topologies.md#writer-administration-is-not-routine-repair).
+
+For an approved coordinated upgrade, update and stop older writers on every host first.
 Claim each filesystem source on its canonical host, then inspect writer status
 and existing locks. Activation is explicit:
 
 ```bash
 gbrain sources writer status --probe --json
 gbrain sources writer activate --confirm-quiesced --dry-run --json
-gbrain sources writer activate --confirm-quiesced --json
+gbrain sources writer activate --confirm-quiesced \
+  --admin-intent writer_activate --expected-state <reviewed-admin-state> --json
 ```
 
-The flag asserts that older binaries, external editors and maintenance writers
-have been quiesced on every host. Activation verifies all owner bindings and
+The quiescence flag asserts that older binaries, external editors and maintenance writers
+have been quiesced on every host. It does not authorize a topology change alone:
+each non-dry-run claim, activation or transfer requires its exact `--admin-intent`
+and the `admin_state` fingerprint from reviewed status. Inspect again after each
+change; stale state refuses. A TTY or `--yes` is not a substitute, and explicit
+noninteractive provisioning uses the same guards. Activation verifies all owner bindings and
 native locking, rejects outstanding legacy leases and unfinished publications,
 and makes local refusal records durable before enabling managed writes. Even an
 expired lease needs explicit inspection and removal; elapsed time does not prove
@@ -363,7 +373,8 @@ gbrain auth local-writer register stdio --source-ids default \
   --allowed-operations remember,forget --scopes read,write --dry-run --json
 gbrain auth local-writer revoke 11111111-1111-4111-8111-111111111111 --json
 gbrain sources writer status --probe --json
-gbrain sources writer claim default --path /absolute/canonical/source --json
+gbrain sources writer claim default --path /absolute/canonical/source \
+  --admin-intent writer_claim --expected-state <reviewed-admin-state> --json
 ```
 
 `register --replace` requires the complete intended grant, revokes the prior
@@ -384,9 +395,12 @@ manifest digest. Copy the complete canonical worktree to the successor, then
 accept there with the exact epoch and digest:
 
 ```bash
-gbrain sources writer transfer prepare default --json
+gbrain sources writer transfer prepare default \
+  --admin-intent writer_transfer_prepare --expected-state <reviewed-admin-state> --json
+gbrain sources writer status --json
 gbrain sources writer transfer accept default --path /absolute/successor/root \
-  --expected-epoch 1 --manifest '<prepared-sha256>' --json
+  --expected-epoch 1 --manifest '<prepared-sha256>' \
+  --admin-intent writer_transfer_accept --expected-state <reviewed-successor-admin-state> --json
 ```
 
 Successful preparation places the root in its draining state and records an

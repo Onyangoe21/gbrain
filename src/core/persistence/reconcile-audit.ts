@@ -8,7 +8,7 @@ import { resolveSourceLocalFilePath } from '../markdown.ts';
 import { recordedPathFromFileUri } from '../write-through.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { submissionAuthority } from './authority.ts';
-import { currentVerifiedLocalWriter, localHostId, readLocalWriter, verifyLocalWriter } from './identity.ts';
+import { currentVerifiedLocalWriter, existingLocalHostId, readLocalWriter, verifyLocalWriter } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { prepareFileTarget } from './page-prepare.ts';
 
@@ -33,8 +33,9 @@ export async function auditCanonicalSource(engine: BrainEngine, sourceId: string
     if (typeof options.after !== 'string') throw new OperationError('invalid_params', 'The audit cursor must be a page slug.');
     try { validateSlug(options.after); } catch { throw new OperationError('invalid_params', 'The audit cursor must be a valid page slug.'); }
   }
-  const binding = await getWorktreeBinding(engine, sourceId);
-  if (!binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active') {
+  const hostId = existingLocalHostId();
+  const binding = hostId ? await getWorktreeBinding(engine, sourceId, hostId) : null;
+  if (!binding?.local_path || binding.owner_host_id !== hostId || binding.state !== 'active') {
     throw new OperationError('owner_unavailable', 'Read-only drift auditing must run on the active canonical owner.');
   }
   const root = join(binding.local_path, binding.relative_path);
@@ -61,7 +62,7 @@ export async function auditCanonicalSource(engine: BrainEngine, sourceId: string
         size = stat.size;
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       if (size > 5_000_000) throw new OperationError('invalid_params', 'The file exceeds the bounded audit size.');
-      await prepareFileTarget(engine, { source_id: sourceId, worktree_id: binding.worktree_id, slug: candidate.slug }, snapshot, null);
+      await prepareFileTarget(engine, { source_id: sourceId, worktree_id: binding.worktree_id, slug: candidate.slug }, snapshot, null, hostId!);
     } catch (error) {
       const reason = error instanceof OperationError ? error.code : 'storage_error';
       if (reason === 'source_changed') report.drifted++;
