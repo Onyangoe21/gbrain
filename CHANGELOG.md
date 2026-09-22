@@ -38,6 +38,10 @@ HNSW remains approximate. Postgres can use a server-cancelled exact fallback wit
 - Managed-safe code reindexing and shared Markdown/code preparation preserve fenced metadata, valid vectors and incoming graph edges; rebuilt outgoing edges become eligible for resolution again. Resolver batches and projection replacement share ordered guards, so a concurrent old resolver cannot certify new edges. Code reads enforce current live projections, and recursive operations do not reuse stale traversal caches.
 - Contributed by @time-attack (#5126, keyword ordering), @morven-ai (#5169, CJK operator selection), @Laochaleun (#5245, Markdown projection preparation), and @tarush1989 (#5085, atom diversification). Thanks to the issue reporters for the planner and retrieval reproductions.
 
+### For contributors
+
+- Required PgBouncer execution checks no longer misclassify passing output when the summary reader exits early. Native-lock contention fixtures wait for setup ownership before asserting write exclusion, without changing the contention assertions.
+
 ## [0.51.6.0] - 2026-09-21
 
 **A temporary brain gets one safe second chance to start.**
