@@ -26,6 +26,7 @@ import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
+import { expandEngineTypeFilters } from '../schema-pack/query-types.ts';
 import { probeProjectionReadiness } from '../search/projection-readiness.ts';
 import { resolveHardExcludes } from '../search/source-boost.ts';
 import { pageReadFilter } from '../search/read-policy-sql.ts';
@@ -259,7 +260,7 @@ const search: Operation = {
     const limit = (p.limit as number) || 20;
     const offset = (p.offset as number) || 0;
     // #3985: validated multi-type filter, threaded into both branches below.
-    const types = normalizeTypesParam(p.types);
+    let types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await resolveSnippetCap(ctx, p);
     // #4398: explicit per-call source_id wins over ctx.sourceId, validated
@@ -286,6 +287,10 @@ const search: Operation = {
     const keywordOnly = (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
 
     if (keywordOnly) {
+      if (types) {
+        types = (await expandEngineTypeFilters(ctx.engine, { types, ...scope })).types;
+        if (types?.length === 0) return [];
+      }
       const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, requireSafeChunks: ctx.remote !== false, ...(types ? { types } : {}), ...scope });
       const results = dedupResults(raw);
       // #3783 — every row here IS a keyword hit (direct FTS path); mark
@@ -464,7 +469,7 @@ const query: Operation = {
     const queryText = p.query as string | undefined;
     // #3985: validated multi-type filter (text path; the image-similarity
     // branch below also honors it — searchVector filters types at SQL level).
-    const types = normalizeTypesParam(p.types);
+    let types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
     const snippetCap = await resolveSnippetCap(ctx, p);
     const imageData = p.image as string | undefined;
@@ -497,6 +502,10 @@ const query: Operation = {
         since: typeof p.since === 'string' ? p.since : undefined,
         until: typeof p.until === 'string' ? p.until : undefined,
       });
+      if (types) {
+        types = (await expandEngineTypeFilters(ctx.engine, { types, ...querySourceScope })).types;
+        if (types?.length === 0) return [];
+      }
       const imageMeta: HybridSearchMeta = {
         vector_enabled: true, expansion_applied: false, detail_resolved: null, degraded: [],
       };

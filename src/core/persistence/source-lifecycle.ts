@@ -66,7 +66,10 @@ export async function installTopologyBinding(tx:BrainEngine,sourceId:string,inca
 }
 
 /** One source transition; shared-root members are fenced and invalidated together. */
-export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceLifecycleInput):Promise<Record<string,unknown>>{
+export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceLifecycleInput, admission?: {
+  before(tx: BrainEngine): Promise<void>;
+  after(tx: BrainEngine, incarnation: string): Promise<void>;
+}):Promise<Record<string,unknown>>{
   if(!['add','claim','archive','restore','remove','purge','rebind','reclone'].includes(input.operation)) throw new OperationError('invalid_params','Unknown source lifecycle operation.');
   for(const key of ['dryRun','refederate','confirmDestructive','createDirectory','expiredOnly','requireGitContent'] as const) if(input[key]!==undefined&&typeof input[key]!=='boolean') throw new OperationError('invalid_params',`${key} must be a boolean.`);
   for(const key of ['path','name','expectedIncarnation','requestId','remoteUrl'] as const) if(input[key]!==undefined&&(typeof input[key]!=='string'||input[key]!.length>8192)) throw new OperationError('invalid_params',`${key} must be a bounded string.`);
@@ -110,6 +113,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     const repeated=await priorTopologyChange(tx,principal,requestId,intent);
     if(repeated){await lockTopologyPrincipal(tx,principal);return topologyReceipt(repeated);}
     if((source?.incarnation??null)!==(before?.incarnation??null)) throw new OperationError('source_changed','The source changed during lifecycle preparation.');
+    if(admission) await admission.before(tx);
     if(input.operation==='add'&&source&&(!root||source.local_path!==null)) throw new OperationError('source_id_taken','Source ID is already registered.');
     if(input.operation==='purge'&&!input.expiredOnly&&!source?.archived) throw new OperationError('invalid_params','Only an archived source can be purged.');
     if(['remove','purge'].includes(input.operation)&&!input.confirmDestructive) throw new OperationError('invalid_params','Source removal requires explicit destructive confirmation.');
@@ -178,6 +182,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         ...(root?{local_path:root.source}:{}),...(['remove','purge'].includes(input.operation)?{storage_retained:true,local_path:ownedSourcePath??null,pages_deleted:pagesDeleted}:{}),
         ...(input.operation==='add'?{name:input.name??source?.name??input.sourceId,config:{...source?.config,...input.config},id:input.sourceId}: {})};
     });
+    if(admission) await admission.after(tx,String(result.source_incarnation));
     const row=await recordTopologyChange(tx,{principal,requestId,intent,operation:input.operation,sourceId:input.sourceId,incarnation:source?.incarnation??String(result.source_incarnation),worktrees},result);
     return topologyReceipt(row);
     });

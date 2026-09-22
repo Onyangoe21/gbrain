@@ -1,3 +1,4 @@
+import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from './company-brain/receipt-schema.ts';
 import { PERSISTENCE_SCHEMA_STATEMENTS } from './persistence/schema.ts';
 import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from './persistence/topology-schema.ts';
 import { PAGE_PROJECTION_SCHEMA_SQL } from './page-state/projection-schema.ts';
@@ -1263,6 +1264,7 @@ ${PAGE_STATE_SCHEMA_SQL}
 ${PERSISTENCE_SCHEMA_STATEMENTS.join(';\n')};
 ${PAGE_PROJECTION_SCHEMA_SQL}
 ${PERSISTENCE_TOPOLOGY_SCHEMA_SQL}
+${SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL}
 
 CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
   source_incarnation UUID NOT NULL REFERENCES sources(incarnation) ON DELETE CASCADE,
