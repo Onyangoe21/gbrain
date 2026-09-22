@@ -142,8 +142,9 @@ export async function readCommittedBlob(revision: RevisionIdentity, entry: Commi
   const gitPath = revision.scope ? `${revision.scope}/${entry.path}` : entry.path;
   const treeEntry = (await gitRead(revision.git_root,
     ['ls-tree', '-r', '-l', '-z', '--full-tree', revision.tree, '--', `:(literal)${gitPath}`], 64 * 1024)).toString('utf8');
-  const expected = new RegExp(`^${entry.mode} blob ${entry.object_id} +${entry.bytes}\\t`);
-  if (!expected.test(treeEntry) || treeEntry.slice(treeEntry.indexOf('\t') + 1) !== `${gitPath}\0`) {
+  const separator = treeEntry.indexOf('\t');
+  const expected = `${entry.mode} blob ${entry.object_id} ${entry.bytes}`;
+  if (separator < 0 || treeEntry.slice(0, separator).replace(/ +/g, ' ') !== expected || treeEntry.slice(separator + 1) !== `${gitPath}\0`) {
     throw new OperationError('invalid_source', 'The blob does not belong to the approved revision and path.');
   }
   const result = await gitRead(revision.git_root, ['cat-file', 'blob', entry.object_id], limits.maxFileBytes);
