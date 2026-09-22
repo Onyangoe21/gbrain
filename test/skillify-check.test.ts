@@ -15,6 +15,7 @@ import { join } from 'path';
 
 const REPO = join(__dirname, '..');
 const SCRIPT = join(REPO, 'scripts', 'skillify-check.ts');
+const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 function run(args: string[]): { exitCode: number; stdout: string; stderr: string } {
   try {
@@ -22,9 +23,12 @@ function run(args: string[]): { exitCode: number; stdout: string; stderr: string
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: REPO,
+      maxBuffer: MAX_OUTPUT_BYTES,
     });
     return { exitCode: 0, stdout, stderr: '' };
   } catch (err: any) {
+    // Transport failures (for example ENOBUFS) are not audit verdicts.
+    if (typeof err.status !== 'number') throw err;
     return {
       exitCode: err.status ?? 1,
       stdout: err.stdout?.toString?.() ?? '',
@@ -80,6 +84,18 @@ describe('skillify-check CLI', () => {
     }
   });
 
+  test('captures a complete report larger than the subprocess default buffer', () => {
+    const targets = Array.from({ length: 700 }, () => 'src/commands/publish.ts');
+    const result = run([...targets, '--json']);
+    expect(Buffer.byteLength(result.stdout)).toBeGreaterThan(1024 * 1024);
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed).toHaveLength(targets.length);
+    expect(parsed.every((entry: { path: string }) => entry.path === targets[0])).toBe(true);
+    const anyFailed = parsed.some((entry: { items: { passed: boolean; required: boolean }[] }) =>
+      entry.items.some(item => !item.passed && item.required));
+    expect(result.exitCode).toBe(anyFailed ? 1 : 0);
+  });
+
   test('bogus target reports `Code file exists: false` as a required gap', () => {
     const result = run(['src/definitely-not-a-real-file.ts', '--json']);
     const parsed = JSON.parse(result.stdout);
@@ -110,7 +126,7 @@ function runWithPath(opts: { path: string }): { stdout: string; stderr: string }
     encoding: 'utf-8',
     cwd: REPO,
     env: { ...process.env, PATH: opts.path },
-    maxBuffer: 10 * 1024 * 1024,
+    maxBuffer: MAX_OUTPUT_BYTES,
   });
   return {
     stdout: res.stdout ?? '',
