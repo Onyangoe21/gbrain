@@ -234,7 +234,7 @@ const fetch_page: Operation = {
     let snapshot: PageSnapshot | null;
     try {
       snapshot = await ctx.engine.readPageSnapshot(slug, {
-        ...sourceOpts, excludePrivate, resolveAlias: true, requireUnambiguous: identity === null, requireLiveSource: true,
+        ...sourceOpts, excludePrivate, resolveAlias: true, requireUnambiguous: identity === null, requireLiveSource: true, preserveExactIdentity: true,
       });
     } catch (error) {
       if (error instanceof PageSnapshotAmbiguousError) {

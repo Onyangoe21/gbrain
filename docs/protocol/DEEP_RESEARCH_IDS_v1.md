@@ -44,6 +44,8 @@ An exact source/slug page takes precedence over a stale alias at the same addres
 If that exact page is private or soft-deleted, fetch returns the missing-page
 envelope instead of substituting the readable alias target. A rename can still
 follow its alias when no exact row remains at the old address.
+This strict address rule belongs to `fetch`; native `get_page` retains its
+documented alias lookup and `include_deleted` recovery behavior.
 `fetch.id` echoes the supplied opaque ID; the citation URL names the current
 canonical page. Legacy fetches retain the canonical bare-slug response ID.
 Recreating a source/slug can resolve the new page: these are logical page

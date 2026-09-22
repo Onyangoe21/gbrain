@@ -17,6 +17,7 @@ export interface PageSnapshotOptions extends GetPageOpts {
   resolveAlias?: boolean;
   requireUnambiguous?: boolean;
   requireLiveSource?: boolean;
+  preserveExactIdentity?: boolean;
 }
 export class PageSnapshotAmbiguousError extends Error {
   constructor() {
