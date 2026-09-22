@@ -41,6 +41,9 @@ database snapshot.
 
 Source-qualified IDs may follow an alias after a rename within that source.
 An exact source/slug page takes precedence over a stale alias at the same address.
+If that exact page is private or soft-deleted, fetch returns the missing-page
+envelope instead of substituting the readable alias target. A rename can still
+follow its alias when no exact row remains at the old address.
 `fetch.id` echoes the supplied opaque ID; the citation URL names the current
 canonical page. Legacy fetches retain the canonical bare-slug response ID.
 Recreating a source/slug can resolve the new page: these are logical page

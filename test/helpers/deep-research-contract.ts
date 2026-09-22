@@ -182,6 +182,23 @@ export function deepResearchContract(getEngine: () => BrainEngine): void {
       expect(result.url).toBe(`gbrain://page/beta/${slug}`);
     });
 
+    for (const state of ['private', 'deleted'] as const) {
+      test(`${state} exact pages cannot substitute a readable stale alias target`, async () => {
+        const hits = await searchOp.handler(ctx(), { query: 'Zirconiumneedle' }) as any[];
+        expect(hits).toHaveLength(1);
+        await seed('beta', 'notes/previous-example', 'Different stale alias evidence.');
+        await getEngine().executeRaw(`INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+          VALUES ('beta', $1, 'notes/previous-example')`, [slug]);
+        if (state === 'private') await seed('beta', slug, 'Private exact evidence.', { visibility: 'private' });
+        else await getEngine().softDeletePage(slug, { sourceId: 'beta' });
+        const missing = await errorOf(encodeDeepResearchId('beta', 'notes/missing'));
+        expect(await errorOf(hits[0].id)).toEqual(missing);
+        expect((await fetch(encodeDeepResearchId('beta', 'notes/previous-example'))).text)
+          .toContain('Different stale alias evidence.');
+        if (state === 'deleted') expect(await errorOf(hits[0].id, ctx({ remote: false }))).toEqual(missing);
+      });
+    }
+
     test('unicode and delimiter-bearing slugs round-trip with escaped citations', async () => {
       const special = 'notes/研究:example?part#one% "quoted"';
       await seed('beta', special, 'Escaped fixture evidence.');
