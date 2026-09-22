@@ -21,7 +21,7 @@ test('3,600-page CLI reindex commits, survives interruption, and resumes without
   if (exitCode !== 0) console.error(stderr);
   expect(exitCode).toBe(0);
   const summaries = stdout.trim().split('\n').map(line => JSON.parse(line));
-  expect(summaries.find(row => row.name === 'sweep')?.transactions).toBe(3600);
-  expect(summaries.find(row => row.name === 'resume')?.transactions).toBe(3500);
+  expect(summaries.find(row => row.name === 'sweep')?.pageTransactions).toBe(3600);
+  expect(summaries.find(row => row.name === 'resume')?.pageTransactions).toBe(3500);
   rmSync(scratch, { recursive: true, force: true });
 }, 660_000);

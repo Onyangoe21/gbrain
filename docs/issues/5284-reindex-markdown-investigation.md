@@ -32,6 +32,14 @@ bun --no-env-file scripts/bench-reindex-markdown.ts . 3600 8
 bun test test/reindex-markdown-persistence.slow.test.ts
 ```
 
+The trace reports total, page and planner-statistics transactions separately.
+Page transactions are identified by their actual canonical page-lock keys: every
+rebuilt page must have one distinct committed transaction, and no such transaction
+may cover multiple pages. Explicit `ANALYZE` work is reported separately and
+unclassified transactions fail the fixture. The interruption targets the 101st
+page transaction, independent of maintenance work. This retains the ownership and
+recovery assertions when an upstream release adds a legitimate statistics refresh.
+
 The benchmark also accepts another source checkout as its first argument, so
 the same harness can exercise a reviewed revision without modifying that
 checkout. Its second and third arguments bound page count (3,000–10,000) and

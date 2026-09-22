@@ -19,20 +19,37 @@ if (mode === 'trace') {
   const transaction = PGLiteEngine.prototype.transaction;
   const trace = process.env.REINDEX_FIXTURE_TRACE!;
   let count = 0;
+  let pageCount = 0;
   PGLiteEngine.prototype.transaction = async function<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
     if ((this as unknown as { _pageTransaction: boolean })._pageTransaction) return transaction.call(this, fn);
     const id = ++count;
     const started = performance.now();
     let bodyDone = started;
+    const pageKeys = new Set<string>();
+    let statistics = false;
+    let kind: 'page' | 'statistics' | 'other' = 'other';
+    let pageSequence: number | undefined;
     appendFileSync(trace, JSON.stringify({ phase: 'begin', id, ms: started }) + '\n');
     const result = await transaction.call(this, async (tx: BrainEngine) => {
+      const lockPageKeys = tx.lockPageKeys;
+      tx.lockPageKeys = async function(this: BrainEngine, keys) {
+        for (const key of keys) pageKeys.add(JSON.stringify([key.sourceId, key.slug]));
+        await lockPageKeys.call(this, keys);
+      };
+      const executeRaw = tx.executeRaw;
+      tx.executeRaw = async function<R = Record<string, unknown>>(this: BrainEngine, sql: string, params?: unknown[]): Promise<R[]> {
+        if (sql.trim().toUpperCase().startsWith('ANALYZE ')) statistics = true;
+        return await executeRaw.call(this, sql, params) as R[];
+      };
       const result = await fn(tx);
       bodyDone = performance.now();
-      appendFileSync(trace, JSON.stringify({ phase: 'body_done', id, ms: bodyDone }) + '\n');
-      if (id === Number(process.env.REINDEX_FIXTURE_KILL_AT)) process.kill(process.pid, 'SIGKILL');
+      kind = pageKeys.size > 0 ? 'page' : statistics ? 'statistics' : 'other';
+      if (kind === 'page') pageSequence = ++pageCount;
+      appendFileSync(trace, JSON.stringify({ phase: 'body_done', id, ms: bodyDone, kind, pageSequence, pageKeys: [...pageKeys] }) + '\n');
+      if (pageSequence === Number(process.env.REINDEX_FIXTURE_KILL_AT)) process.kill(process.pid, 'SIGKILL');
       return result;
     });
-    appendFileSync(trace, JSON.stringify({ phase: 'committed', id, bodyMs: bodyDone - started, commitMs: performance.now() - bodyDone }) + '\n');
+    appendFileSync(trace, JSON.stringify({ phase: 'committed', id, kind, pageSequence, pageKeys: [...pageKeys], bodyMs: bodyDone - started, commitMs: performance.now() - bodyDone }) + '\n');
     return result;
   };
 } else {

@@ -53,9 +53,15 @@ async function run(name: string, mode: string, killAt?: number) {
   const output = await stdout.text();
   const lines = mode === 'trace' ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
   const commits = lines.filter(row => row.phase === 'committed');
+  const pageCommits = commits.filter(row => row.kind === 'page');
   const commitTimes = commits.map(row => row.commitMs).sort((a, b) => a - b);
   const summary = {
     name, exitCode, timedOut, elapsedMs, output: output.trim(), transactions: commits.length,
+    pageTransactions: pageCommits.length,
+    uniquePages: new Set(pageCommits.flatMap(row => row.pageKeys)).size,
+    maxPagesPerTransaction: pageCommits.reduce((max, row) => Math.max(max, row.pageKeys.length), 0),
+    statisticsTransactions: commits.filter(row => row.kind === 'statistics').length,
+    unclassifiedTransactions: commits.filter(row => row.kind === 'other').length,
     lastTrace: lines.at(-1),
     commitP50Ms: commitTimes[Math.floor(commitTimes.length * 0.5)],
     commitP99Ms: commitTimes[Math.floor(commitTimes.length * 0.99)],
@@ -81,7 +87,11 @@ function verifySweep(summary: Awaited<ReturnType<typeof run>>, count: number) {
   assert.equal(result.pending_after, 0);
   assert.equal(result.failed, 0);
   assert.equal(result.skipped, 0);
-  assert.equal(summary.transactions, count, 'Each page must have its own committed transaction');
+  assert.equal(summary.pageTransactions, count, 'Each page must have its own committed transaction');
+  assert.equal(summary.uniquePages, count, 'Every rebuilt page must have a distinct guarded transaction');
+  assert.equal(summary.maxPagesPerTransaction, count ? 1 : 0, 'A page rebuild transaction must not span multiple pages');
+  assert.equal(summary.unclassifiedTransactions, 0, 'Unexpected transactions require explicit investigation');
+  assert.equal(summary.transactions, count + summary.statisticsTransactions);
 }
 
 verifyStore(await run('seed', 'seed'), pages);
@@ -91,9 +101,12 @@ verifySweep(await run('idempotent', 'trace'), 0);
 verifyStore(await run('reset', 'reset'), pages);
 const interrupted = await run('interrupted', 'trace', 101);
 assert.notEqual(interrupted.exitCode, 0);
-assert.equal(interrupted.transactions, 100);
+assert.equal(interrupted.pageTransactions, 100);
+assert.equal(interrupted.uniquePages, 100);
+assert.equal(interrupted.maxPagesPerTransaction, 1);
+assert.equal(interrupted.unclassifiedTransactions, 0);
 assert.equal(interrupted.lastTrace.phase, 'body_done');
-assert.equal(interrupted.lastTrace.id, 101);
+assert.equal(interrupted.lastTrace.pageSequence, 101);
 verifyStore(await run('after-interrupt', 'inspect'), pages - 100);
 verifySweep(await run('resume', 'trace'), pages - 100);
 verifyStore(await run('after-resume', 'inspect'), 0);
