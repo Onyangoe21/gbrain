@@ -19,6 +19,15 @@ graph-write and preference-routing claims. The fixture suite
 `test/scripts/check-key-files-current-state.test.ts` covers history markers,
 cross-subsystem duplicate entries, and byte caps for the entry docs and references.
 
+`test/pglite-in-memory-create-retry.serial.test.ts` injects create failures while
+using real PGLite instances and a validated schema snapshot. It pins one cold
+retry only before an in-memory database has opened, both failure diagnostics,
+schema replay after snapshot fallback, post-open cleanup and close poisoning,
+concurrent connect/disconnect ordering, exit-code preservation, and exclusion of
+the persistent repair path. Run it in its own Bun process because it mocks the
+PGLite module. Its recovery cases discriminate against the no-retry base; its
+post-open cleanup cases discriminate against a retry that replaces a live database.
+
 `test/e2e/serve-http-oauth.test.ts` additionally pins confidential POST/Basic revocation, public-client SDK fallthrough, malformed/mixed authentication rejection, cross-client isolation, unknown-token opacity, metadata auth methods, no-store responses, strict post-revoke `401`, and retryable backend `503` semantics. SDK-driven discovery and real owner-approved PKCE also pin read-only bootstrap, explicit writer requests, scope clamping, and DCR delegation refusal. `test/oauth-scope-hint.test.ts` exercises the actual SDK middleware over HTTP without requiring a database.
 
 `test/put-page-persistence.test.ts` and `test/e2e/put-page-persistence-postgres.test.ts`
