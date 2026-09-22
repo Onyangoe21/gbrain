@@ -1228,6 +1228,13 @@ export async function hybridSearch(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
+  if (opts?.types?.length === 0) return [];
+  if (opts?.type || opts?.types?.length) {
+    const { expandEngineTypeFilters } = await import('../schema-pack/query-types.ts');
+    const filters = await expandEngineTypeFilters(engine, opts);
+    if (filters.types?.length === 0) return [];
+    opts = { ...opts, ...filters };
+  }
   // v0.32.3 search-lite mode: resolve the active mode + per-key overrides
   // once at entry. Mode supplies DEFAULTS for intentWeighting, tokenBudget,
   // expansion, and searchLimit when the caller leaves those undefined.
@@ -2543,6 +2550,7 @@ export async function hybridSearchCached(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
+  if (opts?.types?.length === 0) return [];
   // v0.32.3 search-lite mode: resolve mode + per-key overrides once. The
   // resolved knob set drives cache enable/threshold/TTL AND the knobs_hash
   // that scopes the cache row so a tokenmax write can't be served to a
@@ -2709,7 +2717,7 @@ export async function hybridSearchCached(
   // #3985: type-filtered requests skip the cache — `types` is not part of
   // knobsHash, so a filtered result set could be served to an unfiltered
   // lookup (and vice versa). Mirrors the #3442 date-filter bypass.
-  const typeFiltered = (opts?.types?.length ?? 0) > 0;
+  const typeFiltered = Boolean(opts?.type) || (opts?.types?.length ?? 0) > 0;
   // Offset pages are cache-hostile until the pre-slice POOL itself is what's
   // stored: the cache holds the already offset/limit-sliced page (bare
   // hybridSearch slices before returning), so a hit for any other offset

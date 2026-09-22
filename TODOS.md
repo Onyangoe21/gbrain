@@ -7241,7 +7241,7 @@ keeping both skills' triggers intact for chaining.
 ## Completed
 
 ### ~~F11 — manual native OAuth registration~~
-**Completed:** v0.51.7.1 (2026-09-22), with the original command proposal superseded.
+**Completed:** v0.51.8.1 (2026-09-22), with the original command proposal superseded.
 
 **Resolution:** `gbrain mcp admin register NAME --redirect-uri URI [--redirect-uri URI ...]` provides validated manual native OAuth registration through the running server and owner authentication. It supports public and confidential PKCE with authorization-code and refresh grants, without direct database edits. The legacy `auth register-client` command remains unchanged. See [MCP administration](docs/mcp/ADMIN.md).
 
