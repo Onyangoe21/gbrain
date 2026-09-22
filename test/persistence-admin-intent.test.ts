@@ -7,6 +7,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
 import { writerAdminState } from '../src/core/persistence/admin-intent.ts';
+import { PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from '../src/core/persistence/physical-root-record.ts';
 import { parsePersistenceAdminArgs } from '../src/commands/persistence-admin.ts';
 import { localHostId, persistenceHome, registerLocalWriter, withVerifiedLocalRegistration } from '../src/core/persistence/identity.ts';
 import { createPersistenceIpcProvider } from '../src/core/persistence/provider.ts';
@@ -37,6 +38,48 @@ async function fixture(run: (root: string) => Promise<void>) {
       try { await run(root); } finally { await disposePersistenceConsumer(engine); }
     });
   } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+async function expectRacedTopologyRejection(operation: 'writer_claim' | 'writer_transfer_prepare' | 'writer_transfer_accept',
+  params: Record<string, unknown>, roots: string[]) {
+  await engine.transaction(async tx => {
+    await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
+    await tx.executeRaw("INSERT INTO sources(id,name) VALUES('unrelated-example','Unrelated example')");
+  });
+  const intent = await reviewedWriterIntent(engine, operation);
+  const snapshot = async () => ({
+    worktrees: await engine.executeRaw('SELECT * FROM persistence_worktrees ORDER BY id'),
+    bindings: await engine.executeRaw('SELECT * FROM persistence_source_bindings ORDER BY source_id'),
+    hosts: await engine.executeRaw('SELECT * FROM persistence_host_bindings ORDER BY worktree_id,host_id'),
+    receipts: await engine.executeRaw('SELECT * FROM persistence_topology_changes ORDER BY id'),
+    markers: roots.flatMap(root => [join(root, PHYSICAL_ROOT_MARKER), physicalRootReservationPath(root), join(root, '.gbrain-managed')])
+      .map(path => ({ path, contents: existsSync(path) ? readFileSync(path, 'utf8') : null })),
+  });
+  const before = await snapshot();
+  let raced = false;
+  let racedState: string | undefined;
+  const proxy = new Proxy(engine, { get(target, property) {
+    if (property === 'transaction') return async (run: (tx: BrainEngine) => Promise<unknown>) => {
+      if (!raced) {
+        raced = true;
+        expect(await writerAdminState(target)).toBe(intent.expected_state);
+        await target.transaction(async tx => {
+          await tx.executeRaw("SELECT set_config('gbrain.topology_change','on',true)");
+          await tx.executeRaw("UPDATE sources SET archived=true WHERE id='unrelated-example'");
+        });
+        racedState = await writerAdminState(target);
+        expect(racedState).not.toBe(intent.expected_state);
+        expect(await snapshot()).toEqual(before);
+      }
+      return target.transaction(run);
+    };
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } }) as BrainEngine;
+  await expect(runPersistenceAdministration(proxy, operation, { ...params, ...intent })).rejects.toMatchObject({ code: 'writer_admin_state_changed' });
+  expect(raced).toBe(true);
+  expect(racedState).toBe(await writerAdminState(engine));
+  expect(await engine.executeRaw("SELECT archived FROM sources WHERE id='unrelated-example'")).toEqual([{ archived: true }]);
+  expect(await snapshot()).toEqual(before);
 }
 
 test('status, probe, dry runs and routine flags never create ownership or host identity', () => fixture(async root => {
@@ -110,6 +153,42 @@ test('activation rechecks raced state before enabling or registering writers', (
   await expect(runPersistenceAdministration(proxy, 'writer_activate', { confirm_quiesced: true, ...intent })).rejects.toMatchObject({ code: 'writer_admin_state_changed' });
   expect(await engine.executeRaw('SELECT enabled FROM persistence_brain')).toEqual([{ enabled: false }]);
   expect(await engine.executeRaw('SELECT id FROM persistence_local_writers')).toEqual([]);
+}));
+
+test('transfer preparation rechecks raced topology before changing transfer state or markers', () => fixture(async root => {
+  writeFileSync(join(root, 'example.md'), 'generic example');
+  await runPersistenceAdministration(engine, 'writer_claim', { source_id: 'default', path: root, ...await reviewedWriterIntent(engine, 'writer_claim') });
+  expect(await engine.executeRaw('SELECT owner_host_id,owner_epoch::text,state,manifest FROM persistence_worktrees'))
+    .toEqual([{ owner_host_id: localHostId(), owner_epoch: '1', state: 'active', manifest: null }]);
+  await expectRacedTopologyRejection('writer_transfer_prepare', { source_id: 'default' }, [root]);
+  expect(await runPersistenceAdministration(engine, 'writer_transfer_prepare', { source_id: 'default', ...await reviewedWriterIntent(engine, 'writer_transfer_prepare') })).toMatchObject({ prepared: true, owner_epoch: '1' });
+}));
+
+test('transfer acceptance rechecks raced topology despite an unchanged prepared epoch and manifest', () => fixture(async root => {
+  const successor = join(root, '..', 'successor'); mkdirSync(successor);
+  for (const path of [root, successor]) writeFileSync(join(path, 'example.md'), 'generic example');
+  await runPersistenceAdministration(engine, 'writer_claim', { source_id: 'default', path: root, ...await reviewedWriterIntent(engine, 'writer_claim') });
+  const prepared = await runPersistenceAdministration(engine, 'writer_transfer_prepare', { source_id: 'default', ...await reviewedWriterIntent(engine, 'writer_transfer_prepare') }) as { owner_epoch: string; manifest: { digest: string } };
+  expect(await engine.executeRaw("SELECT owner_host_id,owner_epoch::text,state,manifest->>'digest' AS digest FROM persistence_worktrees"))
+    .toEqual([{ owner_host_id: localHostId(), owner_epoch: prepared.owner_epoch, state: 'draining', digest: prepared.manifest.digest }]);
+  for (const path of [join(successor, PHYSICAL_ROOT_MARKER), physicalRootReservationPath(successor), join(successor, '.gbrain-managed')]) expect(existsSync(path)).toBe(false);
+  const params = { source_id: 'default', path: successor, expected_epoch: prepared.owner_epoch, manifest: prepared.manifest.digest };
+  await expectRacedTopologyRejection('writer_transfer_accept', params, [root, successor]);
+  expect(await runPersistenceAdministration(engine, 'writer_transfer_accept', { ...params, ...await reviewedWriterIntent(engine, 'writer_transfer_accept') }))
+    .toMatchObject({ transferred: true, binding: { local_path: successor, owner_host_id: localHostId(), state: 'active' } });
+  expect(await engine.executeRaw('SELECT owner_epoch::text FROM persistence_worktrees')).toEqual([{ owner_epoch: '2' }]);
+}));
+
+test('managed claim rechecks raced topology before creating ownership, a receipt or markers', () => fixture(async root => {
+  const candidate = join(root, '..', 'candidate'); mkdirSync(candidate);
+  await engine.executeRaw("INSERT INTO sources(id,name) VALUES('candidate-example','Candidate example')");
+  await runPersistenceAdministration(engine, 'writer_claim', { source_id: 'default', path: root, ...await reviewedWriterIntent(engine, 'writer_claim') });
+  expect(await runPersistenceAdministration(engine, 'writer_activate', { confirm_quiesced: true, ...await reviewedWriterIntent(engine, 'writer_activate') })).toMatchObject({ activated: true });
+  expect(await engine.executeRaw("SELECT source_id FROM persistence_source_bindings WHERE source_id='candidate-example'")).toEqual([]);
+  for (const path of [join(candidate, PHYSICAL_ROOT_MARKER), physicalRootReservationPath(candidate), join(candidate, '.gbrain-managed')]) expect(existsSync(path)).toBe(false);
+  await expectRacedTopologyRejection('writer_claim', { source_id: 'candidate-example', path: candidate }, [root, candidate]);
+  expect(await runPersistenceAdministration(engine, 'writer_claim', { source_id: 'candidate-example', path: candidate, ...await reviewedWriterIntent(engine, 'writer_claim') }))
+    .toMatchObject({ claimed: true, binding: { source_id: 'candidate-example', owner_host_id: localHostId(), local_path: candidate } });
 }));
 
 test('provider startup, remote lane forgery and remote intent cannot change writer topology', () => fixture(async root => {
