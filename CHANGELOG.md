@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.51.6.0] - 2026-09-21
+## [0.51.7.1] - 2026-09-22
 
 **Your agent can now open administration and guide another agent through a working connection.**
 
@@ -33,7 +33,7 @@ Follow [MCP administration](docs/mcp/ADMIN.md) for registration, native OAuth/PK
 
 Owner administration requires the separate owner credential. An OAuth client's `admin` scope does not open the dashboard. After a server restart, open a fresh owner session and restart pending authorization in the native client. Token invalidation leaves accepted jobs subject to their existing grant checks; revocation or deletion denies them at their next authority check. Already admitted external work may complete.
 
-## To take advantage of v0.51.6.0
+## To take advantage of v0.51.7.1
 
 Run `gbrain upgrade` on the server host and on machines using the CLI, then restart the existing server through its usual service manager. Verify owner access with the read-only `mcp admin clients` command above, then open a fresh owner link. This release adds no database migration. Existing grants and token invalidations remain in effect. Keep the configured bootstrap credential private and stable across restarts; follow the runbook's headless recovery steps if it has been lost.
 
@@ -55,6 +55,83 @@ Run `gbrain upgrade` on the server host and on machines using the CLI, then rest
 - Add a required pinned Chromium browser lane exercising shipped embedded assets, plus HTTP, credential-redaction, lifecycle-race, and instruction coverage.
 - Stabilize native Codex test fixtures with explicit per-tool approval and bounded MCP startup waiting; isolate provider credentials and home directories in keyless fixtures. Preserve behavioral and security assertions.
 - Update existing HTTP message assertions to check the owner-specific authentication and retry remedies.
+
+## [0.51.7.0] - 2026-09-21
+
+**Search can find your pages without quietly mistaking an unfinished index for an empty brain.** Large brains no longer rely on a misleading estimate that made vector search scan every chunk. Filtered searches can look beyond their first batch of candidates, and they tell you when their work limit still leaves the answer incomplete. Keyword results stay stable between repeated requests and adjacent pages.
+
+Code and Markdown recovery now use the same guarded preparation as normal indexing. Code metadata can be repaired while the resident writer owns the database, without changing your original files or paying to embed them again. Existing vectors survive only when their content and model provenance still match. Search and doctor distinguish pending projections from a genuine miss, even when some results are already available.
+
+**Say to your agent:** *"Check whether my search index is ready, and repair code metadata without spending on embeddings."*
+
+### How to use it
+
+Upgrade normally, then run `gbrain doctor`. Keep the upgraded resident `gbrain serve` running to drain queued projection rebuilds. For code metadata repair, use `gbrain reindex-code --force --no-embed`; use `--source <id>` to restrict the work. Authorize `gbrain embed --stale` separately if vectors are still missing.
+
+| Situation | What you can now see |
+|---|---|
+| A filtered vector scan reaches its work limit | `vector_candidates_incomplete`, not a false clean miss. |
+| Some visible pages still need a current text projection | `projection_pending`, including alongside nonempty results. |
+| The readiness probe cannot run | `projection_status_unknown`, rather than an unsupported claim that everything is ready. |
+| A query starts or ends at an exact date boundary | Inclusive public bounds, including the final microseconds of a date-only upper bound. |
+
+### Things to watch
+
+HNSW remains approximate. Postgres can use a server-cancelled exact fallback within its remaining search budget; PGLite reports an unresolved shortfall rather than pretending a timer stopped its database work. A text-ready page may still need embeddings. CLI JSON keeps its result-array format and sends incompleteness notices to stderr; MCP exposes retrieval metadata in its response envelope.
+
+## To take advantage of v0.51.7.0
+
+`gbrain upgrade` should apply the schema changes automatically. If schema maintenance failed, run `gbrain apply-migrations --yes` with an authorized database maintenance role, then run `gbrain doctor`. Statistics hidden by row-security policy are not treated as absent. Your agent can follow `skills/migrations/v0.51.7.0.md`; no global planner settings, vector-index rebuild, provider change or automatic embedding spend is required.
+
+### Itemized changes
+
+- Schema migrations 160 and 161 add verified current-projection expression statistics and the pending-projection lookup index. Bulk import, sync, reindex and drained recovery refresh statistics outside page locks.
+- Both engines separate candidate, iterative-scan and pagination limits; preserve scope and visibility filters; and surface incomplete candidate pools through hybrid search, CLI and MCP.
+- Postgres relaxed keyword retries prefer index access locally. Keyword candidate and result ordering are deterministic; caseless CJK terms use LIKE while case-sensitive alphabets retain ILIKE.
+- Public `since`/`until` comparisons preserve inclusivity and timestamp precision. Independent atoms no longer receive transcript-session demotions.
+- Managed-safe code reindexing and shared Markdown/code preparation preserve fenced metadata, valid vectors and incoming graph edges; rebuilt outgoing edges become eligible for resolution again. Resolver batches and projection replacement share ordered guards, so a concurrent old resolver cannot certify new edges. Code reads enforce current live projections, and recursive operations do not reuse stale traversal caches.
+- Contributed by @time-attack (#5126, keyword ordering), @morven-ai (#5169, CJK operator selection), @Laochaleun (#5245, Markdown projection preparation), and @tarush1989 (#5085, atom diversification). Thanks to the issue reporters for the planner and retrieval reproductions.
+
+### For contributors
+
+- Required PgBouncer execution checks no longer misclassify passing output when the summary reader exits early. Native-lock contention fixtures wait for setup ownership before asserting write exclusion, without changing the contention assertions.
+
+## [0.51.6.0] - 2026-09-21
+
+**A temporary brain gets one safe second chance to start.**
+
+An occasional startup failure no longer has to end a session that uses a fresh,
+temporary brain. If the first attempt fails before the database opens, GBrain
+tries once more from scratch. A successful retry tells you what happened. If
+both attempts fail, it stops and keeps both errors available for diagnosis.
+
+This second chance applies only to temporary databases held in memory. Your
+saved brain keeps its existing locking and repair protections. If a database
+has already opened and a later setup step fails, GBrain closes that database
+instead of replacing it with another one. If cleanup itself fails, it preserves
+the existing refusal to reopen until the process exits.
+
+| Situation | Result |
+|---|---|
+| Startup succeeds immediately | No retry or recovery warning. |
+| A temporary database fails to open once | One fresh attempt, without the cached snapshot. |
+| Both attempts fail | Startup fails with the original error and retry details. |
+| Setup fails after the database opens | The open database is closed; startup is not retried. |
+
+The behavior is automatic after upgrading. It does not retry entire failed test
+files, change saved-data repair rules, or guarantee recovery from every runtime
+failure. The doctor's separate temporary on-disk probe is unchanged.
+
+### Itemized changes
+
+- Bound in-memory `PGLiteEngine.connect()` recovery to one cold create before
+  any database is attached; replay the schema after snapshot fallback.
+- Preserve both failed-attempt diagnostics and existing shutdown ownership.
+- Add deterministic coverage for recovery, real snapshots, post-open cleanup,
+  poisoned close, concurrent connect/disconnect, and process exit status.
+
+Contributed by @RoniHenareh in #5272, with lifecycle safety and regression coverage
+extended during integration.
 
 ## [0.51.4.0] - 2026-09-21
 
