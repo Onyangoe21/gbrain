@@ -29,6 +29,7 @@ src/core/calibration/undo-wave.ts	1	engine_guard	Canonical table SQL trigger req
 src/core/chronicle/extract-events.ts	2	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/drift.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/extract-atoms.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
+src/core/cycle/extract-atoms-page-state.ts	1	engine_guard	Atom completion updates and cardinality checks share one transaction; managed canonical SQL remains fenced and scan/failure bookkeeping is stored separately.
 src/core/cycle/extract-facts.ts	2	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/extract-takes.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/grade-takes.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.

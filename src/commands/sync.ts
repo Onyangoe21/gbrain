@@ -71,6 +71,7 @@ import { loadStorageConfig, findDbOnlyCollisions } from '../core/storage-config.
 // time. integrations.ts is side-effect-free at module load (pure recipe I/O
 // helpers), so a static import is safe here.
 import { getConfiguredCollectorOutputs } from './integrations.ts';
+import { printManagedSyncDiagnostic } from './sync-diagnostics.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // v0.41.32.0: stamp the durable newest-COMMIT timestamp at sync time so the
 // remote staleness path reads a column instead of shelling out to git.
@@ -243,6 +244,7 @@ export function shouldNudgeAfterSync(status: SyncResult['status']): boolean {
 }
 
 export interface SyncResult {
+  managedWrite?: import('../core/persistence/sync-run.ts').ManagedSyncWriteDiagnostic;
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures' | 'partial';
   fromCommit: string | null;
   toCommit: string;
@@ -5208,11 +5210,11 @@ See also:
         const r = results[i];
         const src = runnableSources[i];
         if (r.status === 'fulfilled') {
-          writeHuman(`  ✓ ${src.name}: ${r.value.result.status} (added=${r.value.result.added}, modified=${r.value.result.modified}, deleted=${r.value.result.deleted})`);
+          if (!printManagedSyncDiagnostic(r.value.result, humanSink)) writeHuman(`  ✓ ${src.name}: ${r.value.result.status} (added=${r.value.result.added}, modified=${r.value.result.modified}, deleted=${r.value.result.deleted})`);
           perSourceResults.push({
             sourceId: src.id,
             sourceName: src.name,
-            status: 'ok',
+            status: r.value.result.managedWrite ? 'error' : 'ok',
             result: r.value.result,
           });
         } else {
@@ -5235,7 +5237,7 @@ See also:
           perSourceResults.push({
             sourceId: src.id,
             sourceName: src.name,
-            status: 'ok',
+            status: result.managedWrite ? 'error' : 'ok',
             result,
           });
         } catch (e: unknown) {
@@ -5273,6 +5275,7 @@ See also:
             // #3068: surface the partial reason (e.g. pull_failed) so JSON
             // consumers can distinguish a self-healing timeout from a wedge.
             ...(r.result.reason ? { reason: r.result.reason } : {}),
+            ...(r.result.managedWrite ? { managed_write: r.result.managedWrite } : {}),
             added: r.result.added,
             modified: r.result.modified,
             deleted: r.result.deleted,
@@ -5379,20 +5382,12 @@ See also:
     }
   }
 
-  // Bug 9 — --retry-failed: before running normal sync, clear acknowledgment
-  // flags so the sync picks them up as fresh work. The actual re-attempt
-  // happens inside the regular incremental/full loop because once the commit
-  // pointer is behind the failures, the diff naturally revisits them.
   if (retryFailed) {
-    // v0.42.42.0 (#2139, D13C): scope the retry count to THIS source — rows
-    // carry source_id (#1939), so a single-source retry shouldn't report
-    // another source's failures.
     const failures = unacknowledgedSyncFailures().filter(f => f.source_id === sourceId);
     if (failures.length === 0) {
-      slog('No unacknowledged sync failures to retry.');
+      slog('No local ledger entries; checking the durable sync cursor for unfinished or failed writes.');
     } else {
       slog(`Retrying ${failures.length} previously-failed file(s)...`);
-      // Don't acknowledge them yet — they must succeed to clear.
     }
   }
 
@@ -5414,7 +5409,7 @@ See also:
     // Routed through the owned verdict channel (NOT bare `process.exitCode`,
     // which PGLite's Emscripten runtime clobbers mid-run — see
     // src/core/cli-force-exit.ts).
-    if (result.status === 'partial' && result.reason === 'pull_failed') {
+    if (result.managedWrite || result.status === 'partial' && result.reason === 'pull_failed') {
       const { setCliExitVerdict } = await import('../core/cli-force-exit.ts');
       setCliExitVerdict(1);
     }
@@ -5466,7 +5461,8 @@ See also:
       }
     }
     if (jsonOut) {
-      console.log(JSON.stringify(buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate)));
+      console.log(JSON.stringify({ ...buildSingleSyncJsonEnvelope(sourceId, result, singleEmbedBackfill, singleCostGate),
+        ...(result.managedWrite ? { managed_write: result.managedWrite } : {}) }));
     }
     return;
   }
@@ -5900,6 +5896,7 @@ async function maybeExtractionNudge(engine: BrainEngine, sourceId?: string): Pro
  * JSON envelope pipes cleanly through `jq` (D4).
  */
 export function printSyncResult(result: SyncResult, sink: NodeJS.WriteStream = process.stdout) {
+  if (printManagedSyncDiagnostic(result, sink)) return;
   const write = (line: string) => sink.write(line + '\n');
   const writeUncommittedNote = (u: NonNullable<SyncResult['uncommitted']>) =>
     write(

@@ -3,6 +3,26 @@
 On-demand reference (see CLAUDE.md Reference map). Current behavior + invariants
 only.
 
+### Canonical reconciliation
+
+`test/persistence-reconcile-merge.test.ts` pins loss-preserving field choices.
+`test/persistence-reconcile.test.ts` runs the guarded repair and replay contracts
+on PGLite and, with an explicit safe `DATABASE_URL`, isolated PostgreSQL databases.
+It covers stale preconditions, current/original grants, private facts, retained
+backups, ordinary mutations after repair, and competing publications.
+`test/reconcile-owner-journey.serial.test.ts` drives real CLI requests through
+HTTP and stdio PGLite owners before and after activation, restarts the owner, and
+independently reads the newly remembered private fact and provenance.
+
+`test/reconcile-crash.slow.test.ts` and `test/e2e/reconcile-crash*.test.ts` kill real
+processes at all eight publication boundaries with activation off/on. PostgreSQL
+uses one file per activation state to stay within the unchanged per-file cap. Optional
+`GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR` retains executed-case evidence.
+`test/e2e/reconcile-pgbouncer.test.ts` requires the transaction-mode pooler when
+`GBRAIN_CI_REQUIRE_PGBOUNCER=1` and proves repair followed by a new private memory
+write. The durable-persistence workflow runs these contracts on both supported
+Bun versions and uploads the crash manifests; local CI runs the slow and E2E lanes.
+
 Search reliability has real-planner and transport regressions in
 `test/e2e/vector-candidate-safety-postgres.test.ts`,
 `test/e2e/search-query-contract-postgres.test.ts`,
