@@ -1,11 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
 import { runExtractFacts } from '../../src/core/cycle/extract-facts.ts';
 import { renderFactsTable } from '../../src/core/facts-fence.ts';
-import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
 const slug = 'people/vector-repair-example';
@@ -13,13 +12,20 @@ const slug = 'people/vector-repair-example';
 for (const kind of ['pglite', 'postgres'] as const) {
   describe.skipIf(kind === 'postgres' && !databaseUrl)(`${kind} fact-vector preservation`, () => {
     let engine: BrainEngine;
+    let closePostgres: (() => Promise<void>) | undefined;
     const vector = new Float32Array(1536).fill(0.25);
 
     beforeAll(async () => {
-      engine = kind === 'pglite' ? new PGLiteEngine() : new PostgresEngine();
-      if (kind === 'postgres') assertSafeE2eDatabaseUrl(databaseUrl!);
-      await engine.connect(kind === 'pglite' ? {} : { database_url: databaseUrl! });
-      await engine.initSchema();
+      configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: {} });
+      if (kind === 'postgres') {
+        const fixture = await isolatedPersistencePostgres(databaseUrl!);
+        engine = fixture.engine;
+        closePostgres = fixture.close;
+      } else {
+        engine = new PGLiteEngine();
+        await engine.connect({});
+        await engine.initSchema();
+      }
     });
 
     beforeEach(async () => {
@@ -42,7 +48,8 @@ for (const kind of ['pglite', 'postgres'] as const) {
     afterAll(async () => {
       await engine.executeRaw('DELETE FROM facts WHERE source_markdown_slug=$1', [slug]);
       await engine.executeRaw('DELETE FROM pages WHERE slug=$1', [slug]);
-      await engine.disconnect();
+      if (closePostgres) await closePostgres();
+      else await engine.disconnect();
     });
 
     async function setFence(claim: string, rowNum: number, visibility: 'world' | 'private' = 'world', active = true) {
