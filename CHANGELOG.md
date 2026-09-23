@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.52.3.0] - 2026-09-23
+## [0.53.0.0] - 2026-09-23
 
 **Keep what your agents know and how they work in the same brain.** New local brains now create a content directory containing both knowledge and useful memory skills. Connected agents can discover the same published instructions instead of maintaining unrelated copies. An explicitly authorized editor can update a skill once, and other connections can fetch the same committed version, including its approved supporting files.
 
@@ -21,11 +21,11 @@ New host grants follow published skills by default; choose `--skills memory-only
 | An old brain is upgraded | A staged migration records content, ownership and client actions without overwriting edits or expanding disclosure. |
 | A client cannot check freshness | Enforced adapter admission blocks stale use; advisory native integrations do not claim stronger guarantees. |
 
-## To take advantage of v0.52.3.0
+## To take advantage of v0.53.0.0
 
 1. Run `gbrain upgrade`, then inspect `gbrain apply-migrations --dry-run --json`.
 2. On an existing file-backed brain, stop older writers and skill-serving processes, review writer status, and follow the migration checklist's state-bound claim and activation steps. Shared-skill activation requires explicit administration intent and the reviewed state; quiescence alone is not authority. Re-run `gbrain apply-migrations --yes` to finish eligible mechanical stages.
-3. Read `skills/migrations/v0.52.3.0.md` for explicit follow grants, DB-only export, local conflicts and verification. Reconnect each intended harness; do not count disconnected or native-unverified clients as finished.
+3. Read `skills/migrations/v0.53.0.0.md` for explicit follow grants, DB-only export, local conflicts and verification. Reconnect each intended harness; do not count disconnected or native-unverified clients as finished.
 4. See [shared brain skills](docs/guides/shared-brain-skills.md) for scoped editing, disclosure policy, exact-version retrieval and recovery. Keep an operational database backup: Git content does not contain grants, delivery receipts or revocation history.
 
 ### Itemized changes

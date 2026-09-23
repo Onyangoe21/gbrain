@@ -97,7 +97,7 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
         await pending('projection', sourcePolicy.reason);
         continue;
       }
-      await pending('inventory', 'db_only_export_required: preview gbrain apply-migrations --migration 0.52.3 --export-db-only --content-root <new-root> --export-source ' + source.id + ' --dry-run --json; approve quiescence and backup choice before exporting. Memory stays available.');
+      await pending('inventory', 'db_only_export_required: preview gbrain apply-migrations --migration 0.53.0 --export-db-only --content-root <new-root> --export-source ' + source.id + ' --dry-run --json; approve quiescence and backup choice before exporting. Memory stays available.');
       continue;
     }
     const checkpoint = await ctx.engine.getConfig(key);
@@ -197,7 +197,7 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
         complete = entries.length <= 256 && entries.every(name => !existsSync(join(hostDir, name, 'SKILL.md')) || declared.has(name));
       } catch { complete = false; }
     }
-    if (!complete) report.pending_actions.push('Host-global catalog assignment is pending. Review a dedicated content pack root with skillpack.json (brain_resident:true) and declared skills; never register the application checkout. After approval, register it with `gbrain sources add shared-skills --path <reviewed-pack-root> --force --no-federated`. Inspect `gbrain sources writer status --json` before deliberate ownership changes; follow skills/migrations/v0.52.3.0.md for action-specific --admin-intent and reviewed --expected-state claim/activation steps. Quiescence is a separate prerequisite, not administration authority. Preview `gbrain apply-migrations --migration 0.52.3 --dry-run --json`, then apply with --yes only when those stages are approved. Original files and grants are unchanged; unmanifested or undeclared skills require explicit review.');
+    if (!complete) report.pending_actions.push('Host-global catalog assignment is pending. Review a dedicated content pack root with skillpack.json (brain_resident:true) and declared skills; never register the application checkout. After approval, register it with `gbrain sources add shared-skills --path <reviewed-pack-root> --force --no-federated`. Inspect `gbrain sources writer status --json` before deliberate ownership changes; follow skills/migrations/v0.53.0.0.md for action-specific --admin-intent and reviewed --expected-state claim/activation steps. Quiescence is a separate prerequisite, not administration authority. Preview `gbrain apply-migrations --migration 0.53.0 --dry-run --json`, then apply with --yes only when those stages are approved. Original files and grants are unchanged; unmanifested or undeclared skills require explicit review.');
   }
   report.status = report.sources.some(row => row.status === 'conflict') ? 'conflict'
     : report.sources.some(row => row.status === 'action_required') || report.pending_actions.length ? 'action_required' : dryRun ? 'planned' : 'complete';

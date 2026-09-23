@@ -2590,8 +2590,8 @@ consent gates around unattended remediation.
 
 ## Upgrade
 
-For v0.52.3.0, follow the
-[mechanical shared-skills migration](skills/migrations/v0.52.3.0.md) on the host,
+For v0.53.0.0, follow the
+[mechanical shared-skills migration](skills/migrations/v0.53.0.0.md) on the host,
 starting with `gbrain apply-migrations --dry-run --json`. Stop/exclude old writers,
 review writer status, and use the checklist's action-specific `--admin-intent`
 and reviewed `--expected-state` when activating shared skills. Quiescence flags

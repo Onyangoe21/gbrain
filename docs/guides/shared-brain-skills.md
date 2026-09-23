@@ -358,7 +358,7 @@ downloaded files, other history, or backups.
 
 ## Migrate an existing brain
 
-Use the mechanical [v0.52.3.0 migration checklist](../../skills/migrations/v0.52.3.0.md).
+Use the mechanical [v0.53.0.0 migration checklist](../../skills/migrations/v0.53.0.0.md).
 Start on the host with `gbrain apply-migrations --dry-run --json`. It inventories
 registered roots and reports stage-specific conflicts, not arbitrary home
 directories or disconnected devices. Keep operational DB and content backups

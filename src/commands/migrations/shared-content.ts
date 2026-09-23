@@ -5,7 +5,7 @@ import type { Migration } from './types.ts';
 import type { OrchestratorOpts } from './types.ts';
 import { exportDatabaseContent } from '../../core/shared-skills/migration-export.ts';
 
-export const SHARED_CONTENT_MIGRATION_VERSION = '0.52.3';
+export const SHARED_CONTENT_MIGRATION_VERSION = '0.53.0';
 
 export async function inspectSharedContentMigration(dryRun: boolean, exportOptions?: OrchestratorOpts['dbOnlyExport']): Promise<SharedMigrationReport | null> {
   const config = loadConfig();
