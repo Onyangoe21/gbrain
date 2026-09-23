@@ -87,6 +87,26 @@ beforeEach(async () => {
 afterAll(async () => { await engine.disconnect(); });
 
 describe('retrieval output boundary', () => {
+  test('search and CLI retain incomplete retrieval diagnostics after exhausting the text scan budget', async () => {
+    await engine.setConfig('search.mcp_keyword_only', 'true');
+    await engine.putPage('notes/pending-projection', { type: 'note', title: 'Pending projection', compiled_truth: 'Unprojected fixture.' });
+    rows = Array.from({ length: 100 }, (_, index) => ({
+      ...row(), slug: `notes/large-${index}`, title: 'a'.repeat(16000), chunk_text: 'b'.repeat(16000), source_subject: 'c'.repeat(1000),
+    }));
+    const keyword = spyOn(engine, 'searchKeyword').mockResolvedValue(rows);
+    try {
+      const { ctx, meta } = context(false);
+      const result = await operationsByName.search.handler(ctx, { query: 'fixture', limit: 100 }) as SearchResult[];
+      expect(result).toHaveLength(rows.length);
+      expect(meta.retrieval.degraded).toContainEqual({ stage: 'projection_pending' });
+      expect(meta.retrieval.projection_readiness).toMatchObject({ status: 'projection_pending', ready: false });
+      captureRetrievalMeta('retrieval', meta.retrieval);
+      expect(formatResult('search', result)).toContain('Retrieval incomplete: projection_pending.');
+      captureRetrievalMeta('retrieval', { degraded: [{ stage: 'projection_pending' }], projection_readiness: { status: 'projection_pending', ready: false } });
+      expect(formatResult('search', rows)).toContain('Retrieval incomplete: projection_pending.');
+    } finally { keyword.mockRestore(); }
+  });
+
   test('real keyword retrieval redacts a sealed projection while its canonical page and chunks stay intact', async () => {
     await engine.setConfig('search.mcp_keyword_only', 'true');
     await engine.putPage('notes/synthetic-keyword', {

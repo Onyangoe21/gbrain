@@ -69,6 +69,27 @@ describe('bounded retrieval display redaction', () => {
     expect(output.meta.answer).toBe(OUTPUT_REDACTION_LIMIT);
   });
 
+  test('scan exhaustion retains only validated retrieval metadata codes at their exact paths', () => {
+    const rows: Array<{ chunk_text: string; status?: string; stage?: string }> = Array.from({
+      length: OUTPUT_REDACTION_MAX_TOTAL_CHARS / OUTPUT_REDACTION_MAX_FIELD_CHARS,
+    }, () => ({ chunk_text: 'a'.repeat(OUTPUT_REDACTION_MAX_FIELD_CHARS) }));
+    rows.push({ chunk_text: '', status: 'projection_pending', stage: 'projection_pending' });
+    const metadata = {
+      degraded: [{ stage: 'projection_pending', reason: 'no_provider', detail: key }, { stage: key, reason: key }],
+      projection_readiness: { status: 'projection_pending', ready: false, hint: key },
+      nested: { degraded: [{ stage: 'projection_pending' }], projection_readiness: { status: 'ready' } },
+    };
+    const output = redactRetrievalOutput(rows, metadata);
+    expect(output.meta.degraded[0]).toEqual({ stage: 'projection_pending', reason: 'no_provider', detail: OUTPUT_REDACTION_LIMIT });
+    expect(output.meta.degraded[1]).toEqual({ stage: OUTPUT_REDACTION_LIMIT, reason: OUTPUT_REDACTION_LIMIT });
+    expect(output.meta.projection_readiness).toEqual({ status: 'projection_pending', ready: false, hint: OUTPUT_REDACTION_LIMIT });
+    expect(output.meta.nested.degraded[0].stage).toBe(OUTPUT_REDACTION_LIMIT);
+    expect(output.meta.nested.projection_readiness.status).toBe(OUTPUT_REDACTION_LIMIT);
+    expect(output.results.at(-1)!.stage).toBe(OUTPUT_REDACTION_LIMIT);
+    expect(output.results.at(-1)!.status).toBe(OUTPUT_REDACTION_LIMIT);
+    expect(metadata.degraded[0].detail).toBe(key);
+  });
+
   test('many fields cannot exhaust the budget by erasing result identities or numeric ranking', () => {
     const rows = Array.from({ length: 9000 }, (_, i) => ({ slug: `notes/synthetic-${i}`, chunk_text: key, score: i }));
     const output = redactRetrievalOutput(rows, {});
