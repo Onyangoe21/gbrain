@@ -30,7 +30,7 @@
  * leading dashes everywhere in this file, including the stub template.
  */
 
-import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
+import { assertLegacySkillFilesystemWrite, confinedSkillChildWrite } from './writer-guard.ts';
 import {
   existsSync,
   lstatSync,
@@ -923,7 +923,10 @@ export function removeHarnessBridge(opts: {
   const notOwned = requested.filter(s => !owned.includes(s));
   const toRemove = requested.filter(s => owned.includes(s));
   if (!dryRun) for (const slug of toRemove) for (const rel of Object.keys(entry!.written[slug].files)) {
-    assertLegacySkillFilesystemWrite(join(opts.destDir, rel));
+    try { confinedSkillChildWrite(opts.destDir, rel); } catch (error) {
+      if ((error as { code?: string }).code === 'target_escape') throw new BridgeError((error as Error).message, 'target_escape', rel);
+      throw error;
+    }
   }
 
   const removedFiles: string[] = [];

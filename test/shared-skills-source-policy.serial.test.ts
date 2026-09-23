@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { isolatedSharedSkillsEngine } from './helpers/shared-skills-engine.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 import { inspectCompanyBrain } from '../src/core/company-brain/inspection.ts';
 import { connectCompanyBrain } from '../src/core/company-brain/runtime.ts';
 import { getCompanyBrainProfile } from '../src/core/company-brain/profile.ts';
@@ -40,7 +41,7 @@ test('a real approved company source remains byte-identical across shared-skill 
     const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-C', root, ...args], { encoding: 'utf8' }).trim();
     try {
       mkdirSync(root);
-      git('init', '--quiet');
+      await makeGitFixture(root);
       for (const [path, content] of Object.entries({
         'people/operator.md': '---\ntype: person\ntitle: Example Operator\n---\n# Example Operator\nOwns the account.\n',
         'customers/account.md': '---\ntype: customer\ntitle: Example Account\nowner: "[[people/operator]]"\naudience: internal\n---\n# Example Account\nSynthetic account.\n',

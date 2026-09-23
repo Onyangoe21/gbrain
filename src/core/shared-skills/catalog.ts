@@ -28,7 +28,7 @@ async function identity(ctx: OperationContext) {
 function opaque(secret: string, value: unknown): string { return createHmac('sha256', Buffer.from(secret, 'hex')).update(stableJson(value)).digest('base64url'); }
 function encodeCursor(secret: string, value: unknown): string {
   const nonce = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', Buffer.from(secret, 'hex'), nonce);
+  const cipher = createCipheriv('aes-256-gcm', Buffer.from(secret, 'hex'), nonce, { authTagLength: 16 });
   const content = Buffer.concat([cipher.update(stableJson(value), 'utf8'), cipher.final()]);
   return Buffer.concat([nonce, cipher.getAuthTag(), content]).toString('base64url');
 }
@@ -36,7 +36,8 @@ function decodeCursor(secret: string, value: string): { auth: string; view: stri
   try {
     if (value.length > 4096) throw new Error();
     const data = Buffer.from(value, 'base64url');
-    const decipher = createDecipheriv('aes-256-gcm', Buffer.from(secret, 'hex'), data.subarray(0, 12));
+    if (data.length < 28) throw new Error();
+    const decipher = createDecipheriv('aes-256-gcm', Buffer.from(secret, 'hex'), data.subarray(0, 12), { authTagLength: 16 });
     decipher.setAuthTag(data.subarray(12, 28));
     return JSON.parse(Buffer.concat([decipher.update(data.subarray(28)), decipher.final()]).toString());
   } catch { throw new OperationError('full_resync_required', 'The catalog cursor is invalid or expired.'); }

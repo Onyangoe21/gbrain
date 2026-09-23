@@ -15,7 +15,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { assertLegacySkillFilesystemWrite } from './skillpack/writer-guard.ts';
+import { assertLegacySkillFilesystemWrite, confinedSkillChildWrite } from './skillpack/writer-guard.ts';
 import {
   CROSS_CUTTING_PATTERNS,
   DRY_PROXIMITY_LINES,
@@ -250,7 +250,7 @@ export function autoFixDryViolations(
   const fixed: FixOutcome[] = [];
   const skipped: FixOutcome[] = [];
   const { skills: manifest } = loadOrDeriveManifest(skillsDir);
-  if (!opts.dryRun) for (const skill of manifest) assertLegacySkillFilesystemWrite(join(skillsDir, skill.path));
+  if (!opts.dryRun) for (const skill of manifest) confinedSkillChildWrite(skillsDir, skill.path);
 
   for (const skill of manifest) {
     const skillPath = join(skillsDir, skill.path);

@@ -155,7 +155,10 @@ export async function createLifecycleFixture(options: { root: string; size: numb
             counters.pending_receipts++;
             return payload.write_request as T;
           }
-          throw Object.assign(new Error(`Benchmark operation ${operation} failed`), { code: payload.error ?? 'operation_failed', operation });
+          const error = new Error(`Benchmark operation ${operation} failed`) as Error & { code: unknown; operation: string };
+          error.code = payload.error ?? 'operation_failed';
+          error.operation = operation;
+          throw error;
         }
         return payload as T;
       } catch (error) { counters.errors++; throw error; }

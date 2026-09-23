@@ -64,7 +64,7 @@ export async function runLifecycleBenchmark(options: LifecycleOptions) {
           try { sample = JSON.parse(readFileSync(samplePath, 'utf8')); }
           catch { sample = { correctness_pass: false, failure: { phase: 'worker', code: 'missing_sample_manifest' } }; }
           if (code !== 0 || timedOut) { sample.correctness_pass = false; sample.process_failure = { exit_code: code, timed_out: timedOut }; }
-          Object.assign(sample, { corpus: size, independent_run: run, manifest_path: samplePath, log_path: logPath });
+          sample = { ...sample, corpus: size, independent_run: run, manifest_path: samplePath, log_path: logPath };
           group.push(sample); manifest.samples.push(sample);
           assert.deepEqual(sourceHashes(), manifest.source_hashes, 'Measured source changed during a sample');
           process.stderr.write(`[shared lifecycle] valid_calls=${sample.correctness_pass}, reads=${sample.gate_sample?.phase_b?.queries_run}, ` +

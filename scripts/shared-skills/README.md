@@ -70,7 +70,7 @@ No absolute latency, memory or throughput budget is invented by this workload.
 ```bash
 env -u DATABASE_URL bun --no-env-file scripts/shared-skills/lifecycle.ts \
   --smoke --manifest=.context/shared-skills-lifecycle-smoke.json
-bun test test/shared-skills-lifecycle-benchmark.test.ts
+bun test --timeout=60000 test/shared-skills-lifecycle-benchmark.test.ts
 ```
 
 The smoke uses two skills, two members, four reads per phase and one independent

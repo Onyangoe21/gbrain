@@ -131,6 +131,13 @@ test('scoped views ignore hidden-source changes, bind cursors and disambiguate q
   await put(f.local, 'alpha'); await put(f.local, 'beta');
   const first = await listSharedSkills(f.reader, { limit: 1 });
   expect(first.next_cursor).toBeDefined();
+  const cursorBytes = Buffer.from(first.next_cursor!, 'base64url');
+  for (const length of [0, 11, 12, 20, 27, 28, cursorBytes.length - 1]) {
+    await expect(listSharedSkills(f.reader, { limit: 1, cursor: cursorBytes.subarray(0, length).toString('base64url') || 'invalid' }))
+      .rejects.toMatchObject({ code: 'full_resync_required' });
+  }
+  const changedTag = Buffer.from(cursorBytes); changedTag[12] ^= 1;
+  await expect(listSharedSkills(f.reader, { limit: 1, cursor: changedTag.toString('base64url') })).rejects.toMatchObject({ code: 'full_resync_required' });
   await put({ ...f.local, sourceId: 'hidden' }, 'alpha');
   expect((await listSharedSkills(f.reader, { limit: 1 })).view_token).toBe(first.view_token);
   expect((await listSharedSkills(f.reader, { limit: 1, cursor: first.next_cursor })).skills[0].name).toBe('beta');

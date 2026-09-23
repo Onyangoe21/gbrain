@@ -15,7 +15,7 @@
  *     and refuses to overwrite unless `--force-unlock`.
  */
 
-import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
+import { assertLegacySkillFilesystemWrite, confinedSkillChildWrite } from './writer-guard.ts';
 import {
   closeSync,
   existsSync,
@@ -373,7 +373,7 @@ export function applyInstall(
   if (!opts.dryRun) {
     assertLegacySkillFilesystemWrite(plan.targetWorkspace);
     assertLegacySkillFilesystemWrite(plan.targetSkillsDir);
-    for (const { entry } of plan.entryOutcomes) assertLegacySkillFilesystemWrite(join(plan.targetSkillsDir, entry.relTarget));
+    for (const { entry } of plan.entryOutcomes) confinedSkillChildWrite(plan.targetSkillsDir, entry.relTarget);
   }
   const files: FileResult[] = [];
 

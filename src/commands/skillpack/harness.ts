@@ -57,6 +57,7 @@ import { BundleError, bundledSkillSlugs, loadBundleManifest } from '../../core/s
 import { findGbrainOrDie, resolveAbs, resolveWorkspace } from './shared.ts';
 import { installSharedBrainBridge } from '../../core/skillpack/shared-brain-bridge.ts';
 import { nativeSharedSkillsDirectory } from '../../core/harness/native-router.ts';
+import { confinedSkillChildWrite } from '../../core/skillpack/writer-guard.ts';
 
 const DEFAULT_PERSONA: Record<Exclude<BridgeHarness, 'openclaw'>, string> = {
   'claude-code': 'coding-agent',
@@ -369,7 +370,7 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
     const shared = await withBestEffortEngine(engine => installSharedBrainBridge({ engine, config: loadConfig(), harness: a.harness,
       policy: a.skillsPolicy, dryRun: a.dryRun,
       dest: a.dest ? resolveAbs(a.dest) : a.harness === 'claude-code' ? resolveDest(a)
-        : a.harness === 'openclaw' && a.workspace ? join(resolveAbs(a.workspace), 'skills') : nativeSharedSkillsDirectory(a.harness) ?? undefined }));
+        : a.harness === 'openclaw' && a.workspace ? confinedSkillChildWrite(resolveAbs(a.workspace), 'skills', { dryRun: a.dryRun }) : nativeSharedSkillsDirectory(a.harness) ?? undefined }));
     if (shared) {
       if (a.json) console.log(JSON.stringify({ ok: true, harness: a.harness, dryRun: a.dryRun, ...shared }, null, 2));
       else console.log(`shared skills: ${shared.status} (${shared.reason})\n${shared.next_action}`);
