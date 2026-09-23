@@ -81,18 +81,21 @@ export async function managedAtomSession(engine: BrainEngine, sourceId: string, 
   if (retry) {
     if (!retry.retryId || retry.retryId.length > 128) throw new OperationError('invalid_params', 'A bounded explicit atom retry identity is required.');
     const prior = await getWriteRequest(engine, authority.principal, requireUuid(retry.requestId));
-    if (!prior || prior.operation !== 'submit_job' || prior.source_id !== sourceId || prior.source_incarnation !== source.incarnation || !String(prior.intent?.kind).startsWith('managed_atom_')) {
+    if (!prior || prior.operation !== 'submit_job' || prior.source_id !== sourceId || prior.source_incarnation !== source.incarnation) {
       throw new OperationError('not_found', 'No retained atom batch belongs to this writer, source and request.');
     }
     await authorizeStoredRequest(engine, prior);
+    if (prior.compacted && !prior.intent) expiredAtomReceipt(prior);
+    if (!String(prior.intent?.kind).startsWith('managed_atom_')) throw new OperationError('not_found', 'No retained atom batch belongs to this writer, source and request.');
     const p = prior.intent as AtomIntent;
-    const rows = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2
-      AND source_incarnation=$3::uuid AND intent->>'runKey'=$4 ORDER BY sequence`, [prior.principal_kind, prior.principal_id, source.incarnation, p.runKey]);
+    const rows = await atomBatchRows(engine, session, p.runKey);
     for (let i = 0; i < rows.length; i++) {
       await authorizeStoredRequest(engine, rows[i]);
       if (['queued', 'running', 'recovering'].includes(rows[i].state)) rows[i] = await waitForWrite(engine, rows[i], session.config);
       if (['queued', 'running', 'recovering'].includes(rows[i].state)) writeResponse(rows[i]);
     }
+    const expired = rows.find(row => row.compacted && !row.intent);
+    if (expired) expiredAtomReceipt(expired);
     if (!rows.some(row => row.state !== 'committed' || row.outcome?.failure)) throw new OperationError('invalid_params', 'This atom batch already completed successfully.');
     const checkpointKey = p.checkpointKey ?? p.runKey;
     const [checkpoint] = await engine.executeRaw<{ completed_keys: unknown }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-atoms' AND fingerprint=$1", [checkpointKey]);
@@ -124,7 +127,35 @@ function runKey(session: ManagedAtomSession, origin: AtomOrigin): string {
   return digest(['managed-atoms-v1', session.incarnation, origin.kind, origin.locator, origin.pageId, origin.contentHash]);
 }
 
+function atomRequestId(key: string, slug: string): string {
+  const hex = digest([key, slug]);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+async function atomBatchRows(engine: BrainEngine, session: ManagedAtomSession, key: string): Promise<WriteRequest[]> {
+  const completionId = atomRequestId(key, '__managed_atom_complete__');
+  const completion = await getWriteRequest(engine, session.authority.principal, completionId);
+  if (completion && (completion.operation !== 'submit_job' || completion.source_id !== session.sourceId ||
+    completion.source_incarnation !== session.incarnation || completion.slug !== '__managed_atom_complete__')) {
+    throw new OperationError('idempotency_conflict', 'The atom completion request ID belongs to another accepted operation.');
+  }
+  const children = (completion?.intent as AtomIntent | null)?.children ?? [];
+  return engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE source_id=$1 AND source_incarnation=$2::uuid
+    AND principal_kind=$3 AND principal_id=$4 AND ((intent->>'runKey'=$5 AND intent->>'kind' LIKE 'managed_atom_%')
+      OR request_id=$6::uuid OR id=ANY($7::uuid[])) ORDER BY sequence`,
+  [session.sourceId, session.incarnation, session.authority.principal.kind, session.authority.principal.id, key, completionId, children]);
+}
+
+function expiredAtomReceipt(row: WriteRequest): never {
+  const error = new OperationError('recovery_required', 'The retained payload for this accepted request has expired; atom retry cannot recover it.',
+    'Inspect the original receipt and current source and atom pages before deciding how to recover. No extraction was started.');
+  error.writeRequest = receiptFor(row);
+  error.writeError = 'recovery_required';
+  throw error;
+}
+
 function malformedAtomReceipt(row: WriteRequest): never {
+  if (row.compacted && !row.intent) expiredAtomReceipt(row);
   const error = new OperationError('extraction_failed', 'The accepted atom extraction produced malformed output.',
     `Approve one new attempt with gbrain jobs submit extract-atoms-drain --params '${JSON.stringify({ sourceId: row.source_id, retryRequestId: row.request_id })}'.`);
   error.writeRequest = receiptFor(row);
@@ -143,9 +174,7 @@ export async function resumeManagedAtoms(engine: BrainEngine, session: ManagedAt
       if (failed) { await authorizeStoredRequest(engine, failed); malformedAtomReceipt(failed); }
     }
   }
-  const rows = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE source_id=$1 AND source_incarnation=$2::uuid
-    AND principal_kind=$3 AND principal_id=$4 AND intent->>'runKey'=$5 AND intent->>'kind' LIKE 'managed_atom_%' ORDER BY sequence`,
-  [session.sourceId, session.incarnation, session.authority.principal.kind, session.authority.principal.id, key]);
+  const rows = await atomBatchRows(engine, session, key);
   if (!rows.length) return false;
   for (const row of rows) {
     await authorizeStoredRequest(engine, row);
@@ -153,7 +182,7 @@ export async function resumeManagedAtoms(engine: BrainEngine, session: ManagedAt
     writeResponse(completed);
     if (completed.outcome?.failure) malformedAtomReceipt(completed);
   }
-  if (!rows.some(row => row.intent?.kind === 'managed_atom_complete')) throw new OperationError('storage_error', 'The accepted atom batch has no completion receipt.');
+  if (!rows.some(row => row.request_id === atomRequestId(key, '__managed_atom_complete__'))) throw new OperationError('storage_error', 'The accepted atom batch has no completion receipt.');
   return true;
 }
 
@@ -182,8 +211,7 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
     for (const input of [...inputs, { slug: '__managed_atom_complete__', pageId: null,
       intent: { kind: 'managed_atom_complete', runKey: key, origin, children, ...(failure ? { failure } : {}),
         ...(session.retry ? { checkpointKey: session.retry.checkpointKey, expectedCheckpoint: session.retry.expectedCheckpoint } : {}) } as AtomIntent }]) {
-      const hex = digest([key, input.slug]);
-      const requestId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+      const requestId = atomRequestId(key, input.slug);
       const row = await admitWriteInTransaction(tx, { principal: session.authority.principal, authority: session.authority,
         operation: 'submit_job', sourceId: session.sourceId, sourceIncarnation: session.incarnation,
         worktreeId: session.binding?.worktree_id, topologyGeneration: session.binding?.topology_generation,
