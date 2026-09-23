@@ -14,6 +14,7 @@
 
 import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
+import { PgliteBusyError } from '../core/pglite-lock.ts';
 import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
 import {
@@ -622,6 +623,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       try {
         if (recordCheckpoint) appendCompletedMigration({ version: m.version, status: 'partial' });
       } catch { /* swallow ledger-write failure on throw path */ }
+      if (e instanceof PgliteBusyError) throw e;
       failed = true;
       break;
     }
