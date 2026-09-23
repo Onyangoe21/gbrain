@@ -50,37 +50,51 @@ async function fixture(engine: BrainEngine) {
 }
 
 test('fresh public init imports a directory and a file, reads them, and refuses skill publication', async () => {
-  const local = join(home, 'cli'); mkdirSync(local);
-  const cwd = join(local, 'cwd'); mkdirSync(cwd);
-  const input = join(local, 'input'); mkdirSync(input);
-  const cli = async (...args: string[]) => {
-    const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), ...args], {
-      cwd, env: { PATH: process.env.PATH, HOME: local, GBRAIN_HOME: local, GBRAIN_DISABLE_UPDATE_CHECK: '1' }, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
-    });
-    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    return { stdout, stderr, code };
-  };
-  const init = await cli('init', '--pglite', '--no-embedding');
-  expect(init.code, init.stderr).toBe(0);
-  writeFileSync(join(input, 'first-day.md'), '# First day\n\nRemember the project launch checklist.\n');
-  const imported = await cli('import', input, '--no-embed', '--json');
-  expect(imported.code, imported.stderr).toBe(0);
-  expect(imported.stdout).toContain('"imported":1');
-  expect(imported.stderr).not.toContain('legacy writer');
-  const read = await cli('get', 'first-day', '--json');
-  expect(read.code, read.stderr).toBe(0);
-  expect(read.stdout).toContain('project launch checklist');
-  const again = await cli('import', input, '--no-embed', '--json');
-  expect(again.stdout).toContain('"skipped":1');
-  writeFileSync(join(input, 'single.md'), '# Single file\n\nA second ordinary knowledge page.\n');
-  const single = await cli('import', join(input, 'single.md'), '--no-embed', '--json');
-  expect(single.code, single.stderr).toBe(0);
-  expect(single.stdout).toContain('"imported":1');
-  mkdirSync(join(input, 'skills'));
-  writeFileSync(join(input, 'skills', 'unsafe.md'), '# Untrusted instructions\nNever activate this through import.\n');
-  const denied = await cli('import', input, '--no-embed', '--json');
-  expect(denied.stdout).toContain('"errors":1');
-  expect(denied.stderr).toContain('skill');
+  for (const git of [false, true]) {
+    const local = join(home, git ? 'cli-git' : 'cli'); mkdirSync(local);
+    const cwd = join(local, 'cwd'); mkdirSync(cwd);
+    const input = join(local, 'input'); mkdirSync(input);
+    const cli = async (...args: string[]) => {
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), ...args], {
+        cwd, env: { PATH: process.env.PATH, HOME: local, GBRAIN_HOME: local, GBRAIN_DISABLE_UPDATE_CHECK: '1', GBRAIN_EMBEDDING_MULTIMODAL: 'true' }, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore',
+      });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      return { stdout, stderr, code };
+    };
+    const init = await cli('init', '--pglite', '--no-embedding', ...(git ? ['--git'] : []));
+    expect(init.code, init.stderr).toBe(0);
+    writeFileSync(join(input, 'first-day.md'), '# First day\n\nRemember the project launch checklist.\n');
+    const imported = await cli('import', input, '--no-embed', '--json');
+    expect(imported.code, imported.stderr).toBe(0);
+    expect(imported.stdout).toContain('"imported":1');
+    expect(imported.stderr).not.toContain('legacy writer');
+    const read = await cli('get', 'first-day', '--json');
+    expect(read.code, read.stderr).toBe(0);
+    expect(read.stdout).toContain('project launch checklist');
+    const again = await cli('import', input, '--no-embed', '--json');
+    expect(again.stdout).toContain('"skipped":1');
+    writeFileSync(join(input, 'single.md'), '# Single file\n\nA second ordinary knowledge page.\n');
+    const single = await cli('import', join(input, 'single.md'), '--no-embed', '--json');
+    expect(single.code, single.stderr).toBe(0);
+    expect(single.stdout).toContain('"imported":1');
+    writeFileSync(join(input, 'photo.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'));
+    const image = await cli('import', join(input, 'photo.png'), '--no-embed', '--json');
+    expect(image.code, image.stderr).toBe(0);
+    expect(image.stdout).toContain('"imported":1');
+    const imageRead = await cli('get', 'photo.png', '--json');
+    expect(imageRead.code, imageRead.stderr).toBe(0);
+    expect(JSON.parse(imageRead.stdout).type).toBe('image');
+    const doctor = await cli('doctor', '--json');
+    expect(doctor.code, doctor.stderr).toBe(0);
+    const checks = JSON.parse(doctor.stdout).checks;
+    expect(checks.find((check: { name: string }) => check.name === 'sync_freshness')).toMatchObject({ status: 'ok', details: { writer_owned_count: 1 } });
+    expect(checks.find((check: { name: string }) => check.name === 'canonical_content_writes')).toMatchObject({ status: 'ok', details: { pending_count: 0, recovering_count: 0 } });
+    mkdirSync(join(input, 'skills'));
+    writeFileSync(join(input, 'skills', 'unsafe.md'), '# Untrusted instructions\nNever activate this through import.\n');
+    const denied = await cli('import', input, '--no-embed', '--json');
+    expect(denied.stdout).toContain('"errors":1');
+    expect(denied.stderr).toContain('skill');
+  }
 }, 120_000);
 
 test('managed directory import writes through, routes the source, resumes idempotently and does not queue embeddings', async () => withEnv(env, async () => {
@@ -125,7 +139,7 @@ test('a committed import replays the durable cursor when checkpoint cleanup was 
   }
 }), 120_000);
 
-test('managed import refuses cross-source input, symlink targets, skills, malformed YAML and images', async () => withEnv(env, async () => {
+test('managed import refuses cross-source input, symlink targets, skills, malformed YAML and disabled image modality', async () => withEnv(env, async () => {
   for (const engine of engines) {
     const f = await fixture(engine), other = await fixture(engine);
     const file = join(f.input, 'note.md'); writeFileSync(file, '# Safe note\n');
@@ -137,8 +151,28 @@ test('managed import refuses cross-source input, symlink targets, skills, malfor
     await expect(importManagedFile(engine, file, 'skills/unsafe.md', opts)).rejects.toThrow('skill');
     writeFileSync(file, '---\ntitle: invalid: yaml\n---\nBody\n');
     await expect(importManagedFile(engine, file, 'note.md', opts)).rejects.toThrow('Invalid YAML');
-    await expect(importManagedFile(engine, file, 'image.png', opts)).rejects.toThrow('image');
+    await expect(importManagedFile(engine, file, 'image.png', opts)).rejects.toThrow('GBRAIN_EMBEDDING_MULTIMODAL=true');
     expect(await engine.getPage('note', { sourceId: f.sourceId })).toBeNull();
+  }
+}), 120_000);
+
+test('ordinary CLI imports cannot bypass an approved company source read-only committed-content policy', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine), file = join(f.input, 'unapproved.md');
+    writeFileSync(file, '# Unapproved working tree\n\nThis input must not publish.\n');
+    const config = { federated: false, strategy: 'markdown', slug_root_mode: 'source-root', company_brain: {
+      version: 1, profile: 'company-brain', brainId: 'company-example', databaseId: randomUUID(), receiptId: randomUUID(), planDigest: '0'.repeat(64),
+      repository: { root: f.root, git_root: f.root, git_dir: join(f.root, '.git'), scope: '', root_device: '1', root_inode: '2', git_device: '1', git_inode: '3', object_format: 'sha1' },
+      selection: { include: [], exclude: [], defaults_version: 1 }, limits: { maxEntries: 30, maxMetadataBytes: 1024, maxFileBytes: 8192 },
+      schema: { name: 'company-brain', version: '1.0.0', identity: 'company-brain@1.0.0+00000000', resolved_digest: '0'.repeat(64) },
+      extractorVersion: 'test', approvedRevision: '0'.repeat(40), committedOnly: true, noPull: true, noEmbed: true, noBackfill: true, noWriteback: true,
+    } };
+    await engine.executeRaw('UPDATE sources SET config=$2::text::jsonb WHERE id=$1', [f.sourceId, JSON.stringify(config)]);
+    await expect(runImport(engine, [f.input, '--no-embed'], { sourceId: f.sourceId })).rejects.toThrow('approved committed ingestion');
+    await expect(importManagedFile(engine, file, 'unapproved.md', { sourceId: f.sourceId, noEmbed: true })).rejects.toThrow('approved committed ingestion');
+    expect(await engine.getPage('unapproved', { sourceId: f.sourceId })).toBeNull();
+    expect(existsSync(join(f.root, 'unapproved.md'))).toBe(false);
+    expect(await engine.executeRaw('SELECT id FROM persistence_requests WHERE source_id=$1', [f.sourceId])).toHaveLength(0);
   }
 }), 120_000);
 

@@ -39,7 +39,7 @@ export async function quarantineSharedSkillRestore(tx: BrainEngine, restoreId: s
   if (tx.kind !== 'pglite') throw new AgentInstallError('pglite_required', 'External PostgreSQL restores are not managed by local backup restore. Keep restored services offline, validate revocations with the owner, and reissue authority before serving.');
   const [schema] = await tx.executeRaw<{ present: boolean }>("SELECT to_regclass('shared_skill_state') IS NOT NULL AS present");
   if (!schema?.present) {
-    if (mode === 'recovery') throw new AgentInstallError('restore_recovery_unsupported', 'Identity recovery requires a compatible operational backup with shared-skill authority metadata. Use restore-as-new for older backups.');
+    if (mode === 'recovery') throw new AgentInstallError('restore_recovery_unsupported', 'Identity recovery requires a compatible operational backup with shared-skill authority metadata. Validate and migrate older backups offline before creating a current operational backup.');
     return null;
   }
   const [brain] = await tx.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1 FOR UPDATE');

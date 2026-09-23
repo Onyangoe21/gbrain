@@ -44,7 +44,7 @@ test('approved local installation uses its own verified principal and fixed-sour
   expect(result.native).toBe('unverified'); expect(result.catalog_delivery).toBe('advisory_refresh');
   const router = readFileSync(result.router_path!, 'utf8');
   expect(router).toContain(join(f.root, 'bin', 'gbrain'));
-  expect(router).toContain('sync_brain_skills');
+  expect(router).toContain('sync-brain-skills');
   expect(router).toContain('Preserve the user');
   const rows = await engine.executeRaw<{ principal_id: string; follow_policy: { source_ids: string[] } }>('SELECT principal_id,follow_policy FROM shared_skill_members WHERE principal_id=$1', [f.registration.id]);
   expect(rows).toHaveLength(1); expect(rows[0].follow_policy.source_ids).toEqual(['default']);

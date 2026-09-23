@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
-import type { ImportResult } from '../import-file.ts';
+import { isImageFilePath, type ImportResult } from '../import-file.ts';
 import { loadConfig } from '../config.ts';
 import { OperationError, type OperationContext } from '../ops/contract.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
-import { currentVerifiedLocalWriter } from './identity.ts';
+import { currentVerifiedLocalWriter, localHostId } from './identity.ts';
 import { getWorktreeBinding } from './ownership.ts';
 import { initializeLocalPersistence, requestPrincipalForContext, submitPageMutation } from './page-mutations.ts';
 import { digest, sha256 } from './digest.ts';
@@ -19,9 +19,14 @@ export async function importManagedFile(engine: BrainEngine, filePath: string, s
     throw new OperationError('permission_denied', 'Managed filesystem import requires the trusted local CLI.');
   }
   opts.signal?.throwIfAborted();
+  if (isImageFilePath(sourcePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL !== 'true') {
+    throw new OperationError('invalid_params', 'Image import requires GBRAIN_EMBEDDING_MULTIMODAL=true.');
+  }
   const sourceId = opts.sourceId ?? 'default';
   const binding = await getWorktreeBinding(engine, sourceId);
-  if (!binding?.local_path) throw new OperationError('owner_unavailable', 'Managed import requires a canonical root for the selected source.');
+  if (!binding?.local_path || binding.owner_host_id !== localHostId() || binding.state !== 'active') {
+    throw new OperationError('owner_unavailable', 'Managed import must run on the active canonical owner for the selected source.');
+  }
   const root = join(binding.local_path, binding.relative_path);
   const inputPath = resolve(filePath);
   const canonicalRelative = relative(root, inputPath);

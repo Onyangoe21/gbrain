@@ -32,7 +32,7 @@ test('genuinely fresh setup follows packaged shared skills through the owned abs
   expect(installed.shared_skills.catalog_delivery).toBe('advisory_refresh');
   const instructions = readFileSync(installed.instructions, 'utf8');
   expect(instructions).toContain('Do not replace the agent');
-  expect(instructions).toContain('sync_brain_skills');
+  expect(instructions).toContain('sync-brain-skills');
   expect(instructions).toContain(join(fresh, 'bin', 'gbrain'));
   const active = JSON.parse(readFileSync(join(fresh, '.gbrain', 'agent-install', 'shared-skills', 'active.json'), 'utf8'));
   expect(Object.keys(active.skills).length).toBeGreaterThan(0);
@@ -52,7 +52,7 @@ test('existing receipt without a prior choice stays pending until explicit appro
   expect(followed.shared_skills.catalog_delivery).toBe('advisory_refresh');
   const after = readInstallReceipt(root)!;
   expect({ installation_id: after.installation_id, skill_id: after.native.skill_id, source_id: after.source_id }).toEqual(identity);
-  expect(readFileSync(followed.instructions, 'utf8')).toContain('sync_brain_skills');
+  expect(readFileSync(followed.instructions, 'utf8')).toContain('sync-brain-skills');
 }, 120_000);
 
 test('adopted local brain stays memory-only pending approval and never acquires a new identity instruction', async () => {
@@ -66,14 +66,14 @@ test('adopted local brain stays memory-only pending approval and never acquires 
   expect(adopted.shared_skills.reason).toBe('follow_approval_required');
   expect(readInstallReceipt(root)?.adopted).toBe(true);
   expect(readInstallReceipt(root)?.skills_policy).toBeUndefined();
-  expect(readFileSync(adopted.instructions, 'utf8')).not.toContain('sync_brain_skills');
+  expect(readFileSync(adopted.instructions, 'utf8')).not.toContain('sync-brain-skills');
 }, 120_000);
 
 test('explicit opt-out leaves membership, keeps source routing and refuses to overwrite edited generated instructions', async () => {
   const before = readInstallReceipt(fresh)!;
   const result = await setupInAgent({ root: fresh, harness: 'grok-bot', bundle, sourceRef, skills: 'memory-only' });
   expect(result.shared_skills.status).toBe('memory_only');
-  expect(readFileSync(result.instructions, 'utf8')).not.toContain('sync_brain_skills');
+  expect(readFileSync(result.instructions, 'utf8')).not.toContain('sync-brain-skills');
   expect(readInstallReceipt(fresh)?.source_id).toBe(before.source_id);
   const engine = new PGLiteEngine();
   await engine.connect({ engine: 'pglite', database_path: before.database_path });

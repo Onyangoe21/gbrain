@@ -7,6 +7,7 @@ import { parseFactsFence } from '../facts-fence.ts';
 import { parseTakesFence } from '../takes-fence.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { buildTakeRows } from '../batch-rows.ts';
+import { deriveResolutionTuple } from '../takes-resolution.ts';
 
 type Row = Record<string, unknown>;
 
@@ -60,8 +61,13 @@ export async function assertExportProjectionRoundtrip(engine: BrainEngine, page:
   for (const stored of storedTakes) {
     const take = takes.find(row => row.rowNum === stored.row_num), base = normalized.find(row => row.row_num === stored.row_num);
     if (!take || !base) { conflicts.push(`takes row ${stored.row_num}: missing canonical row`); continue; }
-    const expected: Row = { ...base, resolved_at: take.resolvedAt ?? null, resolved_quality: take.resolvedQuality ?? null,
-      resolved_outcome: take.resolvedQuality === 'correct' ? true : take.resolvedQuality === 'incorrect' ? false : null,
+    let resolution: ReturnType<typeof deriveResolutionTuple> | null = null;
+    if (take.resolvedQuality !== undefined) {
+      if (!take.resolvedBy) throw new OperationError('unsupported_export_data', `Canonical takes row ${take.rowNum} has a resolution without resolved_by. Restore the recorded resolver in the fence before export; no identity was inferred.`);
+      resolution = deriveResolutionTuple({ quality: take.resolvedQuality, resolvedBy: take.resolvedBy });
+    }
+    const expected: Row = { ...base, resolved_at: take.resolvedAt ?? null, resolved_quality: resolution?.quality ?? null,
+      resolved_outcome: resolution?.outcome ?? null,
       resolved_source: take.resolvedEvidence ?? null, resolved_value: take.resolvedValue ?? null,
       resolved_unit: take.resolvedUnit ?? null, resolved_by: take.resolvedBy ?? null };
     const changed = differences(stored, expected);

@@ -7,6 +7,7 @@ import { checkedContentRoot, inventorySkillpack, sameInventory, type PackInvento
 import { contentSetupKey, installPackagedSharedSkills, setupSharedBrainContent, type SharedContentReceipt } from './setup.ts';
 import type { DatabaseContentExportReceipt } from './migration-export.ts';
 import { inspectSharedMemberMigration, type SharedMemberMigration } from './migration-members.ts';
+import { sharedSkillSourcePolicy } from './setup-source-policy.ts';
 
 export type MigrationPublication = 'disabled' | 'prose_only' | 'consent_required';
 export interface SharedMigrationStage {
@@ -64,8 +65,10 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
   const roots = await ctx.engine.executeRaw<{ id: string; incarnation: string; local_path: string | null }>('SELECT id,incarnation,local_path FROM sources WHERE NOT archived ORDER BY id');
   const fallback = await ctx.engine.getConfig('sync.repo_path');
   for (const source of roots) {
+    const sourcePolicy = await sharedSkillSourcePolicy(ctx.engine, source.id).catch(error => ({ mode: 'preserve_files' as const,
+      reason: error instanceof OperationError ? `${error.code}: ${error.message}` : 'profile_incompatible: the source writeback policy could not be verified; no repository changes were attempted.' }));
     const contentCheckpoint = await ctx.engine.getConfig(contentSetupKey(source.id, source.incarnation));
-    if (contentCheckpoint && !dryRun) {
+    if (contentCheckpoint && !dryRun && sourcePolicy.mode === 'content') {
       let content: SharedContentReceipt;
       try { content = JSON.parse(contentCheckpoint); }
       catch { throw new OperationError('local_conflict', 'A content setup checkpoint is malformed; preserve it for review.'); }
@@ -84,7 +87,16 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
       row.stages.push({ stage, status: row.status, reason });
       await persist();
     };
+    if (sourcePolicy.mode === 'preserve_files') {
+      row.member_installations = await inspectSharedMemberMigration(ctx.engine, source.id, source.incarnation);
+      await pending('projection', sourcePolicy.reason);
+      continue;
+    }
     if (!row.root) {
+      if (sourcePolicy.mode === 'explicit_pack_required') {
+        await pending('projection', sourcePolicy.reason);
+        continue;
+      }
       await pending('inventory', 'db_only_export_required: preview gbrain apply-migrations --migration 0.51.9 --export-db-only --content-root <new-root> --export-source ' + source.id + ' --dry-run --json; approve quiescence and backup choice before exporting. Memory stays available.');
       continue;
     }
@@ -111,6 +123,10 @@ export async function runSharedSkillsMigration(ctx: OperationContext, options: {
     }
     row.stages.push({ stage: 'inventory', status: 'complete' });
     await persist();
+    if (!row.inventory && sourcePolicy.mode === 'explicit_pack_required') {
+      await pending('projection', sourcePolicy.reason);
+      continue;
+    }
     if (!brain.enabled || !brain.skill_bundles_enabled) {
       await pending('ownership', 'writer_not_quiesced: stop/exclude older filesystem writers and skill servers, claim the canonical root, then explicitly activate the shared-skill writer protocol.');
       continue;

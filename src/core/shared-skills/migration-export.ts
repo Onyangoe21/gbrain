@@ -19,6 +19,8 @@ import { installPackagedSharedSkills } from './setup.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
 import { slugifyPath } from '../sync.ts';
+import { assertPackagedSkillSource } from './setup-source-policy.ts';
+import { approvedSchemaIdentity, loadActivePackForEngine, type ApprovedSchemaIdentity } from '../schema-pack/engine-resolution.ts';
 
 export interface DatabaseContentExportOptions {
   root: string;
@@ -45,6 +47,7 @@ export interface DatabaseContentExportReceipt {
   conflicts: Array<{ slug: string; reason: string }>;
   pending_actions: string[];
   root_identity?: { device: number; inode: number };
+  schema_policy?: { schema: ApprovedSchemaIdentity; source_config_sha256: string };
 }
 
 function exportPath(page: Page): string {
@@ -56,6 +59,10 @@ function exportPath(page: Page): string {
 }
 
 async function exportInventory(engine: BrainEngine, sourceId: string) {
+  const activePack = await loadActivePackForEngine(engine, { sourceId, remote: false });
+  const [source] = await engine.executeRaw<{ config: unknown; incarnation: string }>('SELECT config,incarnation FROM sources WHERE id=$1 AND NOT archived', [sourceId]);
+  if (!source) throw new OperationError('source_changed', 'The export source is no longer active.');
+  const schemaPolicy = { schema: approvedSchemaIdentity(activePack), source_config_sha256: setupHash(stableJson({ config: source.config, incarnation: source.incarnation })) };
   const files: Record<string, string> = {}, conflicts: DatabaseContentExportReceipt['conflicts'] = [];
   const pages = await engine.listPages({ sourceId, limit: 5001, sort: 'slug' });
   if (pages.length > 5000) throw new OperationError('export_limit', 'This migration is bounded to 5,000 active pages per source; split or use a reviewed bulk export.');
@@ -72,7 +79,7 @@ async function exportInventory(engine: BrainEngine, sourceId: string) {
       }
       const frontmatter = { ...page.frontmatter, slug: page.slug, tags };
       const content = serializeMarkdown(frontmatter, page.compiled_truth, page.timeline, { type: page.type, title: page.title, tags });
-      const parsed = parseMarkdown(content, path, { validate: true, expectedSlug: slugifyPath(path) });
+      const parsed = parseMarkdown(content, path, { validate: true, expectedSlug: slugifyPath(path), activePack: activePack.manifest });
       const expectedFrontmatter = { ...page.frontmatter };
       for (const key of ['slug', 'type', 'title', 'tags']) delete expectedFrontmatter[key];
       if (parsed.errors?.length || parsed.slug !== page.slug || parsed.type !== page.type || parsed.title !== page.title ||
@@ -97,7 +104,7 @@ async function exportInventory(engine: BrainEngine, sourceId: string) {
       conflicts.push({ slug: page.slug, reason: error instanceof OperationError ? error.message : 'This page cannot be exported losslessly.' });
     }
   }
-  return { files, conflicts, pages: pages.length };
+  return { files, conflicts, pages: pages.length, schemaPolicy };
 }
 
 function verifyFiles(root: string, hashes: Record<string, string>, exact = false): void {
@@ -127,6 +134,7 @@ export async function exportDatabaseContent(ctx: OperationContext, options: Data
   const [brain] = await ctx.engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
   const [source] = await ctx.engine.executeRaw<{ incarnation: string; local_path: string | null }>('SELECT incarnation,local_path FROM sources WHERE id=$1 AND NOT archived', [options.sourceId]);
   if (!brain || !source) throw new OperationError('source_changed', 'The selected brain/source is not active.');
+  await assertPackagedSkillSource(ctx.engine, options.sourceId);
   if (!options.dryRun && options.confirmQuiesced && ((await ctx.engine.executeRaw('SELECT id FROM gbrain_cycle_locks LIMIT 1')).length ||
     (await ctx.engine.executeRaw("SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1")).length)) {
     throw new OperationError('writer_not_quiesced', 'Active maintenance locks or durable writes remain; finish or recover them before exporting.');
@@ -147,8 +155,10 @@ export async function exportDatabaseContent(ctx: OperationContext, options: Data
     staging_root: `${root}.gbrain-export-${randomUUID()}`, request_id: randomUUID(), stage: 'inventory', status: 'planned',
     database_retained: true, backup: options.backup ?? 'choice_required', validation: 'parsed_markdown_and_raw_hashes',
     files: hashes, pages: inventory.pages, conflicts: [], pending_actions: [],
+    schema_policy: inventory.schemaPolicy,
   };
   receipt.conflicts = inventory.conflicts;
+  if (prior && stableJson(prior.schema_policy ?? null) !== stableJson(inventory.schemaPolicy)) receipt.conflicts.push({ slug: '*', reason: 'The source schema or ingestion policy changed since the export checkpoint. Revalidate the original policy before resuming; the root was not rebound.' });
   if (prior && !sameInventory(prior.files, hashes)) receipt.conflicts.push({ slug: '*', reason: 'Database content changed since the export checkpoint. Preserve the existing export and choose a reviewed recovery path.' });
   receipt.pending_actions = [];
   if (!options.confirmQuiesced) receipt.pending_actions.push('Stop all memory/file writers and old skill servers, then pass --confirm-quiesced.');
@@ -179,7 +189,7 @@ export async function exportDatabaseContent(ctx: OperationContext, options: Data
       const enclosing = spawnSync('git', ['-C', receipt.staging_root, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 15_000 });
       if (enclosing.status === 0) throw new OperationError('local_conflict', 'The export would claim an enclosing Git worktree. Choose a destination outside existing repositories.');
       const current = await exportInventory(ctx.engine, options.sourceId);
-      if (current.conflicts.length || !sameInventory(hashes, Object.fromEntries(Object.entries(current.files).map(([path, content]) => [path, setupHash(content)])))) throw new OperationError('local_conflict', 'The database changed while exporting; writers were not quiesced.');
+      if (current.conflicts.length || stableJson(current.schemaPolicy) !== stableJson(receipt.schema_policy) || !sameInventory(hashes, Object.fromEntries(Object.entries(current.files).map(([path, content]) => [path, setupHash(content)])))) throw new OperationError('local_conflict', 'The database content, source schema or ingestion policy changed while exporting; writers were not quiesced.');
       renameSync(receipt.staging_root, root);
       flushTopologyDirectory(dirname(root));
     }
@@ -189,6 +199,9 @@ export async function exportDatabaseContent(ctx: OperationContext, options: Data
     receipt.root_identity = { device: stat.dev, inode: stat.ino };
     receipt.stage = 'exported'; receipt.status = 'action_required';
     await ctx.engine.setConfig(key, JSON.stringify(receipt));
+    await assertPackagedSkillSource(ctx.engine, options.sourceId);
+    const verified = await exportInventory(ctx.engine, options.sourceId);
+    if (verified.conflicts.length || stableJson(verified.schemaPolicy) !== stableJson(receipt.schema_policy) || !sameInventory(hashes, Object.fromEntries(Object.entries(verified.files).map(([path, content]) => [path, setupHash(content)])))) throw new OperationError('local_conflict', 'The database content, source schema or ingestion policy changed before source binding.');
     await registerLocalWriter(ctx.engine, 'cli');
     assertTopologyCommitted(await runManagedSourceLifecycle(ctx.engine, { operation: 'claim', sourceId: options.sourceId, path: root,
       expectedIncarnation: source.incarnation, requestId: receipt.request_id }));

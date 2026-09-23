@@ -60,7 +60,8 @@ for (const profile of ['memory-reader', 'coding-agent'] as const) test(`fresh pa
         const nativePath = (installed.shared_skills as { native_router_path: string }).native_router_path;
         expect(existsSync(nativePath)).toBe(true);
         const installedStatus = readHarnessConnectionStatus(options);
-        expect('usable_skills' in installedStatus && installedStatus.usable_skills.length).toBe(2);
+        expect('recorded_skills' in installedStatus && installedStatus.recorded_skills.length).toBe(2);
+        expect('usability' in installedStatus && installedStatus.usability).toBe('last_checked_unverified');
         expect('blocked_skills' in installedStatus && installedStatus.blocked_skills.length).toBe(1);
         expect('local_reference' in installedStatus && installedStatus.local_reference).toBe('owned');
         await engine.executeRaw('UPDATE oauth_clients SET scope=$2,allowed_operations=$3::text[] WHERE client_id=$1', [profile, grant.scopes!.join(' '), grant.allowedOperations]);
@@ -75,7 +76,7 @@ for (const profile of ['memory-reader', 'coding-agent'] as const) test(`fresh pa
         expect(status.current_authority).toBe('unprobed');
         expect(status.status).toBe('left');
         expect('remote_membership_pending' in status && status.remote_membership_pending).toBe(true);
-        expect('usable_skills' in status && status.usable_skills).toEqual([]);
+        expect('recorded_skills' in status && status.recorded_skills).toEqual([]);
         expect(JSON.stringify(status)).not.toContain(credentials.access_token);
         await engine.executeRaw('UPDATE oauth_clients SET scope=$2,allowed_operations=$3::text[] WHERE client_id=$1', [profile, scopes.join(' '), allowed]);
         const rejoined = await installHarnessConnection(credentials, options);

@@ -18,7 +18,7 @@ import { importFromContent } from '../src/core/import-file.ts';
 import { activateSharedSkillPersistence } from '../src/core/persistence/skill-activation.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { submitSharedSkillMutation } from '../src/core/shared-skills/publication.ts';
+import { adoptSharedSkillpack } from '../src/core/shared-skills/publication.ts';
 import { setSharedSkillPolicy } from '../src/core/shared-skills/policy.ts';
 import { assertKnowledgePublicationAllowed } from '../src/core/shared-skills/knowledge-guard.ts';
 import { atomicWrite } from '../src/core/skillopt/apply-edits.ts';
@@ -58,9 +58,10 @@ async function fixture(run: (f: Fixture) => Promise<void>) {
         const root = join(scratch, 'brain'); mkdirSync(root);
         writeFileSync(join(root, 'skillpack.json'), JSON.stringify({ api_version: 'gbrain-skillpack-v1', name: 'example-pack', version: '1.0.0',
           description: 'Synthetic fixture', author: 'Example Maintainer', license: 'MIT', homepage: 'https://example.com/skills',
-          gbrain_min_version: '0.51.0', brain_resident: true, skills: [] }));
+          gbrain_min_version: '0.51.0', brain_resident: true, skills: ['skills/alpha'] }));
         await engine.executeRaw('UPDATE sources SET local_path=$1 WHERE id=$2', [root, 'default']);
-        await engine.executeRaw("INSERT INTO sources(id,name,local_path) VALUES('alias-source','Alias source',$1)", [root]);
+        const aliasRoot = join(scratch, 'alias-source'); mkdirSync(aliasRoot);
+        await engine.executeRaw("INSERT INTO sources(id,name,local_path) VALUES('alias-source','Alias source',$1)", [aliasRoot]);
         for (const [slug, sourcePath, sourceUri] of [
           ['notes/path-alias', 'skills/alpha/SKILL.md', null],
           ['notes/manifest-alias', 'skillpack.json', null],
@@ -70,19 +71,20 @@ async function fixture(run: (f: Fixture) => Promise<void>) {
           await engine.executeRaw('UPDATE pages SET source_path=$1,source_uri=$2 WHERE source_id=$3 AND slug=$4', [sourcePath, sourceUri, 'default', slug]);
         }
         await claimWorktree(engine, 'default', root);
-        await claimWorktree(engine, 'alias-source', root);
+        await claimWorktree(engine, 'alias-source', aliasRoot);
         await activateSharedSkillPersistence(engine, { confirmQuiesced: true });
         const ctx: OperationContext = { engine, config: { engine: 'pglite' }, remote: false, sourceId: 'default', dryRun: false,
           logger: { info() {}, warn() {}, error() {} } };
         await engine.setConfig('mcp.publish_skills', 'true');
         await setSharedSkillPolicy(ctx, 'default', { version: 1, enabled: true, classes: ['prose', 'reference'], audiences: ['readers'], requirements: [], allow_follow: true }, null);
-        const result = await submitSharedSkillMutation(ctx, 'put_skill', { request_id: randomUUID(), source_id: 'default',
-          pack_id: 'example-pack', name: 'alpha', expected_revision: null, files: [
+        const result = await adoptSharedSkillpack(ctx, 'default', { request_id: randomUUID(), pack_id: 'example-pack', skills: [
+          { pack_id: 'example-pack', name: 'alpha', expected_revision: null, files: [
             { path: protectedFiles[1], content: prose, file_class: 'prose', depends_on: protectedFiles.slice(2) },
             { path: protectedFiles[2], content: 'Approved reference.', file_class: 'reference' },
             { path: protectedFiles[3], content: 'Approved shared dependency.', file_class: 'reference' },
-          ] });
-        expect(result.state).toBe('committed');
+          ] },
+        ] });
+        expect(result.receipts[0].state).toBe('committed');
         const [source] = await engine.executeRaw<{ incarnation: string }>("SELECT incarnation FROM sources WHERE id='default'");
         await run({ engine, ctx, root, scratch, incarnation: source.incarnation });
       } finally { await disposePersistenceConsumer(engine); await isolated.close(); }

@@ -35,7 +35,7 @@ test('new managed bridge installs the common native router after explicit follow
   const installed = result as { native_router_path: string; launcher: string; native: string; source_id: string };
   expect(installed.native).toBe('unverified'); expect(installed.source_id).toBe('default');
   expect(readFileSync(installed.native_router_path, 'utf8')).toContain(installed.launcher);
-  expect(readFileSync(installed.native_router_path, 'utf8')).toContain('sync_brain_skills');
+  expect(readFileSync(installed.native_router_path, 'utf8')).toContain('sync-brain-skills');
   expect(readFileSync(installed.launcher, 'utf8')).toContain("export GBRAIN_SOURCE=default");
   expect(readFileSync(join(dest, 'unrelated', 'SKILL.md'), 'utf8')).toBe('User identity and unrelated skill');
   const again = await withEnv(env(), () => installSharedBrainBridge({ engine, config, harness: 'codex', dest }));

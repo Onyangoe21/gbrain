@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
-import { currentCompanyBrainSync, importCompanyBrainFile } from '../core/company-brain/profile.ts';
+import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile } from '../core/company-brain/profile.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -368,6 +368,10 @@ export async function runImport(
         console.error(formatDefaultWriteWarning(assessment, '--source-id'));
       }
     }
+  }
+  if (!currentCompanyBrainSync(sourceId) && await getCompanyBrainProfile(engine, sourceId ?? 'default')) {
+    console.error('This source accepts only its approved committed company-brain manifest. Use sources resume or sync; ordinary import cannot write back to this read-only repository.');
+    throw new ImportAbortError('company-brain sources require approved committed ingestion');
   }
   let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
   try {

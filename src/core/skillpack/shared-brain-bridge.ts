@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { BrainEngine } from '../engine.ts';
@@ -7,12 +7,64 @@ import { checkedRoot, confinedPath, sha256, privateWrite, readFileConfigState } 
 import { findBridgeEntry, loadBridgeState } from './bridge-state.ts';
 import { isUndefinedTableError } from '../utils.ts';
 import { createSharedSkillsAdapter, type SharedSkillsToolCaller } from '../shared-skills/adapter.ts';
-import { readLocalWriter, registerLocalWriter, withVerifiedLocalRegistration } from '../persistence/identity.ts';
+import { verifyLocalWriter, withVerifiedLocalRegistration, type LocalRegistration } from '../persistence/identity.ts';
 import { renderAgentLauncher } from '../agent-install/launcher.ts';
 import { resolveSourceWithTier, ALL_SOURCES } from '../source-resolver.ts';
 import { resolveBrainId } from '../brain-resolver.ts';
 import { acquireBootstrapLock } from '../bootstrap/lock.ts';
 import { assertLegacySkillFilesystemWrite } from './writer-guard.ts';
+import { readPrivateText } from '../harness/credentials.ts';
+import { harnessAdapter } from '../harness/registry.ts';
+import { OperationError } from '../ops/contract.ts';
+
+async function bindBridgeTarget(engine: BrainEngine, brainId: string, adapter: string, root: string, follow: boolean): Promise<LocalRegistration> {
+  const registration = JSON.parse(readPrivateText(confinedPath(configDir(), `persistence/${brainId}.cli.json`), 65536)) as LocalRegistration;
+  if (registration.lane !== 'cli' || typeof registration.credential !== 'string' || !/^[a-f0-9-]{36}$/i.test(registration.id)) {
+    throw new OperationError('bridge_ownership_conflict', 'The private local CLI registration is invalid.');
+  }
+  let verified = false;
+  try { await verifyLocalWriter(engine, registration); verified = true; }
+  catch (error) { if (follow) throw error; }
+  const claimKey = `shared_skills.bridge_owner.v1.${registration.id}.${adapter}`;
+  const target = sha256(JSON.stringify([brainId, root]));
+  const refuseIndependent = () => new OperationError('independent_principal_required',
+    'This local CLI principal already owns another source/destination for this harness. Reuse that bridge target; independent installations need separate private-handoff principals. Leaving does not release this binding.');
+  const existing = await engine.getConfig(claimKey);
+  if (existing !== null && existing !== undefined) {
+    if (existing !== target) throw refuseIndependent();
+    return registration;
+  }
+  if (!verified) throw new OperationError('bridge_ownership_conflict', 'Restore writer access to verify legacy bridge ownership before attempting cleanup.');
+  const [member] = await engine.executeRaw<{ installation_id: string }>(
+    "SELECT installation_id FROM shared_skill_members WHERE principal_kind='local_cli' AND principal_id=$1 AND adapter=$2", [registration.id, adapter]);
+  const readReceipt = (path: string) => {
+    const receipt = JSON.parse(readPrivateText(path, 4 * 1024 * 1024)) as { format_version: number; adapter: string; brain_id: string; installation_id: string };
+    if (receipt.format_version !== 1 || typeof receipt.adapter !== 'string' || typeof receipt.brain_id !== 'string' || typeof receipt.installation_id !== 'string') {
+      throw new OperationError('bridge_ownership_conflict', 'Preserve the invalid legacy enrollment receipt before retrying.');
+    }
+    return receipt;
+  };
+  if (member) {
+    const parent = dirname(root);
+    const directories = existsSync(parent) ? readdirSync(parent).filter(name => /^[a-f0-9]{32}$/.test(name)) : [];
+    if (directories.length > 4096) throw new OperationError('bridge_ownership_conflict', 'The legacy bridge inventory exceeds the ownership inspection limit.');
+    const matching: string[] = [];
+    for (const directory of directories) {
+      const candidate = confinedPath(parent, `${directory}/shared-skills/receipt.json`);
+      if (!existsSync(candidate)) continue;
+      const receipt = readReceipt(candidate);
+      if (receipt.brain_id === brainId && receipt.adapter === adapter && receipt.installation_id === member.installation_id) matching.push(join(parent, directory));
+    }
+    if (matching.length !== 1) throw new OperationError('bridge_ownership_conflict',
+      'Existing membership has missing or multiple bridge receipts. No enrollment or native files were changed. Preserve and resolve all old copies before using separate private-handoff principals.');
+    if (matching[0] !== root) throw refuseIndependent();
+  } else if (existsSync(confinedPath(root, 'shared-skills/receipt.json'))) {
+    throw new OperationError('bridge_ownership_conflict', 'The existing bridge receipt does not belong to the current authenticated principal.');
+  }
+  await engine.executeRaw('INSERT INTO config(key,value) VALUES($1,$2) ON CONFLICT(key) DO NOTHING', [claimKey, target]);
+  if (await engine.getConfig(claimKey) !== target) throw refuseIndependent();
+  return registration;
+}
 
 export async function sharedBrainBridgePlan(options: {
   engine: BrainEngine | null;
@@ -99,7 +151,8 @@ export async function installSharedBrainBridge(options: {
   try { assertLegacySkillFilesystemWrite(dest); }
   catch { return pending('canonical_destination_refused', 'Native router installation cannot write into a managed canonical source. Choose the harness’s separate native skills directory; publish canonical skill changes through the catalog.'); }
   const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
-  const key = sha256(JSON.stringify([brain.brain_id, source.source_id, options.harness, dest])).slice(0, 32);
+  const adapterId = harnessAdapter(options.harness).id;
+  const key = sha256(JSON.stringify([brain.brain_id, source.source_id, adapterId, dest])).slice(0, 32);
   const root = join(configDir(), 'skillpack-shared', key);
   const receiptPath = confinedPath(root, 'installation.json');
   const priorText = existsSync(receiptPath) ? readFileSync(receiptPath, 'utf8') : null;
@@ -122,6 +175,37 @@ export async function installSharedBrainBridge(options: {
     cliPath: sourceCli.includes('$bunfs') ? undefined : sourceCli });
   const actual = existsSync(launcher) ? sha256(readFileSync(launcher)) : null;
   if (actual !== null && ![prior.launcher_hash, prior.pending_hash].includes(actual)) return pending('local_conflict', 'The installation-bound launcher was edited or is unowned. Preserve it before retrying.');
+  let registration: LocalRegistration;
+  try { registration = await bindBridgeTarget(engine, brain.brain_id, adapterId, root, policy === 'follow'); }
+  catch (error) {
+    if (error instanceof OperationError && ['independent_principal_required', 'bridge_ownership_conflict'].includes(error.code)) {
+      if (policy !== 'memory-only') return pending(error.code, error.message);
+      try {
+        const cleanupLock = await acquireBootstrapLock(root);
+        try {
+          if ((existsSync(receiptPath) ? readFileSync(receiptPath, 'utf8') : null) !== priorText) throw new Error('changed ownership receipt');
+          const state = confinedPath(root, 'shared-skills');
+          const cached = JSON.parse(readPrivateText(join(state, 'receipt.json'), 4 * 1024 * 1024));
+          if (cached.brain_id !== brain.brain_id || cached.adapter !== adapterId || typeof cached.installation_id !== 'string') throw new Error('unbound local receipt');
+          const nativePath = confinedPath(state, 'native-router.json');
+          if (existsSync(nativePath)) {
+            const native = JSON.parse(readPrivateText(nativePath, 65536));
+            const name = `gbrain-shared-${sha256(JSON.stringify([brain.brain_id, cached.installation_id, adapterId, `bridge-${key}`])).slice(0, 24)}`;
+            if (native.version !== 1 || native.name !== name || native.skills_dir !== dest || native.brain_id !== brain.brain_id ||
+              native.installation_id !== cached.installation_id || native.adapter !== adapterId) throw new Error('foreign native router ownership');
+          } else if (cached.native_router_path) throw new Error('missing native router ownership');
+          const local = createSharedSkillsAdapter({ root: state, adapter: adapterId, call: async () => { throw error; } });
+          const result = await local.leave();
+          privateWrite(receiptPath, `${JSON.stringify({ ...prior, policy: 'memory-only' })}\n`);
+          return { ...plan, ...result, status: 'pending', reason: error.code, remote_membership_pending: true,
+            next_action: `${error.message} Only unchanged owned local files were cleaned up; edited files are retained. Shared server leave was withheld to protect the other enrollment. Native disablement remains unverified.` };
+        } finally { cleanupLock.release(); }
+      } catch {
+        return pending('bridge_local_cleanup_conflict', 'The existing native ownership cannot be confined to this target. Preserve the files for manual cleanup; no server leave was sent and native disablement is unverified.');
+      }
+    }
+    return pending('bridge_ownership_unavailable', 'Verify the installation’s existing private local CLI registration and bridge receipts before retrying. No target artifacts or enrollment were changed.');
+  }
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const lock = await acquireBootstrapLock(root);
   try {
@@ -137,10 +221,9 @@ export async function installSharedBrainBridge(options: {
     const allowed = new Set(['join_brain', 'sync_brain_skills', 'leave_brain', 'get_skill', 'get_skill_asset']);
     const call: SharedSkillsToolCaller = async <T>(name: string, params: Record<string, unknown>): Promise<T> => {
       if (!allowed.has(name) || !operationsByName[name]) throw new Error('unsupported shared-skills operation');
-      const registration = policy === 'follow' ? await registerLocalWriter(engine, 'cli') : await readLocalWriter(engine, 'cli');
       return await withVerifiedLocalRegistration(engine, registration, async () => await operationsByName[name].handler(ctx, params) as T);
     };
-    const adapter = createSharedSkillsAdapter({ call, root: join(root, 'shared-skills'), adapter: options.harness,
+    const adapter = createSharedSkillsAdapter({ call, root: join(root, 'shared-skills'), adapter: adapterId,
       launcher, nativeSkillsDir: dest, connectionName: `bridge-${key}` });
     const result = policy === 'follow' ? await adapter.join({ approved: true, source_ids: [source.source_id] }) : await adapter.leave();
     if ('remote_membership_pending' in result && result.remote_membership_pending) return { ...plan, ...result, status: 'pending', reason: 'remote_membership_pending',

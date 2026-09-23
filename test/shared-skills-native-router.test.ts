@@ -146,7 +146,8 @@ test('connect status reads only the local receipt without credentials, network o
     expect(result.desired_view).toBe(receipt.desired_view);
     expect(result.native_registration).toBe('installed');
     expect(result.native_use).toBe('unverified');
-    expect(result.usable_skills).toEqual([]);
+    expect(result.recorded_skills).toEqual([]);
+    expect(result.usability).toBe('last_checked_unverified');
     expect(result.blocked_skills).toEqual([]);
     expect(result.local_reference).toBe('owned');
     expect(status.stdout).not.toContain(f.credentials.access_token!);

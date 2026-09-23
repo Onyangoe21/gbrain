@@ -103,3 +103,41 @@ test('existing owned root gains packaged skills while preserving knowledge and o
   expect((await runSharedSkillsMigration(ctx)).sources[0].stages.find(stage => stage.stage === 'projection')?.status).toBe('complete');
   expect((await ctx.engine.getPage('notes/example', { sourceId: 'default' }))!.compiled_truth).toBe('A saved observation.');
 }), 120_000);
+
+test('DB export uses the selected source schema and retains its custom types', () => fixture(async (ctx, home) => {
+  await ctx.engine.setConfig('schema_pack', 'gbrain-base-v2');
+  await ctx.engine.setConfig('schema_pack.source.default', 'company-brain');
+  for (const [slug, type] of [['products/widget-example', 'product'], ['customers/account-example', 'customer']]) {
+    await ctx.engine.putPage(slug, { type, title: 'Schema fixture', compiled_truth: 'Source-specific schema content.', timeline: '', frontmatter: { audience: 'internal' } }, { sourceId: 'default' });
+  }
+  const result = await exportDatabaseContent(ctx, { sourceId: 'default', root: join(home, 'content'), confirmQuiesced: true, backup: 'operator_verified' });
+  expect(result.status).toBe('complete');
+  expect(result.schema_policy?.schema.name).toBe('company-brain');
+  expect(result.schema_policy?.schema.resolvedManifestHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(result.schema_policy?.source_config_sha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(parseMarkdown(readFileSync(join(result.root, 'products/widget-example.md'), 'utf8')).type).toBe('product');
+  expect(parseMarkdown(readFileSync(join(result.root, 'customers/account-example.md'), 'utf8')).type).toBe('customer');
+  expect(await ctx.engine.getConfig('schema_pack')).toBe('gbrain-base-v2');
+  expect(await ctx.engine.getConfig('schema_pack.source.default')).toBe('company-brain');
+}), 120_000);
+
+test('a source schema change during export refuses binding and remains a checkpoint conflict', () => fixture(async (ctx, home) => {
+  await ctx.engine.setConfig('schema_pack.source.default', 'company-brain');
+  const original = ctx.engine.setConfig.bind(ctx.engine);
+  let changed = false;
+  ctx.engine.setConfig = async (key, value) => {
+    await original(key, value);
+    if (!changed && key.startsWith('shared_skills.export.')) {
+      changed = true;
+      await original('schema_pack.source.default', 'gbrain-base-v2');
+    }
+  };
+  const options = { sourceId: 'default', root: join(home, 'content'), confirmQuiesced: true, backup: 'operator_verified' as const };
+  await expect(exportDatabaseContent(ctx, options)).rejects.toMatchObject({ code: 'local_conflict' });
+  ctx.engine.setConfig = original;
+  expect(existsSync(options.root)).toBe(false);
+  expect((await ctx.engine.executeRaw<{ local_path: string | null }>("SELECT local_path FROM sources WHERE id='default'"))[0].local_path).toBeNull();
+  const resumed = await exportDatabaseContent(ctx, options);
+  expect(resumed.status).toBe('conflict');
+  expect(resumed.conflicts[0].reason).toContain('source schema or ingestion policy changed');
+}), 120_000);

@@ -520,6 +520,9 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     console.log('All migrations up to date.');
     process.exit(0);
   }
+  if (!schemaBehind && plan.pending.length === 0 && plan.partial.length === 0) {
+    console.log('All migrations up to date. This covers orchestrator checkpoints only; host publication and client activation are being rechecked.');
+  }
 
   // Run each orchestrator in registry order. An orchestrator failure aborts
   // the rest of the chain; fixing the failure and re-running picks up where
@@ -531,6 +534,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // ledger drop was the root cause of the original infinite-retry symptom).
   let failed = false;
   for (const m of toRun) {
+    const recordCheckpoint = !m.reconcile || !plan.applied.includes(m);
     console.log(`\n=== Applying migration v${m.version}: ${m.featurePitch.headline} ===`);
     try {
       const result = await m.orchestrator(orchestratorOptsFrom(cli));
@@ -546,7 +550,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
         // Record the attempt as 'partial' (not 'complete') so the cap counts
         // it. Don't let a failed orchestrator look like it never ran.
         try {
-          appendCompletedMigration({
+          if (recordCheckpoint) appendCompletedMigration({
             version: m.version,
             status: 'partial',
             phases: result.phases,
@@ -566,7 +570,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       // the last entry for this version is already 'complete' (idempotency
       // guard), so repeated clean runs don't spam the ledger.
       try {
-        appendCompletedMigration({
+        if (recordCheckpoint) appendCompletedMigration({
           version: m.version,
           status: result.status, // 'complete' | 'partial'
           phases: result.phases,
@@ -584,7 +588,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 
       if (result.status === 'partial') {
         console.log(`Migration v${m.version} finished as PARTIAL. Re-run \`gbrain apply-migrations --yes\` after resolving any pending host-work items.`);
-      } else if (result.pending_host_work) {
+      } else if (m.reconcile && result.pending_host_work) {
         console.log(`Migration v${m.version} mechanical checks complete; host publication or client actions remain pending.`);
       } else {
         console.log(`Migration v${m.version} complete.`);
@@ -594,7 +598,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       console.error(`Migration v${m.version} threw: ${msg}`);
       // Same partial-on-throw treatment so the cap counts runaway failures.
       try {
-        appendCompletedMigration({ version: m.version, status: 'partial' });
+        if (recordCheckpoint) appendCompletedMigration({ version: m.version, status: 'partial' });
       } catch { /* swallow ledger-write failure on throw path */ }
       failed = true;
       break;

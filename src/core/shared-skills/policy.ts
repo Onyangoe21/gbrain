@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { OperationError, type OperationContext } from '../ops/contract.ts';
 import { sourceScopeOpts } from '../ops/context.ts';
 import { hasScope } from '../scope.ts';
-import { currentVerifiedLocalWriter } from '../persistence/identity.ts';
+import { currentVerifiedLocalWriter, type LocalGrant } from '../persistence/identity.ts';
 import { coerceLegacyPermissions, normalizeTokenScopes, parseLegacyOperationGrant, parseLegacyTokenScope } from '../legacy-token-scope.ts';
 import type { SqlEngine, WriteAuthority } from '../persistence/model.ts';
 import { stringList } from './manifest.ts';
@@ -19,14 +19,30 @@ export async function authorizeSkillRead(ctx: OperationContext, operation: strin
   if (ctx.remote === false) return ctx;
   const auth = ctx.auth;
   const verified = currentVerifiedLocalWriter();
-  if (!auth && verified) {
-    if (!hasScope(verified.grant.scopes, 'read') || verified.grant.operations && !verified.grant.operations.includes(operation)) {
+  if (!auth?.principal && verified) {
+    const [row] = await ctx.engine.executeRaw<{ revoked_at: unknown; grant_ceiling: LocalGrant }>(
+      'SELECT revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid', [verified.principal.id]);
+    if (!verified.remote || !row || row.revoked_at != null || auth && (auth.clientId !== verified.principal.id ||
+      auth.grantProjectionDegraded || auth.fenceProjectionDegraded || auth.sourceActive === false ||
+      auth.effectiveSurface === 'verbs' || !hasScope(auth.scopes, 'read') ||
+      auth.allowedOperations != null && !auth.allowedOperations.includes(operation)) ||
+      [verified.grant, row.grant_ceiling].some(grant => !hasScope(grant.scopes, 'read') ||
+        grant.operations !== null && !grant.operations.includes(operation))) {
       throw new OperationError('permission_denied', 'The local reader grant excludes this operation.');
     }
     const scope = sourceScopeOpts(ctx);
-    const ids = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : []);
-    if (!verified.grant.sourceIds.includes('*') && ids.some(id => !verified.grant.sourceIds.includes(id))) throw new OperationError('permission_denied', 'The local reader excludes this source.');
-    return ctx;
+    let ids = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : null);
+    let operations = auth?.allowedOperations ?? null;
+    for (const grant of [verified.grant, row.grant_ceiling]) {
+      if (!grant.sourceIds.includes('*')) ids = ids === null ? grant.sourceIds : intersect(ids, grant.sourceIds);
+      if (grant.operations !== null) operations = operations === null ? grant.operations : intersect(operations, grant.operations);
+    }
+    const scopes = (auth?.scopes ?? verified.grant.scopes).filter(value =>
+      hasScope(verified.grant.scopes, value) && hasScope(row.grant_ceiling.scopes, value));
+    return { ...ctx, ...(ids === null ? {} : { sourceId: ids[0] ?? '__denied__' }), auth: {
+      token: '', clientId: verified.principal.id, ...auth, scopes, allowedOperations: operations,
+      ...(ids === null ? {} : { allowedSources: ids }),
+    } };
   }
   if (!auth || !auth.principal || auth.grantProjectionDegraded || auth.fenceProjectionDegraded || !hasScope(auth.scopes, 'read') ||
     auth.allowedOperations != null && !auth.allowedOperations.includes(operation) || auth.effectiveSurface === 'verbs') {

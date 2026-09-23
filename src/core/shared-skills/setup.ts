@@ -9,6 +9,7 @@ import { checkedContentRoot } from './setup-files.ts';
 import { DEFAULT_SHARED_PACK_ID, packagedSharedSkillPolicy, packagedSharedSkills } from './setup-bundle.ts';
 import { publicationEnabled, setSharedSkillPolicy } from './policy.ts';
 import type { BrainEngine } from '../engine.ts';
+import { assertPackagedSkillSource, sharedSkillSourcePolicy } from './setup-source-policy.ts';
 
 export async function isNewContentDatabase(engine: BrainEngine): Promise<boolean> {
   const [row] = await engine.executeRaw<{ fresh: boolean }>("SELECT to_regclass('public.pages') IS NULL AND to_regclass('public.config') IS NULL AND to_regclass('public.persistence_brain') IS NULL AS fresh");
@@ -66,6 +67,18 @@ export async function setupSharedBrainContent(ctx: OperationContext, options: Sh
   receipt.brain_id = brain.brain_id;
   receipt.source_id = sourceId;
   receipt.source_incarnation = source.incarnation;
+  const sourcePolicy = await sharedSkillSourcePolicy(ctx.engine, sourceId);
+  if (sourcePolicy.mode !== 'content') {
+    receipt.root = source.local_path;
+    receipt.repository_kind = source.local_path ? 'content_directory' : 'db_only';
+    if (source.local_path) {
+      const git = spawnSync('git', ['-C', source.local_path, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 15_000 });
+      if (git.status === 0 && resolve(git.stdout.trim()) === resolve(source.local_path)) receipt.repository_kind = 'git';
+    }
+    receipt.pending_actions = [sourcePolicy.reason];
+    if (!options.dryRun) await saveContentReceipt(ctx, receipt);
+    return receipt;
+  }
   const key = contentSetupKey(sourceId, source.incarnation);
   const saved = await ctx.engine.getConfig(key);
   let prior: SharedContentReceipt | null = null;
@@ -172,6 +185,7 @@ export async function setupSharedBrainContent(ctx: OperationContext, options: Sh
 }
 
 export async function installPackagedSharedSkills(ctx: OperationContext, sourceId: string, preservePaths: string[] = []): Promise<void> {
+  await assertPackagedSkillSource(ctx.engine, sourceId);
   const files = packagedSharedSkills();
   for (const path of preservePaths) if (['README.md', 'LICENSE'].includes(path)) delete files[path];
   const { adoptSharedSkillpack } = await import('./catalog.ts');

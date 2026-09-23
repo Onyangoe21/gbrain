@@ -273,9 +273,10 @@ test/serve-http-mcp-transport-cleanup.test.ts	POST /mcp transport cleanup (#2844
 test/serve-http-metrics.test.ts	serve-http.ts wiring (structural — the two defects of the original PR)	2	readFileSync
 test/serve-stdin-eof-drain.test.ts	serve-sync-runner stays off the boot path (#4409)	1	readFileSync
 test/shared-skills-catalog.test.ts	(file-level)	22	readFileSync
-test/shared-skills-export.serial.test.ts	(file-level)	5	readFileSync
+test/shared-skills-export.serial.test.ts	(file-level)	7	readFileSync
 test/shared-skills-init.serial.test.ts	real combined brain initialization	4	readFileSync
 test/shared-skills-migration-cli.serial.test.ts	(file-level)	1	readFileSync
+test/shared-skills-optimizer.serial.test.ts	(file-level)	8	readFileSync
 test/shared-skills-setup.serial.test.ts	packaged default skills	2	readFileSync
 test/shared-skills-setup.serial.test.ts	staged skill migration	7	readFileSync
 test/shared-skills-writer-boundary.serial.test.ts	(file-level)	5	readFileSync

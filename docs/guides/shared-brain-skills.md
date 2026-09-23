@@ -49,6 +49,18 @@ receipt's `root`, `repository_kind`, `stage`, and `pending_actions`; a
 `content_directory` is not a Git repository, and `backup: not_verified` is not
 a protected backup.
 
+Doctor treats upstream-sync freshness as not applicable only for an owned content
+directory or explicitly initialized Git root whose completed, ready setup receipt
+matches the current brain, source incarnation, registered root, and active
+canonical-owner binding.
+The source must have no Git sync commit, external repository, connector, or
+company-ingestion policy. Existing external roots and incomplete or mismatched
+receipts retain the ordinary never-synced/stale checks; managed persistence alone
+does not exempt a source. No `last_sync_at` timestamp is fabricated. The separate
+`canonical_content_writes` check reports queued publication and required recovery
+for these roots. Both checks classify ownership from database records; remote
+doctor does not inspect or execute commands against stored filesystem paths.
+
 ## Discover the authorized catalog
 
 Use `list_skills` with `{"schema_version":2}` over MCP, or:
@@ -64,6 +76,12 @@ is 50; the maximum is 100. Fetch only the relevant `get_skill` with
 `schema_version: 2`, the returned `qualified_id`, and `revision`. Fetch declared
 dependencies through `get_skill_asset` using that same identity and revision.
 Do not turn a returned file into an execution permission.
+
+When supplying separate identity fields instead of `qualified_id`, pass the
+returned brain ID as `expected_brain_id` (`--expected-brain-id` on the CLI).
+This asserts the already-connected brain; it never routes to another database.
+The catalog and receipt field remains `brain_id`. Shared-skill tools expose no
+caller-controlled `brain` or `brain_id` routing parameter.
 
 A qualified identity contains the persistent brain ID, source ID, source
 incarnation, pack ID, and skill name. Copy the returned identity rather than
@@ -236,6 +254,20 @@ copies through the existing harness/destination removal flow before enrolling;
 modified or unowned copies require conflict resolution. No legacy body or
 native shadow copy is automatically deleted or converted by this plan.
 
+After resolving that inventory, a local bridge can approve following with
+`gbrain skillpack scaffold --harness codex --dest /absolute/native/skills --skills follow`.
+Use the actual supported harness and native destination, and `--skills memory-only`
+on that same target for cleanup. The bridge reserves one source/destination per
+verified local CLI principal and harness. Reuse that target for repair or rejoin;
+leaving does not release its binding. Independent installations need separate
+private-handoff principals, not another destination using the same credential.
+
+Conflicting legacy targets can remove unchanged owned local files, but shared
+server leave is withheld so another target's enrollment is not disabled. The
+receipt records pending remote cleanup. Edited or unverifiable native files need
+manual resolution; neither cleanup nor a successful router write proves that a
+running harness unloaded or used those instructions.
+
 ## Update a shared skill
 
 An authorized editor calls `put_skill` with a unique `request_id`, the current
@@ -255,6 +287,33 @@ After commitment, refresh the second client **and the parent**, compare the
 qualified revision, and test new-conversation routing. Ordinary revisions
 within the approved policy can follow without individual installation consent;
 new permissions, file classes, or requirements cannot.
+
+### Optimize without bypassing publication
+
+Opt-in `run_skillopt` calls can select `shared_skill: true` with the catalog's
+`source_id`, `source_incarnation`, `pack_id`, `expected_revision`, the skill's
+`skill_name`, and a unique stable `request_id`. The existing benchmark, provider,
+budget, and evaluation requirements still apply; connecting or following does
+not authorize paid optimization. Remote callers additionally need the existing
+administrator/skill allowlist approval, catalog-read authority, and explicit
+`skill_editor` and `put_skill` permission.
+
+For remote calls, both benchmark and held-out inputs must be approved assets of
+that exact selected skill revision, readable through the caller's current
+`get_skill_asset` grant. Their sealed bytes are used for evaluation; a neighboring
+skill's file, an unpublished local file, or a changed live file cannot substitute
+for the approved input. Trusted-local callers may supply explicitly chosen,
+bounded external evaluation files.
+
+The active canonical owner stages the approved closure under private
+`skillopt-proposals/<proposal_id>`, not inside the content root. Only an accepted,
+lint-valid body change is eligible for publication; frontmatter and supporting
+files stay unchanged. Publication rechecks current authority and the original
+revision. Revocation, conflicts, and invalid candidates retain the private
+proposal without overwriting canonical bytes. A submitted request UUID refuses
+another optimization run before spending; inspect `get_write_request` rather
+than blindly retrying. Shared optimization does not support legacy resume,
+write-capture, or evaluation-ablation options.
 
 ### Publish reviewed filesystem edits
 
@@ -412,11 +471,31 @@ before serving. A backup with unresolved file recovery fails with
 `restore_recovery_required`; preserve the archive/source installation, reconcile
 recovery with its current owner, and make a new backup.
 
-There is no same-identity recovery flag in this CLI. External PostgreSQL dump
-restoration remains an operator-managed procedure: keep the restored service
-offline, validate revocations and withdrawals against current records, exclude
-the old service when replacing it, and reissue authority before serving. A
-stale backup cannot tell you which newer withdrawals or revocations it lacks.
+### Recover the same brain identity
+
+For a compatible local operational archive, an explicit recovery mode preserves
+the brain ID while still rotating the serving epoch/key, revoking archived
+credentials and memberships, detaching owners, and disabling publication:
+
+```bash
+gbrain backup restore /absolute/private/brain.gbrain-backup \
+  --into /absolute/recovered-brain --mode recovery \
+  --confirm-quiesced --confirm-backup-compatible --confirm-authority-reviewed \
+  --json
+```
+
+All three confirmations are required. They record operator attestations, not
+proof that the old service stopped or that the archive contains later
+revocations and withdrawals. Exclude the old service externally, validate the
+archive against current authority and withdrawal records, review the recovery
+receipt, and reissue access before serving. Missing compatible authority metadata
+or unresolved file recovery still refuses recovery; flags cannot bless an
+incomplete archive.
+
+External PostgreSQL dump restoration remains an operator-managed procedure with
+the same offline validation, old-service exclusion, and authority reissue
+requirements. A stale backup cannot tell you which newer withdrawals or
+revocations it lacks.
 
 ## Acceptance checklist
 

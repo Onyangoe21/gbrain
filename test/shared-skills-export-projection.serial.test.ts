@@ -96,3 +96,17 @@ test('a verified export followed by an ordinary page edit preserves private take
   expect(await ctx.engine.executeRaw(takeSql)).toEqual(beforeTakes);
   expect(await ctx.engine.executeRaw(factSql)).toEqual(beforeFacts);
 }), 120_000);
+
+test('an incomplete resolution cannot invent a resolver during export validation', () => fixture(async (ctx, root) => {
+  const incomplete = renderTakesFence([{ rowNum: 1, claim: 'Synthetic incomplete resolution', kind: 'bet', holder: 'brain', weight: 0.9, active: true,
+    resolvedAt: '2026-01-01', resolvedQuality: 'correct', resolvedEvidence: 'Synthetic evidence without attribution' }]).trim();
+  await ctx.engine.putPage('notes/incomplete', { type: 'note', title: 'Incomplete', compiled_truth: incomplete, timeline: '', frontmatter: {} }, { sourceId: 'default' });
+  const page = (await ctx.engine.getPage('notes/incomplete', { sourceId: 'default' }))!;
+  await ctx.engine.transaction(tx => prepareCanonicalProjections(parseMarkdown(serializePageToMarkdown(page, []), 'notes/incomplete.md'), page.slug, 'default')(tx));
+  const before = await ctx.engine.executeRaw('SELECT * FROM takes ORDER BY id');
+  const result = await exportDatabaseContent(ctx, { sourceId: 'default', root, confirmQuiesced: true, backup: 'operator_verified' });
+  expect(result.status).toBe('conflict');
+  expect(result.conflicts.find(conflict => conflict.slug === 'notes/incomplete')?.reason).toContain('resolved_by');
+  expect(existsSync(root)).toBe(false);
+  expect(await ctx.engine.executeRaw('SELECT * FROM takes ORDER BY id')).toEqual(before);
+}), 120_000);

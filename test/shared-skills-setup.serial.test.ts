@@ -29,6 +29,7 @@ function fixture(root: string | null = null) {
       if (sql.includes('FROM sources')) return [source];
       if (sql.includes('EXISTS(SELECT 1 FROM pages')) return [{ present: hasPages }];
       if (sql.includes('FROM shared_skill_packs')) return [];
+      if (sql.includes('FROM source_ingestion_receipts')) return [];
       throw new Error(`Unexpected SQL: ${sql}`);
     },
   } as unknown as BrainEngine;

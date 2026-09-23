@@ -3,11 +3,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, statSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { createSharedSkillsAdapter, type SharedSkillsToolCaller } from '../src/core/shared-skills/adapter.ts';
 import { sharedSkillKey, type MembershipSnapshot } from '../src/core/shared-skills/membership-types.ts';
 import { sha256 } from '../src/core/agent-install/state.ts';
 import { installHarnessConnection } from '../src/core/harness/install.ts';
 import type { HarnessCredentials } from '../src/core/harness/credentials.ts';
+import { operations } from '../src/core/operations.ts';
 
 const roots: string[] = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'gbrain-shared-adapter-')); roots.push(root); return root; };
@@ -199,7 +201,7 @@ test('a thousand-skill authoritative view installs completely without the former
       if (params.acknowledgment) acknowledged = (params.acknowledgment as { evidence: { revisions: unknown[] } }).evidence.revisions.length;
       return snapshot as T;
     }
-    if (name === 'get_skill') return { ...params, delivery: 'complete', usable: true, files: [{ path: 'SKILL.md', sha256: sha256(body), size: Buffer.byteLength(body) }] } as T;
+    if (name === 'get_skill') return { ...params, brain_id: params.expected_brain_id, delivery: 'complete', usable: true, files: [{ path: 'SKILL.md', sha256: sha256(body), size: Buffer.byteLength(body) }] } as T;
     if (name === 'get_skill_asset') return { content: body, encoding: 'utf8' } as T;
     throw new Error('Unexpected fixture operation');
   };
@@ -226,4 +228,45 @@ test('memory-only install neither enrolls nor expands authority', async () => {
   const c: HarnessCredentials = { version: 1, mcp_url: 'https://brain.example.com/mcp', issuer_url: 'https://brain.example.com', client_id: 'fixture', access_token: 'synthetic-fixture-token', shared_skills: { follow: false } };
   const result = await installHarnessConnection(c, { harness: 'claude-code', configPath: join(root, 'config.json'), toolCaller: f.call });
   expect(result.shared_skills?.status).toBe('pending'); expect(f.calls).toEqual([]);
+});
+
+test('launcher router uses registered CLI commands, exact schema flags and shell-safe absolute paths', async () => {
+  const root = temp(), f = fixture();
+  const launcher = join(root, "fixture launcher 'with spaces'");
+  writeFileSync(launcher, '#!/bin/sh\nprintf \'%s\\0\' "$@"\n', { mode: 0o700 });
+  const cache = join(root, 'cache');
+  await createSharedSkillsAdapter({ call: f.call, root: cache, adapter: 'muse', launcher }).join({ approved: true });
+  const router = readFileSync(join(cache, 'router', 'SKILL.md'), 'utf8');
+  const commands = [...router.matchAll(/```sh\n([^\n]+)\n```/g)].map(match => match[1]);
+  expect(commands).toHaveLength(6);
+  const skill = f.skill();
+  const env = { ...process.env, SKILL_NAME: skill.name, BRAIN_ID: skill.brain_id, SOURCE_ID: skill.source_id,
+    SOURCE_INCARNATION: skill.source_incarnation, PACK_ID: skill.pack_id, REVISION: skill.revision,
+    ASSET_PATH: 'references/helper.txt', APPROVED_FOLLOW_POLICY_JSON: JSON.stringify({ approved: true, source_ids: ['default'] }) };
+  const seen: string[] = [];
+  for (const command of commands) {
+    expect(command.startsWith(`'${launcher.replace(/'/g, "'\\''")}' `)).toBe(true);
+    const run = spawnSync('bash', ['-c', command], { env, encoding: 'utf8' });
+    expect(run.status).toBe(0);
+    const [name, ...args] = run.stdout.split('\0').filter(Boolean);
+    seen.push(name);
+    const operation = operations.find(operation => operation.cliHints?.name === name)!;
+    expect(operation).toBeDefined();
+    const flags = args.filter(arg => arg.startsWith('--'));
+    for (const flag of flags) if (flag !== '--json') expect(operation.params[flag.slice(2).replaceAll('-', '_')]).toBeDefined();
+    if (name === 'skills' || name === 'skill') {
+      expect(args[args.indexOf('--schema-version') + 1]).toBe('2');
+    } else expect(args).not.toContain('--schema-version');
+    if (name === 'skill' || name === 'skill-asset') {
+      expect(args[args.indexOf('--expected-brain-id') + 1]).toBe(skill.brain_id);
+      expect(args).not.toContain('--brain-id');
+      expect(args[args.indexOf('--source-id') + 1]).toBe(skill.source_id);
+      expect(args[args.indexOf('--source-incarnation') + 1]).toBe(skill.source_incarnation);
+      expect(args[args.indexOf('--pack-id') + 1]).toBe(skill.pack_id);
+      expect(args[args.indexOf('--revision') + 1]).toBe(skill.revision);
+    }
+  }
+  expect(seen).toEqual(['sync-brain-skills', 'skills', 'skill', 'skill-asset', 'join-brain', 'leave-brain']);
+  expect(router).not.toContain('call sync_brain_skills');
+  expect(router).not.toContain('get_skill with schema_version');
 });

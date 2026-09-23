@@ -53,8 +53,8 @@ describe('real combined brain initialization', () => {
         expect(joined.blocked_skills).toEqual([]);
         expect(joined.status).toBe('catalog_visible');
         expect(joined.delivery.native).toBe('unverified');
-        const scopes = ['read', 'skills_member_self'];
-        const operations = ['join_brain', 'sync_brain_skills', 'leave_brain', 'list_skills', 'get_skill', 'get_skill_asset'];
+        const scopes = ['read', 'write', 'skills_member_self'];
+        const operations = ['join_brain', 'sync_brain_skills', 'leave_brain', 'list_skills', 'get_skill', 'get_skill_asset', 'recall', 'remember', 'forget'];
         const provider = new GBrainOAuthProvider({ sql: sqlQueryForEngine(engine), transaction: fn => engine.transaction(tx => fn(sqlQueryForEngine(tx))) });
         const client = await provider.registerClientManual('fresh-follow-fixture', ['client_credentials'], scopes.join(' '), [], 'default');
         await engine.executeRaw('UPDATE oauth_clients SET allowed_operations=$2::text[] WHERE client_id=$1', [client.clientId, operations]);

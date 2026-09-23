@@ -58,7 +58,7 @@ const get_skill: Operation = {
   params: {
     schema_version: { type: 'number', description: 'Request 2 for an immutable canonical revision.' },
     qualified_id: { type: 'string', description: 'Exact version 2 qualified skill identity.' },
-    brain_id: { type: 'string', description: 'Persistent brain identity from version 2 discovery.' },
+    expected_brain_id: { type: 'string', description: 'Assert the connected persistent brain identity from version 2 discovery. This never routes to another brain.' },
     source_incarnation: { type: 'string', description: 'Source incarnation from version 2 discovery.' },
     pack_id: { type: 'string', description: 'Canonical pack identifier.' },
     revision: { type: 'string', description: 'Exact immutable revision, or omit for the current head.' },
@@ -74,7 +74,8 @@ const get_skill: Operation = {
     },
   },
   handler: async (ctx, p) => {
-    if (p.schema_version === 2) return (await import('../shared-skills/catalog.ts')).getSharedSkill(ctx, p);
+    if (p.schema_version === 2) return (await import('../shared-skills/catalog.ts')).getSharedSkill(ctx, sharedSkillReadSelector(p));
+    if (p.expected_brain_id !== undefined) throw new OperationError('invalid_params', 'expected_brain_id requires schema_version 2; it asserts identity and never selects a brain connection.');
     if (p.schema_version !== undefined && p.schema_version !== 1) throw new OperationError('invalid_params', 'Supported skill catalog schema versions are 1 and 2.');
     const compatibility = await import('../shared-skills/compatibility.ts');
     if (await compatibility.sharedCatalogActive(ctx)) return compatibility.getLegacySharedSkill(ctx, p.name, typeof p.source_id === 'string' ? p.source_id : undefined);
@@ -103,6 +104,12 @@ const sharedSkillKeyParams: Operation['params'] = {
   pack_id: { type: 'string', required: true, description: 'Canonical pack identifier.' },
   name: { type: 'string', required: true, description: 'Canonical skill name.' },
 };
+function sharedSkillReadSelector(p: Record<string, unknown>) {
+  return { name: p.name as string | undefined, qualified_id: p.qualified_id as string | undefined,
+    brain_id: p.expected_brain_id as string | undefined, source_id: p.source_id as string | undefined,
+    source_incarnation: p.source_incarnation as string | undefined, pack_id: p.pack_id as string | undefined,
+    revision: p.revision as string | undefined };
+}
 const sharedSkillMutationParams: Operation['params'] = {
   ...sharedSkillKeyParams,
   request_id: { type: 'string', required: true, description: 'Durable idempotency UUID; reuse only with identical intent.' },
@@ -111,18 +118,20 @@ const sharedSkillMutationParams: Operation['params'] = {
 const get_skill_asset: Operation = {
   name: 'get_skill_asset', description: 'Read a bounded, owner-approved file from an exact sealed skill revision. Does not execute downloaded bytes.',
   scope: 'read', publishGateKey: 'mcp.publish_skills',
+  cliHints: { name: 'skill-asset', positional: [] },
   params: { source_id: sharedSkillKeyParams.source_id, source_incarnation: sharedSkillKeyParams.source_incarnation,
     name: { type: 'string', description: 'Skill name when not selecting by qualified_id.' },
     pack_id: { type: 'string', description: 'Pack identifier when not selecting by qualified_id.' },
     qualified_id: { type: 'string', description: 'Qualified skill key from version 2 discovery.' },
-    brain_id: { type: 'string', description: 'Persistent brain identity.' },
+    expected_brain_id: { type: 'string', description: 'Assert this connected persistent brain identity without routing to another brain.' },
     revision: { type: 'string', required: true, description: 'Immutable revision from get_skill.' },
     path: { type: 'string', required: true, description: 'Exact path in the approved revision file manifest.' } },
-  handler: async (ctx, p) => (await import('../shared-skills/catalog.ts')).getSharedSkillAsset(ctx, { ...p, path: String(p.path ?? '') }),
+  handler: async (ctx, p) => (await import('../shared-skills/catalog.ts')).getSharedSkillAsset(ctx, { ...sharedSkillReadSelector(p), path: String(p.path ?? '') }),
 };
 const put_skill: Operation = {
   name: 'put_skill', description: 'Publish a complete file-canonical skill revision with CAS and a durable receipt. Requires explicit skill editor authority; cannot expand publication policy.',
   scope: 'write', requiredScopes: ['skill_editor'], mutating: true,
+  cliHints: { name: 'put-skill', positional: [] },
   params: { ...sharedSkillMutationParams, description: { type: 'string', description: 'Compact routing description.' },
     triggers: { type: 'array', items: { type: 'string' }, description: 'Routing phrases.' },
     requirements: { type: 'array', items: { type: 'string' }, description: 'Approved runtime and tool requirement tokens.' },
@@ -133,6 +142,7 @@ const put_skill: Operation = {
 const delete_skill: Operation = {
   name: 'delete_skill', description: 'CAS-delete a canonical shared skill and revoke future managed activation. Previously downloaded bytes are not recalled.',
   scope: 'write', requiredScopes: ['skill_editor'], mutating: true, params: sharedSkillMutationParams,
+  cliHints: { name: 'delete-skill', positional: [] },
   handler: async (ctx, p) => (await import('../shared-skills/catalog.ts')).submitSharedSkillMutation(ctx, 'delete_skill', p),
 };
 const import_skill_proposal: Operation = {
@@ -144,6 +154,7 @@ const import_skill_proposal: Operation = {
 const set_skill_policy: Operation = {
   name: 'set_skill_policy', description: 'Explicitly approve a versioned shared-skill disclosure and follow policy. Separate publisher authority is required; editing a skill never grants this permission.',
   scope: 'admin', requiredScopes: ['skill_publisher'], mutating: true,
+  cliHints: { name: 'set-skill-policy', positional: [] },
   params: { source_id: { type: 'string', required: true, description: 'Source whose publication policy is approved.' },
     expected_policy_epoch: { type: 'string', description: 'Previously reviewed policy epoch; null for initial policy.' },
     policy: { type: 'object', required: true, description: 'version:1, enabled, classes, audiences, requirements, allow_follow.' } },
@@ -153,24 +164,28 @@ const set_skill_policy: Operation = {
 const get_skill_policy: Operation = {
   name: 'get_skill_policy', description: 'Read the owner publication policy and CAS epoch, including when sharing is disabled. Does not approve or change disclosure.',
   scope: 'admin', requiredScopes: ['skill_publisher'],
+  cliHints: { name: 'skill-policy', positional: [] },
   params: { source_id: { type: 'string', required: true, description: 'Source whose publication policy is reviewed.' } },
   handler: async (ctx, p) => (await import('../shared-skills/policy.ts')).getSharedSkillPolicy(ctx, String(p.source_id)),
 };
 const get_skill_retention: Operation = {
   name: 'get_skill_retention', description: 'Inspect retained shared-skill revision counts, protected leases and source storage capacity. Trusted host operator only.',
   scope: 'admin', localOnly: true,
+  cliHints: { name: 'skill-retention', positional: [] },
   params: { source_id: { type: 'string', description: 'Canonical source to inspect.' } },
   handler: async (ctx, p) => (await import('../shared-skills/retention.ts')).getSharedSkillRetention(ctx, typeof p.source_id === 'string' ? p.source_id : ctx.sourceId),
 };
 const prune_skill_revisions: Operation = {
   name: 'prune_skill_revisions', description: 'Prune one bounded batch of expired shared-skill history. Preserves heads, tombstones, pending publication refs, delivery leases, pins and permanent write receipts.',
   scope: 'admin', localOnly: true, mutating: true,
+  cliHints: { name: 'prune-skill-revisions', positional: [] },
   params: { source_id: { type: 'string', description: 'Canonical source to prune.' } },
   handler: async (ctx, p) => (await import('../shared-skills/retention.ts')).pruneSharedSkillRevisions(ctx, typeof p.source_id === 'string' ? p.source_id : ctx.sourceId),
 };
 const retain_skill_revision: Operation = {
   name: 'retain_skill_revision', description: 'Pin an exact shared-skill revision for up to 24 hours under a bounded operator quota. Does not grant read or execution permission.',
   scope: 'admin', localOnly: true, mutating: true,
+  cliHints: { name: 'retain-skill-revision', positional: [] },
   params: { ...sharedSkillKeyParams, source_incarnation: { type: 'string', required: true, description: 'Exact source incarnation.' },
     revision: { type: 'string', required: true, description: 'Exact existing immutable revision.' }, hours: { type: 'number', description: 'Pin lifetime greater than zero and at most 24 hours.' } },
   handler: async (ctx, p) => (await import('../shared-skills/retention.ts')).retainSharedSkillRevision(ctx,

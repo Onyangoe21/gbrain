@@ -3,9 +3,10 @@ import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { Page } from '../types.ts';
-import { importCodeFile, importFromContent, MAX_FILE_SIZE } from '../import-file.ts';
+import { importCodeFile, importFromContent, importImageFile, isImageFilePath, MAX_FILE_SIZE, MAX_IMAGE_BYTES } from '../import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import { applyInference } from '../frontmatter-inference.ts';
+import { getCompanyBrainProfile } from '../company-brain/profile.ts';
 import { hasMalformedPathSegment, isCodeFilePath, slugifyCodePath, slugifyPath } from '../sync.ts';
 import { OperationError } from '../ops/contract.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
@@ -31,7 +32,8 @@ export function readImportBytes(path: string): Buffer {
   if (realpathSync(path) !== resolve(path) || !lstatSync(path).isFile()) {
     throw new OperationError('source_changed', 'Managed import refuses symlinked files or ancestors. Use the real source path.');
   }
-  if (lstatSync(path).size > MAX_FILE_SIZE) throw new OperationError('invalid_params', `File too large (max ${MAX_FILE_SIZE} bytes).`);
+  const maxBytes = isImageFilePath(path) ? MAX_IMAGE_BYTES : MAX_FILE_SIZE;
+  if (lstatSync(path).size > maxBytes) throw new OperationError('invalid_params', `File too large (max ${maxBytes} bytes).`);
   return readFileSync(path);
 }
 
@@ -42,9 +44,10 @@ export function managedImportContent(sourcePath: string, bytes: Buffer, activePa
   if (/(^|\/)skills(\/|$)/i.test(sourcePath.replaceAll('\\', '/')) || /(^|\/)skillpack\.json$/i.test(sourcePath)) {
     throw new OperationError('skill_bundle_required', 'Import cannot publish skill paths. Use the shared skill publisher.');
   }
+  if (isImageFilePath(sourcePath)) return { slug: sourcePath.replaceAll('\\', '/').toLowerCase(), content: bytes.toString('base64') };
   let content = bytes.toString('utf8').replace(/^\uFEFF/, '');
   if (isCodeFilePath(sourcePath)) return { slug: slugifyCodePath(sourcePath), content };
-  if (!/\.mdx?$/i.test(sourcePath)) throw new OperationError('invalid_params', 'Managed import supports Markdown and code files; image import requires a coordinated image preparer.');
+  if (!/\.mdx?$/i.test(sourcePath)) throw new OperationError('invalid_params', 'Managed import supports Markdown, code and supported image files.');
   const original = parseMarkdown(content, sourcePath, { validate: true });
   const invalid = original.errors?.find(error => error.code === 'YAML_PARSE');
   if (invalid) throw new OperationError('invalid_params', `Invalid YAML frontmatter: ${invalid.message}`);
@@ -60,6 +63,7 @@ export function managedImportContent(sourcePath: string, bytes: Buffer, activePa
 }
 
 export async function assertImportPaths(engine: BrainEngine, sourceId: string, root: string, input: string, target: string): Promise<void> {
+  if (await getCompanyBrainProfile(engine, sourceId)) throw new OperationError('profile_incompatible', 'Company-brain sources require approved committed ingestion and never accept ordinary import writeback.');
   if (!isWriteTargetContained(target, root)) throw new OperationError('source_changed', 'The import target escapes its canonical source root.');
   const sources = await engine.executeRaw<{ id: string; local_path: string | null; worktree_path: string | null; relative_path: string | null }>(
     `SELECT s.id,s.local_path,h.local_path AS worktree_path,b.relative_path FROM sources s
@@ -112,29 +116,34 @@ export async function prepareManagedImportMutation(engine: BrainEngine, row: Wri
   if ((snapshot?.page.id ?? null) !== row.page_id || snapshot?.page.source_path && snapshot.page.source_path !== p.sourcePath) {
     throw new OperationError('page_identity_changed', 'The imported path no longer names the accepted page.');
   }
-  let prepared: PreparedContentImport | undefined;
-  const prepare = async (value: PreparedContentImport) => { prepared = value; return value.result; };
+  let prepared: (Omit<PreparedContentImport, 'parsedPage'> & { parsedPage?: PreparedContentImport['parsedPage'] }) | undefined;
+  const prepare = async (value: NonNullable<typeof prepared>) => { prepared = value; return value.result; };
   const code = isCodeFilePath(p.sourcePath);
-  const result = code
+  const image = isImageFilePath(p.sourcePath);
+  const imageBytes = image ? Buffer.from(p.content, 'base64') : undefined;
+  const result = image
+    ? await importImageFile(engine, p.inputPath, p.sourcePath, { ...source, noEmbed: p.noEmbed, bytes: imageBytes, prepare })
+    : code
     ? await importCodeFile(engine, p.sourcePath, p.content, { ...source, noEmbed: true, prepare })
     : await importFromContent(engine, row.slug, p.content, { ...source, noEmbed: true, remote: false, prepare,
       activePack: p.activePack, sourcePath: p.sourcePath, filename: basename(p.sourcePath, '.md'), allowEmptyOverwrite: true });
   if (!prepared) throw new OperationError('invalid_params', result.error ?? 'The file could not be prepared.');
   const ready = prepared;
   if (ready.slug !== row.slug || ready.observedRevision !== (snapshot?.revision ?? null)) throw new OperationError('revision_conflict', 'The import identity changed during preparation.');
-  const tags = [...new Set([...(snapshot?.tags ?? []), ...ready.parsedPage.tags])].sort();
-  const rendered = code ? p.content : serializePageToMarkdown({
+  if (!image && !ready.parsedPage) throw new OperationError('invalid_params', 'The text import lost its prepared page.');
+  const tags = [...new Set([...(snapshot?.tags ?? []), ...(ready.parsedPage?.tags ?? [])])].sort();
+  const rendered = imageBytes ?? (code ? p.content : serializePageToMarkdown({
     ...(snapshot?.page ?? { id: 0, source_id: row.source_id, created_at: new Date(), updated_at: new Date() }), ...ready.parsedPage,
-  } as Page, tags);
-  const project = code ? undefined : prepareCanonicalProjections(ready.parsedPage, row.slug, row.source_id);
+  } as Page, tags));
+  const project = code || image ? undefined : prepareCanonicalProjections(ready.parsedPage!, row.slug, row.source_id);
   return { observedRevision: ready.observedRevision, noop: ready.noop && p.targetHash === sha256(rendered),
-    deferEmbedding: p.noEmbed, validate: checkPaths,
+    deferEmbedding: image || p.noEmbed, validate: checkPaths,
     file: { root, path, content: rendered, expectedBeforeHash: p.targetHash },
     apply: async tx => {
       await ready.apply(tx);
       await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
       if (!ready.noop && project) await project(tx);
-      if (!ready.noop) await sealPageTextProjection(tx, row.slug, row.source_id);
+      if (!ready.noop && !image) await sealPageTextProjection(tx, row.slug, row.source_id);
       return { ...result, parsedPage: undefined, imported_file: true, source_id: row.source_id };
     } };
 }

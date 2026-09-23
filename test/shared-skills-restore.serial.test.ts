@@ -266,6 +266,17 @@ test('recovery attestations cannot bless a corrupt archive', async () => {
   expect(JSON.parse(readFileSync(join(into, 'restore-receipt.json'), 'utf8'))).toMatchObject({ state: 'failed', mode: 'recovery', original_preserved: true });
 });
 
+test('recovery refuses missing operational authority metadata', async () => {
+  await withBrain(restored, async engine => {
+    const before = await authorityRows(engine);
+    await expect(engine.transaction(async tx => {
+      await tx.executeRaw('DROP TABLE shared_skill_state');
+      await quarantineSharedSkillRestore(tx, randomUUID(), recoveryOptions);
+    })).rejects.toMatchObject({ code: 'restore_recovery_unsupported' });
+    expect(await authorityRows(engine)).toEqual(before);
+  });
+});
+
 test('unresolved topology recovery refuses publication and retains a private failed stage', async () => {
   await withBrain(root, async engine => {
     await engine.executeRaw(`INSERT INTO persistence_topology_changes(principal_id,request_id,digest,operation,source_id,state,recovery)

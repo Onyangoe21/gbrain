@@ -35,7 +35,7 @@ export function readHarnessConnectionStatus(options: HarnessStatusOptions) {
   if (!stat.isFile() || stat.size > 8 * 1024 * 1024) throw new Error('Invalid shared-skills receipt');
   const receipt = JSON.parse(readFileSync(path, 'utf8')) as SharedSkillsLocalReceipt;
   if (receipt.format_version !== 1 || receipt.adapter !== harness) throw new Error('Shared-skills receipt does not match this harness');
-  const usable_skills: Array<{ key: string; revision: string }> = [];
+  const recorded_skills: Array<{ key: string; revision: string }> = [];
   let local_reference: 'owned' | 'absent' | 'conflict' = 'absent';
   const activePath = join(root, 'shared-skills', 'active.json');
   assertNoSymlinks(activePath);
@@ -49,7 +49,7 @@ export function readHarnessConnectionStatus(options: HarnessStatusOptions) {
         if (active.brain_id === receipt.brain_id && active.installation_id === receipt.installation_id && active.enrollment_epoch === receipt.enrollment_epoch && active.skills) {
           local_reference = 'owned';
           for (const [key, skill] of Object.entries(active.skills)) {
-            if (typeof skill.revision === 'string') usable_skills.push({ key, revision: skill.revision });
+            if (typeof skill.revision === 'string') recorded_skills.push({ key, revision: skill.revision });
           }
         }
       }
@@ -58,7 +58,7 @@ export function readHarnessConnectionStatus(options: HarnessStatusOptions) {
   return { ...common, status: receipt.status, brain_id: receipt.brain_id, installation_id: receipt.installation_id,
     enrollment_epoch: receipt.enrollment_epoch, desired_view: receipt.desired_view ?? null, installed_view: receipt.installed_view ?? null,
     acknowledged_view: receipt.acknowledged_view ?? null, last_authority_check: receipt.last_authority_check ?? null,
-    native_registration: receipt.native_registration, freshness: receipt.freshness, local_reference, usable_skills,
+    native_registration: receipt.native_registration, freshness: receipt.freshness, local_reference, recorded_skills, usability: 'last_checked_unverified',
     blocked_skills: receipt.blocked_skills ?? [],
     retained_file_count: receipt.retained_files?.length ?? 0, pending_file_count: Object.keys(receipt.pending_files ?? {}).length,
     remote_membership_pending: receipt.remote_membership_pending ?? false, remote_membership_reason: receipt.remote_membership_reason ?? null,
