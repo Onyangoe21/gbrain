@@ -39,7 +39,7 @@ describe('release.yml ↔ binary-self-update asset contract', () => {
     expect(native).toContain('scripts/native/cli-persistence-smoke.ts');
     expect(native).toContain('GBRAIN_TEST_OPENCLAW_BIN:');
     expect(native).toContain('openclaw@2026.9.4');
-    expect(native).toContain('bun test test/openclaw-context-engine-native.serial.test.ts');
+    expect(native).toContain('bun test --timeout=60000 test/openclaw-context-engine-native.serial.test.ts');
     expect(build).toContain('codesign --verify --strict --verbose=2');
     expect(build.indexOf('codesign --verify')).toBeLessThan(build.indexOf('Smoke-test the compiled binary'));
   });
