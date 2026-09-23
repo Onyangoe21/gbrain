@@ -101,6 +101,12 @@ the native session separately.
 
 ## 3. Prove a memory round trip
 
+Save durable facts and preferences, not local harness/configuration state. A
+remote `put_page` does not extract graph edges inline: stdio has best-effort
+startup/idle sweeps, but HTTP needs explicit host maintenance or authorized
+`add_link` calls. Configured providers can receive text, and Markdown export is
+not a full database backup. See [memory boundaries](memory-boundaries.md).
+
 Run the server verifier from the harness environment:
 
 ```bash

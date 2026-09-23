@@ -50,3 +50,16 @@ Keep response interpretation separate from actual MCP tests and native sessions.
 No provider call, automatic capture or production mutation is needed to prepare
 these fictional cases; model evaluations still follow the operator's cost and
 privacy choices.
+
+## Maintenance ownership cases
+
+`maintenance-cases.jsonl` adds five independent, fictional ownership-recovery
+cases. For these cases, provide `skills/maintain/SKILL.md` and
+`docs/architecture/topologies.md` as the instruction context. Use the same
+withheld-requirements and separate-review procedure above. The positive control
+is deliberate noninteractive administration; the other cases distinguish routine
+repair, misleading diagnostic hints, changed state and remote credentials.
+
+Judge proposed responses and calls only. Do not execute topology changes or
+contact a real brain. Preserve instruction hashes and raw responses privately;
+passing these cases is not native-harness activation or a statistical guarantee.

@@ -103,6 +103,7 @@ test/docs-bootstrap-persistence-table.test.ts	#4986 bootstrap.md scopes the Stop
 test/docs-mcp-deploy.test.ts	DEPLOY.md documents dual-mode /mcp auth (#4893)	1	readFileSync
 test/docs-mcp-deploy.test.ts	DEPLOY.md documents the owner magic-link flow (#5007)	5	readFileSync
 test/docs-mcp-deploy.test.ts	DEPLOY.md documents the tailnet/LAN-only serve --http shape (#4500)	3	readFileSync
+test/docs-navigation.test.ts	primary documentation navigation	3	readFileSync
 test/docs-timeline-extraction-guide.test.ts	#4987 timeline extraction docs describe the real trigger	2	readFileSync
 test/doctor-atom-provenance-drift.test.ts	computeAtomProvenanceDriftCheck	18	doctor-source-helper
 test/doctor-embedding-env-override.test.ts	cross-surface parity (source-grep regression guard)	1	doctor-source-helper
@@ -263,6 +264,7 @@ test/scripts/classify-tests.test.ts	classify-tests detectors	18	bun-file,doctor-
 test/scripts/coverage-diff-gate.test.ts	exemptions	3	readFileSync
 test/scripts/e2e-wiring.test.ts	e2e file claim ratchet	5	readFileSync
 test/scripts/e2e-wiring.test.ts	selected-e2e job wiring	6	readFileSync
+test/scripts/heavy-door-workflow.test.ts	heavy door supply chain and coverage gates	4	readFileSync
 test/scripts/native-lock-prebuilds.test.ts	native lock distribution integrity	2	readFileSync
 test/scripts/run-verify-parallel.test.ts	guard registration ⇒ execution coverage	1	readFileSync
 test/scripts/test-shard.slow.test.ts	test-shard.sh — LPT balance contract	5	readFileSync
@@ -276,7 +278,7 @@ test/shared-skills-catalog.test.ts	(file-level)	22	readFileSync
 test/shared-skills-export.serial.test.ts	(file-level)	7	readFileSync
 test/shared-skills-init.serial.test.ts	real combined brain initialization	4	readFileSync
 test/shared-skills-migration-cli.serial.test.ts	(file-level)	1	readFileSync
-test/shared-skills-optimizer.serial.test.ts	(file-level)	8	readFileSync
+test/shared-skills-optimizer.serial.test.ts	(file-level)	15	readFileSync
 test/shared-skills-setup.serial.test.ts	packaged default skills	2	readFileSync
 test/shared-skills-setup.serial.test.ts	staged skill migration	7	readFileSync
 test/shared-skills-writer-boundary.serial.test.ts	(file-level)	5	readFileSync

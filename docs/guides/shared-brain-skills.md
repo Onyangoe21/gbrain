@@ -358,12 +358,19 @@ downloaded files, other history, or backups.
 
 ## Migrate an existing brain
 
-Use the mechanical [v0.51.9.0 migration checklist](../../skills/migrations/v0.51.9.0.md).
+Use the mechanical [v0.52.2.0 migration checklist](../../skills/migrations/v0.52.2.0.md).
 Start on the host with `gbrain apply-migrations --dry-run --json`. It inventories
 registered roots and reports stage-specific conflicts, not arbitrary home
 directories or disconnected devices. Keep operational DB and content backups
 before applying changes. DB-only export requires an explicit absent destination,
 quiescence, and a backup choice; it is not a full database backup.
+
+Writer claim, activation and transfer require deliberate administration intent
+and the `admin_state` from reviewed `sources writer status --json` output. Neither
+routine repair nor `--confirm-quiesced` supplies that authority. Enable the base
+managed writer first when necessary, then inspect fresh status before the separate
+`--shared-skills` activation. The migration checklist gives the exact state-bound
+commands; a changed state requires review, not an automatic retry with a new hash.
 
 An existing root is adopted in place. Knowledge folders, private markers,
 modified files, and explicit publishing opt-outs are preserved. Unmanifested

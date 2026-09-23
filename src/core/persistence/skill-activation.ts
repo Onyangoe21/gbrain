@@ -1,19 +1,20 @@
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { activatePersistence } from './activation.ts';
-import { localHostId } from './identity.ts';
+import { existingLocalHostId, localHostId } from './identity.ts';
 import { acquireWorktree, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import type { NativeLockHandle } from './native-lock.ts';
 import { declarePersistenceProtocol } from './protocol.ts';
 import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from './filesystem-guard.ts';
+import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 
 export async function activateSharedSkillPersistence(engine: BrainEngine,
-  options: { confirmQuiesced?: boolean; dryRun?: boolean } = {}): Promise<{ activated: boolean; protocol_version: 2; filesystem_sources: number }> {
+  options: { confirmQuiesced?: boolean; dryRun?: boolean; expectedState?: string } = {}): Promise<{ activated: boolean; protocol_version: 2; filesystem_sources: number }> {
   const quiescence = () => new OperationError('writer_not_quiesced',
     'Stop and exclude older canonical writers and direct-file skill servers before enabling shared skill publication.',
     'Run this activation on every canonical owner only after verifying process shutdown and canonical-root write access.');
   if (options.confirmQuiesced !== true) throw quiescence();
-  const hostId = localHostId();
+  const hostId = options.dryRun || options.expectedState !== undefined ? existingLocalHostId() : localHostId();
   const loadBindings = async (tx: BrainEngine): Promise<WorktreeBinding[]> => {
     const roots = await tx.executeRaw<{ source_id: string }>(`SELECT b.source_id FROM persistence_source_bindings b
       JOIN sources s ON s.id=b.source_id AND s.incarnation=b.source_incarnation WHERE NOT s.archived ORDER BY b.worktree_id,b.source_id`);
@@ -27,7 +28,10 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
     return bindings;
   };
   const initial = await loadBindings(engine);
-  await activatePersistence(engine, { confirmQuiesced: true, dryRun: options.dryRun });
+  const base = await activatePersistence(engine, { confirmQuiesced: true,
+    dryRun: options.expectedState !== undefined || options.dryRun, expectedState: options.expectedState });
+  if (options.expectedState !== undefined && !base.enabled) throw new OperationError('writer_registration_required',
+    'Activate managed persistence first, then review fresh writer status before enabling shared skills.', WRITER_INSPECTION_HINT);
   const locks: NativeLockHandle[] = [];
   try {
     for (const binding of [...new Map(initial.map(row => [row.worktree_id, row])).values()]) {
@@ -38,6 +42,7 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
     return await engine.transaction(async tx => {
       await declarePersistenceProtocol(tx);
       await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout','1s',true)");
+      await assertWriterAdminState(tx, options.expectedState);
       await tx.executeRaw('SELECT singleton FROM persistence_brain WHERE singleton=1 FOR UPDATE');
       await tx.executeRaw('SELECT id FROM persistence_worktrees ORDER BY id FOR UPDATE');
       await tx.executeRaw('SELECT id FROM sources ORDER BY id FOR SHARE');

@@ -9,7 +9,7 @@ src/commands/frontmatter.ts	0	filesystem_guard	Batch frontmatter repair prefligh
 src/commands/import.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/commands/jobs.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/commands/migrate-engine.ts	11	early_refusal	Managed mode refuses this legacy entry point before its canonical filesystem/provider effects.
-src/commands/migrations/v0_13_1.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
+src/commands/migrations/v0_13_1.ts	2	engine_guard	Metadata-only batches hold canonical page guards and row locks; update validate and preserve only already-valid text seals in the same transaction.
 src/commands/migrations/v0_32_2.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/commands/pages.ts	2	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/commands/reconcile-links.ts	2	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.

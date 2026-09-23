@@ -3,6 +3,7 @@ import * as gateway from '../src/core/ai/gateway.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import type { SearchOpts } from '../src/core/types.ts';
+import { decodeDeepResearchId } from '../src/core/deep-research-id.ts';
 
 let embeddings = 0;
 mock.module('../src/core/ai/gateway.ts', () => ({
@@ -36,6 +37,10 @@ describe('image query retains date and readiness contracts outside hybrid search
       image: 'c3ludGhldGlj', limit: 3, since: '2030-06-15', until: '2030-06-15',
     });
     expect(results).toHaveLength(nonempty ? 1 : 0);
+    if (nonempty) {
+      expect(decodeDeepResearchId((results as Array<{ id: string }>)[0].id))
+        .toEqual({ sourceId: 'default', slug: 'images/synthetic' });
+    }
     expect(options).toMatchObject({ afterDate: '2030-06-15', afterDateInclusive: true,
       beforeDate: '2030-06-16T00:00:00.000Z', beforeDateInclusive: false,
       sourceId: 'default', excludePrivate: true, requireSafeChunks: true });

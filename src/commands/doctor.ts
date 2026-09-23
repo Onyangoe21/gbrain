@@ -2382,7 +2382,7 @@ export async function buildChecks(
       });
     } else {
       const registry = getEmbeddingColumnRegistry(mergedCfg);
-      const declaredColumns = Object.keys(registry);
+      const declaredColumns = Object.keys(registry).filter(name => name !== 'embedding' || !fileCfg?.embedding_disabled || !!mergedCfg.embedding_columns?.embedding);
       const activeCol = resolveEmbeddingColumn(undefined, mergedCfg).name;
 
       // D13 — batch format_type probe via pg_attribute. udt_name only
@@ -2500,7 +2500,7 @@ export async function buildChecks(
         checks.push({
           name: 'embedding_column_registry',
           status: 'ok',
-          message: `Registry healthy: ${okColumns.length} columns (${okColumns.join(', ')})${indexNote}; active='${activeCol}'`,
+          message: `Registry healthy: ${okColumns.length} columns (${okColumns.join(', ')})${indexNote}; ${fileCfg?.embedding_disabled && activeCol === 'embedding' ? 'primary embeddings disabled' : `active='${activeCol}'`}`,
         });
       } else {
         const allMessages = [

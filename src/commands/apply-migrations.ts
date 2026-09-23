@@ -79,7 +79,7 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     mode,
     specificMigration: val('--migration'),
     hostDir: val('--host-dir'),
-    noAutopilotInstall: has('--no-autopilot-install'),
+    noAutopilotInstall: has('--no-autopilot-install') || process.env.GBRAIN_NO_AUTOPILOT_INSTALL === '1',
     forceRetry: val('--force-retry'),
     forceOrchestrator: has('--force-orchestrator'),
     forceSchema: has('--force-schema'),
@@ -99,7 +99,7 @@ Usage:
   gbrain apply-migrations --dry-run      Print the plan; take no action.
   gbrain apply-migrations --dry-run --json
                                         Include read-only content inventories and conflicts.
-  gbrain apply-migrations --migration 0.51.9 --export-db-only --content-root <path>
+  gbrain apply-migrations --migration 0.52.2 --export-db-only --content-root <path>
     [--export-source <id>] --dry-run --json
                                         Preview a lossless host-side DB-only content export.
     --confirm-quiesced                   Attest old writers and skill servers are stopped.
@@ -131,6 +131,7 @@ Flags:
   --host-dir <path>                      Include this directory in host-file walk
                                          (default scope: \$HOME/.claude + \$HOME/.openclaw).
   --no-autopilot-install                 Skip the Phase F autopilot install step.
+                                         Also: GBRAIN_NO_AUTOPILOT_INSTALL=1.
   --non-interactive                      Equivalent to --yes; never prompt.
 
 Exit codes:
