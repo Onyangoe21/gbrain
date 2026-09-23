@@ -75,8 +75,10 @@ count and choosing a finite spending cap, explicitly authorize a bounded repair:
 gbrain embed --stale --facts --source <source-id> --yes --max-cost-usd <cap>
 ```
 
-The cap must be finite and nonnegative. Optional fact-count/time bounds further
-restrict work; this is not an automatic, background or full-brain fact sweep.
+The cap must be finite and nonnegative. `--max-facts` limits attempted facts
+(default 100, range 1–10,000); `--batch-size` bounds each batch (default 100,
+range 1–100); `--budget-ms` limits run time (default 60,000, range 1–3,600,000).
+All three accept integers. This is not an automatic, background or full-brain fact sweep.
 Only NULL vectors on current source/incarnation, row-version and withdrawal
 state are eligible; valid vectors are not re-embedded. Each provider attempt
 rechecks the selected-brain and database off switches and spend allowance.
