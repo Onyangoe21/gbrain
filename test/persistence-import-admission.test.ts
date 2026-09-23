@@ -7,7 +7,7 @@ import type { WriteRequest } from '../src/core/persistence/model.ts';
 
 test('public page parameters cannot opt into trusted managed import or reconciliation', async () => {
   for (const remote of [false, true]) {
-    for (const kind of ['managed_file_import', 'canonical_reconcile']) {
+    for (const kind of ['managed_file_import', 'canonical_reconcile', 'managed_grandfather']) {
       const ctx = { remote } as OperationContext;
       await expect(submitPageMutation(ctx, { operation: 'put_page',
         params: { kind, slug: 'notes/fixture', content: 'Synthetic fixture', managedFileImport: true } }))
