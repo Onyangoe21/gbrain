@@ -5,6 +5,7 @@ import type { SyncOpts } from '../../commands/sync.ts';
 import { loadConfig } from '../config.ts';
 import { importFromContent } from '../import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import { slugifyPath } from '../sync.ts';
 import type { Page } from '../types.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { OperationError } from '../ops/contract.ts';
@@ -13,8 +14,8 @@ import { sealPageTextProjection } from '../page-state/projections.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { prepareCanonicalProjections } from './canonical-projections.ts';
-import { digest } from './digest.ts';
-import { admitWrite, admitWriteInTransaction, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
+import { digest, sha256 } from './digest.ts';
+import { admitWriteInTransaction, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
 import { acquireWorktree, containsPath, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { localHostId } from './identity.ts';
 import { assertPersistenceAccepting, startPersistenceConsumer, waitForWrite, writeResponse } from './service.ts';
@@ -24,8 +25,11 @@ import { persistenceFileHash, type PreparedMutation } from './coordinator.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { prepareFileTarget } from './page-prepare.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
+import type { PageSnapshot } from '../page-state/types.ts';
+import { LockStolenError, syncLockId, withRefreshingLock, type DbLockHandle } from '../db-lock.ts';
 
 type ConnectorKind = 'google' | 'github';
+interface ConnectorLease { handle: DbLockHandle; signal: AbortSignal; }
 interface ConnectorSource { incarnation: string; archived: boolean; local_path: string | null; config: Record<string, unknown>; }
 interface ConnectorRetry {
   checkpointKey: string;
@@ -86,8 +90,20 @@ function stableId(value: unknown): string {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-5${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 
+async function connectorFileTarget(engine: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'worktree_id' | 'slug'>,
+  snapshot: PageSnapshot | null, content: string | null, sourcePath: string | null, root: string | null): Promise<PreparedMutation['file']> {
+  if (!row.worktree_id || snapshot || !sourcePath || !root) return prepareFileTarget(engine, row, snapshot, content);
+  const path = resolve(root, sourcePath);
+  if (!isWriteTargetContained(path, root)) throw new OperationError('source_changed', 'The canonical file target is outside its registered source.');
+  const before = persistenceFileHash(path);
+  if (before && content !== null && before !== sha256(content)) {
+    throw new OperationError('source_changed', 'An unindexed file already occupies the canonical page path.', 'Import the file before replacing it.');
+  }
+  return { path, root, content, expectedBeforeHash: before };
+}
+
 export async function beginConnectorSync(engine: BrainEngine, sourceId: string, connector: ConnectorKind,
-  suppliedConfig: unknown, opts: SyncOpts): Promise<ManagedConnectorSync | null> {
+  suppliedConfig: unknown, opts: SyncOpts, lease?: ConnectorLease): Promise<ManagedConnectorSync | null> {
   const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
   if (!brain?.enabled) return null;
   assertPersistenceAccepting(engine);
@@ -112,9 +128,25 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   const canonicalRoot = connectorBindingRoot(sourceId, source, binding);
   if (binding) await (await acquireWorktree(binding))?.release();
   else authority.writer.databaseOnlyReason = 'connector_database';
-  const session = new ManagedConnectorSync(engine, sourceId, connector, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true, opts.retryFailed === true);
+  const session = new ManagedConnectorSync(engine, sourceId, connector, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true, opts.retryFailed === true, lease);
   await session.load();
   return session;
+}
+
+export async function withConnectorSync<T>(engine: BrainEngine, sourceId: string, connector: ConnectorKind,
+  config: unknown, opts: SyncOpts, work: (session: ManagedConnectorSync | null, opts: SyncOpts) => Promise<T>): Promise<T> {
+  const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+  if (!brain?.enabled) return work(null, opts);
+  opts.signal?.throwIfAborted();
+  return withRefreshingLock(engine, syncLockId(sourceId), async (signal, handle) => {
+    const combined = opts.signal ? AbortSignal.any([opts.signal, signal]) : signal;
+    const options = { ...opts, signal: combined };
+    const session = await beginConnectorSync(engine, sourceId, connector, config, options, { handle, signal: combined });
+    if (!session) throw new OperationError('source_changed', 'The managed connector mode changed before the sweep.');
+    const result = await work(session, options);
+    await session.assertLease(engine);
+    return result;
+  });
 }
 
 export class ManagedConnectorSync {
@@ -124,8 +156,19 @@ export class ManagedConnectorSync {
   readonly checkpointKey: string;
   constructor(private engine: BrainEngine, readonly sourceId: string, private connector: ConnectorKind,
     private source: ConnectorSource, private authority: SyncAuthority, private binding: WorktreeBinding | null,
-    private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean, private retryFailed = false) {
+    private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean, private retryFailed = false,
+    private lease?: ConnectorLease) {
     this.checkpointKey = digest({ sourceId, incarnation: source.incarnation, connector, config: source.config });
+  }
+  async assertLease(engine: BrainEngine): Promise<void> {
+    if (!this.lease) return;
+    this.lease.signal.throwIfAborted();
+    const { handle } = this.lease;
+    const [owned] = await engine.executeRaw(`SELECT id FROM gbrain_cycle_locks
+      WHERE id=$1 AND acquisition_token=$2::uuid AND extract(epoch from acquired_at)::text=$3
+        AND ttl_expires_at>now() FOR SHARE`, [handle.id, handle.acquisitionToken, handle.acquiredAt]);
+    if (!owned) throw new LockStolenError(handle.id);
+    this.lease.signal.throwIfAborted();
   }
   async load(): Promise<void> {
     await this.recover('__managed_sync_checkpoint__');
@@ -151,6 +194,7 @@ export class ManagedConnectorSync {
     }
   }
   private async validate(engine: BrainEngine, slug: string): Promise<WorktreeBinding | null> {
+    await this.assertLease(engine);
     await validateSyncAuthority(engine, this.authority, slug);
     const [source] = await engine.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [this.sourceId]);
     if (!source || source.archived || source.incarnation !== this.source.incarnation ||
@@ -224,6 +268,7 @@ export class ManagedConnectorSync {
   }
   state<T>(empty: T): T { return structuredClone((this.checkpoint[0] as { state?: T } | undefined)?.state ?? empty); }
   async page(slug: string) {
+    slug = slugifyPath(`${slug}.md`);
     await this.recover(slug);
     const snapshot = await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId });
     if (snapshot && this.binding) await prepareFileTarget(this.engine,
@@ -231,11 +276,12 @@ export class ManagedConnectorSync {
     return snapshot?.page ?? null;
   }
   async importMarkdown(sourcePath: string, content: string): Promise<{ slug: string; chunks: number; status: 'imported' | 'skipped'; created: boolean }> {
-    const slug = sourcePath.replace(/\.mdx?$/i, '');
+    const slug = slugifyPath(sourcePath);
     const row = await this.submit('managed_connector_import', slug, sourcePath, { content });
     return { slug, chunks: Number(row.outcome?.chunks ?? 0), status: row.outcome?.noop ? 'skipped' : 'imported', created: row.outcome?.status === 'created' };
   }
   async delete(slug: string, sourcePath: string | null): Promise<boolean> {
+    slug = slugifyPath(`${slug}.md`);
     const row = await this.submit('managed_connector_delete', slug, sourcePath, {});
     return row.outcome?.noop !== true;
   }
@@ -249,8 +295,8 @@ export class ManagedConnectorSync {
   private async submit(kind: ConnectorIntent['kind'], slug: string, sourcePath: string | null, extra: Partial<ConnectorIntent>): Promise<WriteRequest> {
     await this.recover(slug);
     const snapshot = await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId, includeDeleted: true });
-    const file = kind === 'managed_connector_checkpoint' ? undefined : await prepareFileTarget(this.engine,
-      { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug }, snapshot, extra.content ?? null);
+    const file = kind === 'managed_connector_checkpoint' ? undefined : await connectorFileTarget(this.engine,
+      { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug }, snapshot, extra.content ?? null, sourcePath, this.canonicalRoot);
     if (file && sourcePath && resolve(file.path) !== resolve(this.canonicalRoot!, sourcePath)) {
       throw new OperationError('source_changed', 'The connector source path no longer names its canonical file.');
     }
@@ -320,7 +366,10 @@ export class ManagedConnectorSync {
           'Repeat the same connector sync options; an admitted replacement keeps its existing request identity.');
       } finally { await lock?.release(); }
     } else if (!row) {
-      row = await admitWrite(this.engine, prior.input);
+      row = await this.engine.transaction(async tx => {
+        await this.assertLease(tx);
+        return admitWriteInTransaction(tx, prior.input);
+      });
     }
     row = await waitForWrite(this.engine, row!, loadConfig() ?? { engine: this.engine.kind });
     writeResponse(row);
@@ -350,6 +399,10 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
     if (p.filePath !== null && (!p.canonicalRoot || !isWriteTargetContained(p.filePath, p.canonicalRoot) || persistenceFileHash(p.filePath) !== p.fileBeforeHash)) {
       throw new OperationError('source_changed', 'The connector canonical file changed after admission.');
     }
+    if (p.kind !== 'managed_connector_checkpoint') {
+      const [checkpoint] = await tx.executeRaw<{ completed_keys: unknown[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1", [p.checkpointKey]);
+      if (digest(checkpoint?.completed_keys ?? []) !== digest(p.checkpointBefore)) throw new OperationError('revision_conflict', 'The connector checkpoint changed before publication.');
+    }
   };
   await validate(engine);
   if (p.kind === 'managed_connector_checkpoint') return { observedRevision: null, sourceExclusive: true, validate, apply: async tx => {
@@ -369,7 +422,7 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
       snapshot?.page.source_path != null && snapshot.page.source_path !== p.sourcePath) {
     throw new OperationError('revision_conflict', 'The connector page changed after admission.');
   }
-  if (p.kind === 'managed_connector_delete') return { observedRevision: snapshot?.revision ?? null, validate,
+  if (p.kind === 'managed_connector_delete') return { observedRevision: snapshot?.revision ?? null, sourceExclusive: true, validate,
     file: await prepareFileTarget(engine, row, snapshot, null),
     noop: !snapshot || snapshot.page.deleted_at != null, apply: async tx => {
       if (snapshot && snapshot.page.deleted_at == null) {
@@ -378,7 +431,7 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
       }
       return { status: 'soft_deleted', slug: row.slug, source_id: row.source_id, noop: !snapshot || snapshot.page.deleted_at != null };
     } };
-  if (!p.sourcePath || typeof p.content !== 'string' || p.sourcePath.replace(/\.mdx?$/i, '') !== row.slug ||
+  if (!p.sourcePath || typeof p.content !== 'string' || slugifyPath(p.sourcePath) !== row.slug ||
       p.sourcePath.split('/').some(part => !part || part === '.' || part === '..') || p.sourcePath.includes('\\')) {
     throw new OperationError('invalid_params', 'The connector import path is invalid.');
   }
@@ -397,9 +450,9 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
   const project = prepareCanonicalProjections(ready.parsedPage, row.slug, row.source_id);
   const tags = [...new Set([...(snapshot?.tags ?? []), ...ready.parsedPage.tags])].sort();
   const page: Page = { ...(snapshot?.page ?? { id: 0, slug: row.slug, source_id: row.source_id, created_at: new Date(row.created_at), updated_at: new Date(row.created_at) }), ...ready.parsedPage };
-  const file = await prepareFileTarget(engine, row, snapshot, serializePageToMarkdown(page, tags));
+  const file = await connectorFileTarget(engine, row, snapshot, serializePageToMarkdown(page, tags), p.sourcePath, p.canonicalRoot);
   if (file && (file.path !== p.filePath || file.expectedBeforeHash !== p.fileBeforeHash)) throw new OperationError('source_changed', 'The connector canonical file changed during preparation.');
-  return { observedRevision: ready.observedRevision, validate, file, noop: ready.noop, deferEmbedding: p.noEmbed, apply: async tx => {
+  return { observedRevision: ready.observedRevision, sourceExclusive: true, validate, file, noop: ready.noop, deferEmbedding: p.noEmbed, apply: async tx => {
     await ready.apply(tx);
     if (!ready.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
     return { status: ready.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
@@ -408,5 +461,5 @@ export async function prepareConnectorMutation(engine: BrainEngine, row: WriteRe
 }
 
 export function rethrowConnectorWriteError(error: unknown): void {
-  if (error instanceof OperationError) throw error;
+  if (error instanceof OperationError || error instanceof LockStolenError) throw error;
 }

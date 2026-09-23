@@ -1,4 +1,4 @@
-import { beginConnectorSync, rethrowConnectorWriteError, type ManagedConnectorSync } from '../persistence/connector-sync.ts';
+import { withConnectorSync, rethrowConnectorWriteError, type ManagedConnectorSync } from '../persistence/connector-sync.ts';
 /**
  * google-source — Gmail/Calendar/Contacts sync for the `google` source kind.
  *
@@ -997,7 +997,12 @@ export async function runGoogleSync(
   fetchImpl?: FetchImpl,
   vaultOverride?: CredentialVault,
 ): Promise<SyncResult> {
-  const managed = await beginConnectorSync(engine, sourceId, 'google', cfg, opts);
+  return withConnectorSync(engine, sourceId, 'google', cfg, opts,
+    (managed, options) => runGoogleSyncInner(engine, sourceId, cfg, options, managed, fetchImpl, vaultOverride));
+}
+
+async function runGoogleSyncInner(engine: BrainEngine, sourceId: string, cfg: GoogleSourceConfig, opts: SyncOpts,
+  managed: ManagedConnectorSync | null, fetchImpl?: FetchImpl, vaultOverride?: CredentialVault): Promise<SyncResult> {
   if (!cfg.account) {
     throw new Error(
       `Google source "${sourceId}" has no account configured. Re-add it: gbrain sources add ${sourceId} --kind google --account <email>`,

@@ -1,4 +1,5 @@
-import { beginConnectorSync, rethrowConnectorWriteError, type ManagedConnectorSync } from './persistence/connector-sync.ts';
+import { withConnectorSync, rethrowConnectorWriteError, type ManagedConnectorSync } from './persistence/connector-sync.ts';
+import { slugifyPath } from './sync.ts';
 /**
  * github-source — GitHub issues/PR sync for the `github` source kind.
  *
@@ -1187,7 +1188,12 @@ export async function runGitHubSync(
   opts: SyncOpts,
   fetchImpl?: FetchImpl,
 ): Promise<import('../commands/sync.ts').SyncResult> {
-  const managed = await beginConnectorSync(engine, sourceId, 'github', cfg, opts);
+  return withConnectorSync(engine, sourceId, 'github', cfg, opts,
+    (managed, options) => runGitHubSyncInner(engine, sourceId, cfg, options, managed, fetchImpl));
+}
+
+async function runGitHubSyncInner(engine: BrainEngine, sourceId: string, cfg: GitHubSourceConfig, opts: SyncOpts,
+  managed: ManagedConnectorSync | null, fetchImpl?: FetchImpl): Promise<import('../commands/sync.ts').SyncResult> {
   // Credential source: a GitHub App (auto-minted hourly installation tokens)
   // wins when configured; otherwise cfg.tokenEnv is the single source of
   // truth (the default is GH_TOKEN; a custom --token-env that is unset fails
@@ -1458,7 +1464,7 @@ async function refreshSingleItem(
 ): Promise<void> {
   const repo = item.repo.toLowerCase();
   const filePath = itemPagePath(deps.cfg.dir, repo, item.number);
-  const slug = `gh/${repo}/${item.number}`;
+  const slug = slugifyPath(`gh/${repo}/${item.number}`);
   if (item.deleted) {
     const rows = await deps.engine.executeRaw<{ slug: string }>(
       `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL`,

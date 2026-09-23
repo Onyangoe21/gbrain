@@ -8,6 +8,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { claimWorktree } from '../../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { isolatedPersistencePostgres } from './persistence-postgres.ts';
+import { syncLockId } from '../../src/core/db-lock.ts';
 
 export const options = { noEmbed: true, noExtract: true, noSchemaPack: true };
 export const json = (body: unknown, status = 200, headers = {}) => new Response(JSON.stringify(body), {
@@ -89,17 +90,24 @@ export function createConnectorFixture() {
     }
     await disposePersistenceConsumer(engine);
     await engine.disconnect();
+    let childPid: number | undefined;
     try {
       const child = Bun.spawn([process.execPath, 'run', join(import.meta.dir, 'connector-restart.ts')], {
         env: { ...process.env, ...env, GBRAIN_TEST_CONNECTOR_RESTART: JSON.stringify({ database, sourceId: f.id,
           root: f.dir, sourceConfig, body: 'Updated organization after interruption', crash, retryFailed }) }, stdout: 'pipe', stderr: 'pipe',
       });
+      childPid = child.pid;
       const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
       try {
         const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
         return { stdout, stderr, exitCode };
       } finally { clearTimeout(timer); if (child.exitCode === null) child.kill('SIGKILL'); await child.exited; }
-    } finally { await engine.connect(database); }
+    } finally {
+      await engine.connect(database);
+      if (crash && childPid !== undefined) await engine.executeRaw(`UPDATE gbrain_cycle_locks
+        SET acquired_at=now()-interval '2 minutes',last_refreshed_at=now()-interval '1 hour',ttl_expires_at=now()-interval '1 hour'
+        WHERE id=$1 AND holder_pid=$2`, [syncLockId(f.id), childPid]);
+    }
   }
 
   return { home, engines, env, setup, teardown, source, boundSource, standaloneConnector };
