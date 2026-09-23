@@ -6,7 +6,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { installPageProjection, readProjectionSnapshot } from '../src/core/page-state/projections.ts';
 import { runMemoryCueBuild, submitMemoryCueBuild, recallMemoryCues, memoryCueColumn, cueSignature } from '../src/core/memory-cues/index.ts';
-import { volunteerContext, volunteerStage, recallSituationPage, formatVolunteeredPage } from '../src/core/context/volunteer.ts';
+import { volunteerContext, volunteerStage, recallSituationPage, formatVolunteeredPage, SITUATION_RECALL_BUDGET_MS } from '../src/core/context/volunteer.ts';
 import { extractCandidatesFromWindow, type WindowTurn } from '../src/core/context/entity-salience.ts';
 import { assembleTurnContext } from '../src/core/context/turn-context.ts';
 import { buildReflexAddition } from '../src/core/context/reflex.ts';
@@ -124,12 +124,32 @@ afterEach(async () => {
 describe('situation volunteering through production cue recall', () => {
   test('no entity candidates yields one source pointer and safe evidence, never cue prose', async () => {
     expect(extractCandidatesFromWindow(WINDOW)).toHaveLength(0);
-    const pages = await volunteerContext(engine, WINDOW, { sourceIds: ['default'] });
+    const pages = await volunteerContext(engine, WINDOW, { sourceIds: ['default'], deadlineAt: Date.now() + 30_000 });
     expect(pages).toHaveLength(1);
     expect(pages[0]).toMatchObject({ slug: SLUG, source_id: 'default', arm: 'situation', rationale: 'related situation', synopsis: BODY });
     expect(JSON.stringify(pages)).not.toContain('CUE_ONLY_SENTINEL');
     expect(formatVolunteeredPage(pages[0])).toContain('cue similarity 1.00');
     expect(embedCalls).toHaveLength(1);
+  });
+
+  test('the default situation deadline rejects late embeddings before cue lookup', async () => {
+    let now = Date.now();
+    const clock = spyOn(Date, 'now').mockImplementation(() => now);
+    const executeRaw = engine.executeRaw.bind(engine);
+    let cueLookups = 0;
+    const query = spyOn(engine, 'executeRaw').mockImplementation(async (sql, params, opts) => {
+      if (sql.includes('WITH nearest AS MATERIALIZED')) cueLookups++;
+      return executeRaw(sql, params, opts);
+    });
+    beforeEmbed = async () => { now += SITUATION_RECALL_BUDGET_MS + 1; };
+    try {
+      expect(await volunteerContext(engine, WINDOW, { sourceIds: ['default'] })).toEqual([]);
+      expect(embedCalls).toHaveLength(1);
+      expect(cueLookups).toBe(0);
+    } finally {
+      clock.mockRestore();
+      query.mockRestore();
+    }
   });
 
   test('bounded situation queries retain complete role labels on truncated turns', async () => {
