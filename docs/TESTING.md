@@ -231,6 +231,20 @@ worker passes trusted selected configuration, ignores job-supplied configuration
 and settles the entity-page effect with zero fact or chunk embedding calls when
 disabled. Fact extraction still captures the generated fact with a NULL embedding.
 
+`test/managed-facts-embedding.test.ts` and its PostgreSQL counterpart bind retained
+fact vectors to the selected brain's model and dimensions, including equal-width
+host/mount mismatches, keyless capture, policy changes and replay without new spend.
+`test/managed-atom-regressions.test.ts` and its PostgreSQL counterpart preserve
+later target edits through explicit retries and honor database-only storage policy
+without relaxing source authority. `test/managed-synthesis-postprocess.test.ts`
+and its E2E wrapper verify that completed quote/provenance work never rewrites a
+later user edit, while unfinished work resumes against its original revision.
+Connector sweep fencing and physical-path normalization have separate parity
+coverage in `test/persistence-connector-fencing.test.ts`. Standalone crash/recovery
+cases live in `test/persistence-connector-recovery.test.ts` and their own E2E
+wrapper so they do not share the routing file's wall-clock budget; their original
+assertions, child watchdogs and per-file timeout are unchanged.
+
 `test/managed-atoms-cli.slow.test.ts` exercises real disk-backed PGLite CLI
 recovery with a loopback provider: live-owner refusal, graceful owner stop,
 malformed extraction, explicit same-input retry, idempotent replay and owner
