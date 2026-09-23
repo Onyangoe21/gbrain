@@ -67,7 +67,9 @@ because later extraction runs. Preview a selected source without provider work:
 gbrain embed --stale --facts --source <source-id>
 ```
 
-After reviewing the count and cost, explicitly authorize a bounded repair:
+The preview reports the scope and count, not a repair-price estimate. Its zero
+cost means no provider spend occurred during the preview. After reviewing the
+count and choosing a finite spending cap, explicitly authorize a bounded repair:
 
 ```bash
 gbrain embed --stale --facts --source <source-id> --yes --max-cost-usd <cap>

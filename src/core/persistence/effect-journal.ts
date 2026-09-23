@@ -57,6 +57,12 @@ export async function claimPersistenceEffect(engine: BrainEngine, hostId: string
   });
 }
 
+export async function renewPersistenceEffectClaim(engine: SqlEngine, effect: PersistenceEffect): Promise<boolean> {
+  const rows = await engine.executeRaw(`UPDATE persistence_effects SET claim_expires_at=now()+interval '2 minutes',updated_at=now()
+    WHERE id=$1 AND execution_token=$2::uuid AND state='running' AND recovery IS NULL RETURNING id`, [effect.id, effect.execution_token]);
+  return rows.length === 1;
+}
+
 export async function advanceEffectCursor(engine: SqlEngine, effect: PersistenceEffect, slug: string): Promise<void> {
   await engine.executeRaw(`UPDATE persistence_effects SET state='queued',data=jsonb_set(
     CASE WHEN kind='embedding' THEN jsonb_set(data,'{embedding_attempt_base}',to_jsonb(attempts)) ELSE data END,'{after_slug}',to_jsonb($3::text)),

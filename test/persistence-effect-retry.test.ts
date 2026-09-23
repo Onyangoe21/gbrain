@@ -76,11 +76,11 @@ for (const kind of ['pglite', ...(databaseUrl ? ['postgres' as const] : [])] as 
     const retry = (f: Awaited<ReturnType<typeof fixture>>, dryRun = false) => runPersistenceAdministration(engine, 'writer_retry_effects',
       { source_id: f.sourceId, request_id: f.row.request_id, dry_run: dryRun });
     const effect = async (id: string) => (await engine.executeRaw('SELECT * FROM persistence_effects WHERE id=$1', [id]))[0];
-    async function cli(f: Awaited<ReturnType<typeof fixture>>, flags: string[] = []) {
+    async function cli(f: Awaited<ReturnType<typeof fixture>>, flags: string[] = [], expectedCode = 0) {
       const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/cli.ts'), 'sources', 'writer', 'retry-effects', f.sourceId,
         '--request-id', f.row.request_id, '--json', ...flags], { cwd: scratch, env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' });
       const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-      expect({ code, stderr }).toMatchObject({ code: 0 });
+      expect({ code, stderr }).toMatchObject({ code: expectedCode });
       return JSON.parse(stdout);
     }
 
@@ -167,6 +167,44 @@ for (const kind of ['pglite', ...(databaseUrl ? ['postgres' as const] : [])] as 
         { engine: engine.kind })).toMatchObject({ action: 'reconciled', state: 'committed', attempts: 5 });
     });
 
+    check('selected DB disable blocks preview and approval with an enabled file but permits free reconciliation', async () => {
+      const f = await fixture();
+      const before = await effect(f.effectId);
+      await engine.setConfig('embedding_disabled', 'true');
+      try {
+        expect(await retry(f, true)).toMatchObject({ action: 'blocked', reason: 'embedding_disabled' });
+        expect(await retry(f)).toMatchObject({ action: 'blocked', reason: 'embedding_disabled' });
+        expect(await effect(f.effectId)).toEqual(before);
+        const prepared = (await readProjectionSnapshot(engine, 'page', f.sourceId))!;
+        await installPageEmbeddings(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current',
+          embedding: new Float32Array(1536).fill(0.25), model }], signature);
+        expect(await retry(f)).toMatchObject({ action: 'reconciled', attempts: 5 });
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='embedding_disabled'"); }
+    });
+
+    check('DB disable after approval prevents the worker from invoking a provider', async () => {
+      const f = await fixture();
+      expect(await retry(f)).toMatchObject({ action: 'retry_queued' });
+      await engine.setConfig('embedding_disabled', 'true');
+      let calls = 0;
+      try {
+        await runPersistenceEffects(engine, config, { hostId: localHostId(), limit: 1, embedding: { signature, model,
+          embed: async () => { calls++; return [new Float32Array(1536).fill(0.25)]; } } });
+        expect(calls).toBe(0);
+        expect(await effect(f.effectId)).toMatchObject({ state: 'committed', outcome: { embedding: 'skipped', reason: 'embedding_disabled' } });
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='embedding_disabled'"); }
+    });
+
+    check('invalid DB embedding policy fails closed without changing the failed obligation', async () => {
+      const f = await fixture();
+      const before = await effect(f.effectId);
+      await engine.setConfig('embedding_disabled', 'not-a-boolean');
+      try {
+        await expect(retry(f)).rejects.toMatchObject({ code: 'embedding_configuration' });
+        expect(await effect(f.effectId)).toEqual(before);
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='embedding_disabled'"); }
+    });
+
     check('source-scan progress cannot renew the explicit retry allowance', async () => {
       const f = await fixture();
       for (let n = 1; n <= 5; n++) {
@@ -197,6 +235,83 @@ for (const kind of ['pglite', ...(databaseUrl ? ['postgres' as const] : [])] as 
         if (kind === 'pglite') await reopen();
       }
       expect(await effect(unrelated.effectId)).toMatchObject({ state: 'failed', attempts: 5 });
+    });
+
+    check('actual mounted CLI reconciles selected provenance and approves only one policy-bound retry', async () => {
+      const complete = await fixture();
+      const pending = await fixture();
+      const bounded = await fixture();
+      const activeColumn = await fixture();
+      await engine.setConfig('embedding_model', model);
+      await engine.setConfig('embedding_dimensions', '1536');
+      const prepared = (await readProjectionSnapshot(engine, 'page', complete.sourceId))!;
+      await installPageEmbeddings(engine, prepared, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current',
+        embedding: new Float32Array(1536).fill(0.25), model }], signature);
+      const mountsPath = join(scratch, '.gbrain', 'mounts.json');
+      writeFileSync(mountsPath, JSON.stringify({ version: 1, mounts: [{ id: 'selected', alias: 'selected-alias', path: scratch,
+        engine: kind, database_url: config.database_url, database_path: config.database_path }] }));
+      writeFileSync(join(scratch, '.gbrain', 'config.json'), JSON.stringify({ engine: 'pglite', database_path: join(scratch, 'unopened-host'),
+        embedding_model: 'host:must-not-be-used', embedding_dimensions: 19, embedding_disabled: true }));
+      const mounted = async (f: Awaited<ReturnType<typeof fixture>>, flags: string[] = [], expectedCode = 0) => {
+        if (kind === 'pglite') await engine.disconnect();
+        try { return await withEnv({ GBRAIN_MOUNTS_PATH: mountsPath }, () => cli(f, ['--brain', 'selected-alias', ...flags], expectedCode)); }
+        finally { if (kind === 'pglite') await reopen(); }
+      };
+      try {
+        await engine.setConfig('embedding_disabled', 'true');
+        expect(await mounted(complete, ['--dry-run'])).toMatchObject({ action: 'would_reconcile' });
+        expect(await mounted(complete)).toMatchObject({ action: 'reconciled', attempts: 5 });
+        expect(await mounted(pending)).toMatchObject({ action: 'blocked', reason: 'embedding_disabled' });
+        await engine.setConfig('embedding_disabled', 'false');
+        await engine.executeRaw("UPDATE persistence_requests SET authority=jsonb_set(authority,'{scopes}','[\"read\"]'::jsonb) WHERE id=$1::uuid", [pending.row.id]);
+        expect(await mounted(pending, [], 1)).toMatchObject({ error: 'permission_denied' });
+        await engine.executeRaw('UPDATE persistence_requests SET authority=$2::text::jsonb WHERE id=$1::uuid', [pending.row.id, JSON.stringify(pending.row.authority)]);
+        await engine.executeRaw("UPDATE persistence_local_writers SET grant_ceiling=jsonb_set(grant_ceiling,'{scopes}','[\"read\"]'::jsonb) WHERE id=$1::uuid", [pending.row.principal_id]);
+        expect(await mounted(pending, [], 1)).toMatchObject({ error: 'permission_denied' });
+        await engine.executeRaw("UPDATE persistence_local_writers SET grant_ceiling=jsonb_set(grant_ceiling,'{scopes}','[\"read\",\"write\"]'::jsonb) WHERE id=$1::uuid", [pending.row.principal_id]);
+        expect(await mounted(pending, ['--dry-run'])).toMatchObject({ action: 'would_retry', attempts: 5,
+          embedding_policy: { approval: 'selected_database_provenance', execution: 'owner_file_and_database' } });
+        expect(await mounted(pending)).toMatchObject({ action: 'retry_queued', attempts: 5 });
+        expect(await mounted(pending)).toMatchObject({ action: 'unchanged', attempts: 5 });
+        let calls = 0;
+        await runPersistenceEffects(engine, { ...config, embedding_disabled: true }, { hostId: localHostId(), limit: 1,
+          embedding: { signature, model, embed: async () => { calls++; return []; } } });
+        expect(calls).toBe(0);
+        expect(await effect(pending.effectId)).toMatchObject({ state: 'committed', attempts: 6, outcome: { reason: 'embedding_disabled' } });
+        await engine.setConfig('embedding_dimensions', '17');
+        expect(await mounted(bounded, [], 1)).toMatchObject({ error: 'embedding_configuration' });
+        await engine.setConfig('embedding_dimensions', '1536');
+        await engine.executeRaw("DELETE FROM config WHERE key='embedding_model'");
+        expect(await mounted(bounded, [], 1)).toMatchObject({ error: 'embedding_unconfigured' });
+        await engine.setConfig('embedding_model', model);
+        await engine.setConfig('embedding_columns', '{invalid');
+        expect(await mounted(bounded, [], 1)).toMatchObject({ error: 'embedding_configuration' });
+        await engine.executeRaw("DELETE FROM config WHERE key='embedding_columns'");
+        expect(await mounted(bounded)).toMatchObject({ action: 'retry_queued', attempts: 5 });
+        for (let n = 0; n < 5; n++) {
+          await engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=$1', [bounded.effectId]);
+          await runPersistenceEffects(engine, config, { hostId: localHostId(), limit: 1, embedding: { signature, model,
+            embed: async () => { calls++; throw new Error('temporary network timeout'); } } });
+        }
+        expect(calls).toBe(5);
+        expect(await effect(bounded.effectId)).toMatchObject({ state: 'failed', attempts: 10 });
+        expect(await mounted(bounded)).toMatchObject({ action: 'blocked', reason: 'embedding_retry_exhausted' });
+        await engine.executeRaw('ALTER TABLE content_chunks ADD COLUMN embedding_retry_test vector(1536)');
+        await engine.setConfig('search_embedding_column', 'embedding_retry_test');
+        await engine.setConfig('embedding_columns', JSON.stringify({ embedding_retry_test: { type: 'vector', dimensions: 1536, provider: model } }));
+        await engine.setConfig('embedding_model', 'legacy:not-the-active-model');
+        await engine.setConfig('embedding_dimensions', '19');
+        const active = (await readProjectionSnapshot(engine, 'page', activeColumn.sourceId))!;
+        await installPageEmbeddings(engine, active, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'Current',
+          embedding: new Float32Array(1536).fill(0.25), model }], signature);
+        expect(await mounted(activeColumn)).toMatchObject({ action: 'reconciled', attempts: 5 });
+      } finally {
+        writeFileSync(join(scratch, '.gbrain', 'config.json'), JSON.stringify(config));
+        await engine.executeRaw("DELETE FROM config WHERE key IN ('embedding_model','embedding_dimensions','embedding_disabled','embedding_columns','search_embedding_column')");
+        await engine.executeRaw('ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_retry_test');
+        await engine.executeRaw('UPDATE persistence_requests SET authority=$2::text::jsonb WHERE id=$1::uuid', [pending.row.id, JSON.stringify(pending.row.authority)]);
+        await engine.executeRaw("UPDATE persistence_local_writers SET grant_ceiling=jsonb_set(grant_ceiling,'{scopes}','[\"read\",\"write\"]'::jsonb) WHERE id=$1::uuid", [pending.row.principal_id]);
+      }
     });
 
     if (kind === 'pglite') check('actual resident CLI delegates retry while stdio and forged administration remain rejected', async () => {

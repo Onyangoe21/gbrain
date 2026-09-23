@@ -15,13 +15,13 @@ import { validateEmbeddingCreds, EmbeddingCredentialError } from '../embed-prefl
 import { wrapChunkTextsForStoredMode } from '../embedding-context.ts';
 import { isEmbedRetriableError, MAX_RATE_LIMIT_RETRIES, rateLimitDelayMs, restampIfDemotedToTitleTier, transientBackoffMs } from '../embed-retry.ts';
 import { AIConfigError, normalizeAIError } from '../ai/errors.ts';
-import { isAIInvocationPolicyError } from '../ai/invocation-guard.ts';
+import { isAIInvocationPolicyError, withAIInvocationPreflight } from '../ai/invocation-guard.ts';
 import { quoteIdentifier } from '../search/embedding-column.ts';
 import { acquireWorktree, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
-import { persistenceFileHash } from './coordinator.ts';
+import { persistenceFileHash, transientDatabaseFailure } from './coordinator.ts';
 import { sha256 } from './digest.ts';
 import { prepareFileTarget } from './page-prepare.ts';
-import { advanceEffectCursor, claimPersistenceEffect, completeEffect, failEffect, retryEffect } from './effect-journal.ts';
+import { advanceEffectCursor, claimPersistenceEffect, completeEffect, failEffect, renewPersistenceEffectClaim, retryEffect } from './effect-journal.ts';
 import { guardEffectSource, recoverEffectPublication, reserveEffectRecovery } from './effect-recovery.ts';
 import { publishGitEffect } from './effect-git.ts';
 import { dispatchFactsBackstopEffect } from './effect-facts.ts';
@@ -138,19 +138,41 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
   if (!effect.data.source_scan && (snapshot.revision !== effect.revision || snapshot.page.id !== effect.data.page_id)) {
     await completeEffect(engine, effect, { embedding: 'superseded', reason: 'revision_changed' }); return;
   }
-  assertEmbeddingEnabled(config);
   const signature = opts.embedding?.signature ?? currentEmbeddingSignature();
   if (!signature) throw new OperationError('embedding_unconfigured', 'Configure an embedding provider before explicitly retrying.');
   const { prepared, pending } = await readEmbeddingEffectProjection(engine, effect, snapshot, opts.hostId, signature, opts.embedding?.model);
   if (pending.length) {
+    await assertEmbeddingEffectEnabled(engine, config);
     if (effect.attempts - (effect.data.embedding_retry_base ?? effect.data.embedding_attempt_base ?? 0) > MAX_RATE_LIMIT_RETRIES) {
       await failEffect(engine, effect, 'embedding_attempts_exhausted'); return;
     }
     if (!opts.embedding) validateEmbeddingCreds();
     opts.signal?.throwIfAborted();
-    // Providers are never invoked while a native lock or DB transaction is held.
-    const vectors = await (opts.embedding?.embed ?? embedBatch)(wrapChunkTextsForStoredMode(prepared.snapshot.page, pending), { abortSignal: opts.signal, maxRetries: 0 });
-    opts.signal?.throwIfAborted();
+    const lease = new AbortController();
+    const signal = opts.signal ? AbortSignal.any([opts.signal, lease.signal]) : lease.signal;
+    let renewing: Promise<void> | undefined;
+    const renew = () => renewPersistenceEffectClaim({ executeRaw: engine.executeRawDirect.bind(engine) }, effect).then(live => {
+      if (!live) lease.abort(new OperationError('write_claim_lost', 'The embedding claim changed.'));
+    }).catch(error => { lease.abort(embeddingStorageFailure(error)); });
+    const interval = setInterval(() => {
+      if (!renewing && !signal.aborted) renewing = renew().finally(() => { renewing = undefined; });
+    }, 10_000);
+    interval.unref?.();
+    let vectors: Float32Array[];
+    try {
+      await renew();
+      signal.throwIfAborted();
+      vectors = await withAIInvocationPreflight(async () => {
+        signal.throwIfAborted();
+        await renew();
+        signal.throwIfAborted();
+        await assertEmbeddingEffectEnabled(engine, config);
+      }, () => (opts.embedding?.embed ?? embedBatch)(wrapChunkTextsForStoredMode(prepared.snapshot.page, pending), { abortSignal: signal, maxRetries: 0 }));
+    } finally {
+      clearInterval(interval);
+      await renewing;
+    }
+    signal.throwIfAborted();
     if (vectors.length !== pending.length || pending.some((_, index) => !vectors[index]?.length)) {
       throw new OperationError('embedding_unavailable', 'The provider returned an incomplete embedding batch.');
     }
@@ -158,11 +180,13 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
       await guardEffectSource(tx, effect, opts.hostId);
       const [claim] = await tx.executeRaw<PersistenceEffect>('SELECT state,execution_token FROM persistence_effects WHERE id=$1 FOR UPDATE', [effect.id]);
       if (claim?.state !== 'running' || claim.execution_token !== effect.execution_token) throw new OperationError('write_claim_lost', 'The embedding claim changed.');
-      opts.signal?.throwIfAborted();
+      await tx.executeRaw("SELECT key FROM config WHERE key='embedding_disabled' FOR SHARE");
+      await assertEmbeddingEffectEnabled(tx, config);
+      signal.throwIfAborted();
       const installed = await installPageEmbeddings(tx, prepared, pending.map((chunk, i) => ({ chunk_index: chunk.chunk_index,
         chunk_text: chunk.chunk_text, chunk_source: chunk.chunk_source, embedding: vectors[i], model: opts.embedding?.model })), signature);
       if (installed) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, snapshot.page.slug, effect.source_id);
-      opts.signal?.throwIfAborted();
+      signal.throwIfAborted();
       if (installed) await finishPage(tx, effect, snapshot);
       return installed;
     });
@@ -173,6 +197,20 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
     return;
   }
   await finishPage(engine, effect, snapshot);
+}
+
+export async function assertEmbeddingEffectEnabled(engine: BrainEngine, config: GBrainConfig | null): Promise<void> {
+  assertEmbeddingEnabled(config);
+  const disabled = await engine.getConfig('embedding_disabled').catch(error => { throw embeddingStorageFailure(error); });
+  if (disabled !== null && disabled !== 'true' && disabled !== 'false') {
+    throw new OperationError('embedding_configuration', 'Selected brain embedding_disabled must be true or false.');
+  }
+  assertEmbeddingEnabled({ embedding_disabled: disabled === 'true' });
+}
+
+function embeddingStorageFailure(error: unknown): unknown {
+  return transientDatabaseFailure(error)
+    ? new OperationError('embedding_storage_unavailable', 'Embedding policy or claim storage is temporarily unavailable.') : error;
 }
 
 async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, error: unknown, signal?: AbortSignal): Promise<void> {
@@ -188,7 +226,10 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
     if (error instanceof EmbeddingDisabledError || error instanceof EmbeddingCredentialError || code === 'embedding_unconfigured') {
       await completeEffect(engine, effect, { embedding: 'skipped', reason: error instanceof EmbeddingDisabledError ? 'embedding_disabled' : 'embedding_unconfigured' }); return;
     }
-    if (isAIInvocationPolicyError(error) || (error as { tag?: string } | null)?.tag === 'BUDGET_EXHAUSTED') {
+    if (code === 'embedding_configuration') {
+      await failEffect(engine, effect, 'embedding_configuration'); return;
+    }
+    if ((code !== 'embedding_storage_unavailable' && isAIInvocationPolicyError(error)) || (error as { tag?: string } | null)?.tag === 'BUDGET_EXHAUSTED') {
       await failEffect(engine, effect, 'embedding_budget_refused'); return;
     }
     if (!signal?.aborted && normalizeAIError(error) instanceof AIConfigError) {

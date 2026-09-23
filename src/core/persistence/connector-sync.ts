@@ -14,14 +14,14 @@ import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
 import { authorizeStoredRequest } from './authority.ts';
 import { prepareCanonicalProjections } from './canonical-projections.ts';
 import { digest } from './digest.ts';
-import { admitWrite, assertReplayIntent, getWriteRequest, intentDigest } from './journal.ts';
+import { admitWrite, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
 import { acquireWorktree, containsPath, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { localHostId } from './identity.ts';
-import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
+import { assertPersistenceAccepting, startPersistenceConsumer, waitForWrite, writeResponse } from './service.ts';
 import { managedSyncAuthority, validateManagedSyncOptions, validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
 import { persistenceFileHash, type PreparedMutation } from './coordinator.ts';
-import type { WriteRequest } from './model.ts';
+import { isTerminal, type WriteRequest } from './model.ts';
 import { prepareFileTarget } from './page-prepare.ts';
 import { assertPhysicalRoot } from './physical-root.ts';
 
@@ -118,11 +118,58 @@ export class ManagedConnectorSync {
     this.checkpointKey = digest({ sourceId, incarnation: source.incarnation, connector, config: source.config });
   }
   async load(): Promise<void> {
+    await this.recover('__managed_sync_checkpoint__');
     const [row] = await this.engine.executeRaw<{ completed_keys: unknown[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1", [this.checkpointKey]);
     this.checkpoint = row?.completed_keys ?? [];
   }
+  private async recover(slug: string): Promise<void> {
+    await validateSyncAuthority(this.engine, this.authority, slug);
+    const [source] = await this.engine.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [this.sourceId]);
+    if (!source || source.archived || source.incarnation !== this.source.incarnation ||
+        source.local_path !== this.source.local_path || digest(source.config) !== digest(this.source.config)) {
+      throw new OperationError('source_changed', 'The connector source changed during the sweep.');
+    }
+    const binding = await getWorktreeBinding(this.engine, this.sourceId);
+    if ((binding?.worktree_id ?? null) !== (this.binding?.worktree_id ?? null) ||
+        String(binding?.owner_epoch) !== String(this.binding?.owner_epoch) ||
+        connectorBindingRoot(this.sourceId, source, binding) !== this.canonicalRoot) {
+      throw new OperationError('source_changed', 'The connector ownership changed during the sweep.');
+    }
+    if (!binding) return;
+    const retained = () => this.engine.executeRaw<WriteRequest>(
+      'SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND recovery IS NOT NULL ORDER BY sequence LIMIT 1', [binding.worktree_id]);
+    let [row] = await retained();
+    if (!row) return;
+    startPersistenceConsumer(this.engine, loadConfig() ?? { engine: this.engine.kind });
+    const deadline = performance.now() + 5000;
+    while (performance.now() < deadline) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const progress = await Promise.race([
+        (async () => {
+          const current = await getWriteRequestById(this.engine, row.id);
+          if (!current || current.recovery || !isTerminal(current)) return { row: current ?? row, drained: false };
+          writeResponse(current);
+          const [next] = await retained();
+          return { row: next ?? current, drained: !next };
+        })(),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), remaining); }),
+      ]).finally(() => { if (timer) clearTimeout(timer); });
+      if (progress?.drained) return;
+      if (progress) row = progress.row;
+      await new Promise(resolve => setTimeout(resolve, Math.min(50, Math.max(1, deadline - performance.now()))));
+    }
+    if (!row.recovery) writeResponse(row);
+    const error = new OperationError('recovery_required', 'A retained connector publication still requires recovery.',
+      'Inspect the retained receipt and its blocked_reason before retrying this connector.');
+    error.writeRequest = receiptFor(row);
+    error.writeError = 'recovery_required';
+    throw error;
+  }
   state<T>(empty: T): T { return structuredClone((this.checkpoint[0] as { state?: T } | undefined)?.state ?? empty); }
   async page(slug: string) {
+    await this.recover(slug);
     const snapshot = await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId });
     if (snapshot && this.binding) await prepareFileTarget(this.engine,
       { source_id: this.sourceId, worktree_id: this.binding.worktree_id, slug }, snapshot, serializePageToMarkdown(snapshot.page, snapshot.tags));
@@ -145,7 +192,7 @@ export class ManagedConnectorSync {
     this.receipts = [];
   }
   private async submit(kind: ConnectorIntent['kind'], slug: string, sourcePath: string | null, extra: Partial<ConnectorIntent>): Promise<WriteRequest> {
-    await validateSyncAuthority(this.engine, this.authority, slug);
+    await this.recover(slug);
     const snapshot = await this.engine.readPageSnapshot(slug, { sourceId: this.sourceId, includeDeleted: true });
     const file = kind === 'managed_connector_checkpoint' ? undefined : await prepareFileTarget(this.engine,
       { source_id: this.sourceId, worktree_id: this.binding?.worktree_id ?? null, slug }, snapshot, extra.content ?? null);

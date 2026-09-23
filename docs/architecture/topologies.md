@@ -516,7 +516,24 @@ valid vectors reconcile without provider work; otherwise the additional
 allowance is one-shot and covers worker attempts, which may contain provider
 sub-batches. It remains bounded by selected-brain policy, original/current
 authority, source/page revision and effect CAS. This changes no canonical
-receipt, content or ownership. Fact NULL-vector backfill is a separate
+receipt, content or ownership. Healthy embedding work renews its token-guarded
+claim every ten seconds without holding a worktree lock or database transaction
+over provider work. Losing the claim cancels that invocation; the final
+installation still verifies its token. Caller cancellation, per-provider
+timeouts and budget admission remain effective without a whole-page deadline.
+
+Direct `--brain <mount>` retry uses only the selected database's validated active
+column and recorded model provenance for inspection and explicit queue approval.
+Unknown or inconsistent provenance refuses the action; the host brain's model
+and policy are never borrowed. The receipt identifies this as
+`approval: selected_database_provenance` and `execution: owner_file_and_database`.
+Queue approval is not permission to bypass the eventual owner's selected file
+configuration: both that configuration and the database `embedding_disabled`
+setting must permit each provider attempt and final installation. A disable in
+either effective policy stops further provider work. Existing valid vectors can
+still reconcile without a provider while embeddings are disabled.
+
+Fact NULL-vector backfill is a separate
 source-scoped preview/approved-cost operation in
 [embedding migrations](../embedding-migrations.md).
 

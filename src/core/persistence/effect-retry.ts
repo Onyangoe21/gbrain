@@ -1,15 +1,49 @@
 import type { BrainEngine } from '../engine.ts';
 import { loadConfigWithEngine, type GBrainConfig } from '../config.ts';
 import { MAX_RATE_LIMIT_RETRIES } from '../embed-retry.ts';
+import { EmbeddingDisabledError, readContentChunksColumnDim } from '../embedding-dim-check.ts';
+import { resolveWriteColumnFromConfigRows } from '../search/embedding-column.ts';
 import { OperationError, type OperationContext } from '../ops/contract.ts';
 import { authorizeStoredRequest, authorizeWrite, submissionAuthority } from './authority.ts';
 import { existingLocalHostId } from './identity.ts';
 import { guardEffectSource } from './effect-recovery.ts';
-import { readEmbeddingEffectProjection, selectedEffectPage } from './effects.ts';
+import { assertEmbeddingEffectEnabled, readEmbeddingEffectProjection, selectedEffectPage } from './effects.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
-export async function retryEmbeddingEffect(engine: BrainEngine, sourceId: string, requestId: string, dryRun: boolean, baseConfig?: GBrainConfig): Promise<Record<string, unknown>> {
+async function mountedEmbeddingSignature(engine: BrainEngine): Promise<string> {
+  const rows = await engine.executeRaw<{ key: string; value: string }>(`SELECT key,value FROM config
+    WHERE key IN ('embedding_model','embedding_dimensions','search_embedding_column','embedding_columns') ORDER BY key FOR SHARE`);
+  const values = Object.fromEntries(rows.map(row => [row.key, row.value]));
+  let column;
+  try {
+    if (values.embedding_columns !== undefined) {
+      const registry: unknown = JSON.parse(values.embedding_columns);
+      if (!registry || typeof registry !== 'object' || Array.isArray(registry)) throw new Error('Invalid registry');
+    }
+    column = resolveWriteColumnFromConfigRows({ searchEmbeddingColumn: values.search_embedding_column,
+      embeddingColumnsJson: values.embedding_columns });
+  } catch {
+    throw new OperationError('embedding_configuration', 'The selected brain has invalid active embedding-column provenance.',
+      'Inspect and repair embedding configuration on the selected brain owner before retrying.');
+  }
+  const model = column.embeddingModel || values.embedding_model;
+  const dimensions = column.embeddingModel ? column.dimensions
+    : /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
+  if (!model || !/^[^\s:]+:[^\s]+$/.test(model) || !Number.isSafeInteger(dimensions) || !dimensions || column.name === 'embedding_image') {
+    throw new OperationError('embedding_unconfigured', 'The selected brain has no verifiable text embedding model and dimensions.',
+      'Inspect embedding provenance on the selected brain owner; the host model is never used for mounted retry.');
+  }
+  const physical = await readContentChunksColumnDim(engine, column.name);
+  if (!physical.exists || physical.dims !== dimensions) {
+    throw new OperationError('embedding_configuration', 'The selected brain embedding provenance does not match its active vector column.',
+      'Finish the reviewed embedding migration on the selected brain owner before retrying.');
+  }
+  return `${model}:${dimensions}`;
+}
+
+export async function retryEmbeddingEffect(engine: BrainEngine, sourceId: string, requestId: string, dryRun: boolean, baseConfig?: GBrainConfig,
+  policy: 'owner' | 'mounted_database' = 'owner'): Promise<Record<string, unknown>> {
   const requests = await engine.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r WHERE source_id=$1 AND request_id=$2::uuid
     AND EXISTS (SELECT 1 FROM persistence_effects e WHERE e.request_id=r.id AND e.kind='embedding') LIMIT 2`, [sourceId, requestId]);
   if (requests.length !== 1) throw new OperationError('invalid_params', 'The source and request must identify exactly one embedding obligation.');
@@ -17,7 +51,7 @@ export async function retryEmbeddingEffect(engine: BrainEngine, sourceId: string
   const hostId = existingLocalHostId();
   if (!hostId) throw new OperationError('permission_denied', 'Retry requires the registered local CLI host.');
   const config = await loadConfigWithEngine(engine, baseConfig);
-  const signature = config?.embedding_model && config.embedding_dimensions
+  const configuredSignature = config?.embedding_model && config.embedding_dimensions
     ? `${config.embedding_model}:${config.embedding_dimensions}` : null;
   return engine.transaction(async tx => {
     const [selected] = await tx.executeRaw<PersistenceEffect>("SELECT * FROM persistence_effects WHERE request_id=$1::uuid AND kind='embedding'", [request.id]);
@@ -43,19 +77,28 @@ export async function retryEmbeddingEffect(engine: BrainEngine, sourceId: string
       await authorizeWrite(tx, authority, request.operation, snapshot.page.slug, true);
     }
     const receipt = { request_id: request.request_id, source_id: sourceId, kind: 'embedding', attempts: effect.attempts,
-      retry_limit: MAX_RATE_LIMIT_RETRIES, dry_run: dryRun };
+      retry_limit: MAX_RATE_LIMIT_RETRIES, dry_run: dryRun,
+      ...(policy === 'mounted_database' ? { embedding_policy: { approval: 'selected_database_provenance', execution: 'owner_file_and_database' } } : {}) };
     if (effect.state !== 'failed') {
       if (effect.data.embedding_retry_base !== undefined || effect.state === 'committed') return { ...receipt, state: effect.state, action: 'unchanged',
         next_action: 'Inspect this same receipt; this command does not authorize another retry cycle.' };
       throw new OperationError('effect_not_failed', 'Only a failed, non-running embedding effect can be explicitly retried.');
     }
     if (effect.execution_token !== null) throw new OperationError('write_claim_lost', 'A failed effect still has an execution claim; inspect it before retrying.');
+    const signature = policy === 'mounted_database' && !scanComplete ? await mountedEmbeddingSignature(tx) : configuredSignature;
     if (!signature && !scanComplete) return { ...receipt, state: 'failed', action: 'blocked', reason: 'embedding_unconfigured', next_action: 'Configure embeddings, then inspect this request again.' };
     const pending = scanComplete ? [] : (await readEmbeddingEffectProjection(tx, effect, snapshot!, hostId, signature!)).pending;
     const complete = scanComplete || pending.length === 0 && !effect.data.source_scan;
-    if (!complete && (config?.embedding_disabled || effect.data.embedding_retry_base !== undefined)) {
-      return { ...receipt, state: 'failed', action: 'blocked', reason: config?.embedding_disabled ? 'embedding_disabled' : 'embedding_retry_exhausted',
-        next_action: config?.embedding_disabled ? 'Embedding remains disabled; explicitly configure it before retrying.' : 'The explicit retry allowance is already consumed. Inspect the provider and use a separately approved scoped repair.' };
+    if (!complete) {
+      await tx.executeRaw("SELECT key FROM config WHERE key='embedding_disabled' FOR SHARE");
+      try { await assertEmbeddingEffectEnabled(tx, config); }
+      catch (error) {
+        if (!(error instanceof EmbeddingDisabledError)) throw error;
+        return { ...receipt, state: 'failed', action: 'blocked', reason: 'embedding_disabled',
+          next_action: 'Embedding remains disabled; explicitly configure it before retrying.' };
+      }
+      if (effect.data.embedding_retry_base !== undefined) return { ...receipt, state: 'failed', action: 'blocked', reason: 'embedding_retry_exhausted',
+        next_action: 'The explicit retry allowance is already consumed. Inspect the provider and use a separately approved scoped repair.' };
     }
     if (dryRun) return { ...receipt, state: 'failed', action: complete ? 'would_reconcile' : 'would_retry',
       pending_chunks: pending.length, next_action: 'Run the same command without --dry-run to approve this bounded action.' };
@@ -67,6 +110,6 @@ export async function retryEmbeddingEffect(engine: BrainEngine, sourceId: string
     [effect.id, effect.attempts, effect.source_incarnation, complete ? 'committed' : 'queued']);
     if (!updated) throw new OperationError('write_claim_lost', 'The embedding obligation changed during retry approval.');
     return { ...receipt, state: updated.state, action: complete ? 'reconciled' : 'retry_queued', pending_chunks: pending.length,
-      next_action: complete ? 'The existing vectors satisfy this obligation; no provider work was scheduled.' : 'The resident owner may spend up to five attempts under the existing provider and job budget policy. Repeating this command does not renew that allowance.' };
+      next_action: complete ? 'The existing vectors satisfy this obligation; no provider work was scheduled.' : 'The resident owner may spend up to five attempts only when its selected file configuration and the database policy permit embedding, under existing provider and job budgets. Repeating this command does not renew that allowance.' };
   });
 }

@@ -498,7 +498,7 @@ export async function purgeStaleCheckpoints(
       `WITH deleted AS (
          DELETE FROM op_checkpoints
          WHERE updated_at < now() - ($1 || ' days')::interval
-           AND op <> 'managed-atoms'
+           AND op NOT IN ('managed-atoms','managed-connector')
            AND NOT (op='managed-sync' AND (COALESCE(completed_keys->0->>'done','false')<>'true' OR EXISTS (
              SELECT 1 FROM op_checkpoints f WHERE f.op='managed-sync-failure' AND f.fingerprint=op_checkpoints.fingerprint)))
            AND op<>'managed-sync-failure'

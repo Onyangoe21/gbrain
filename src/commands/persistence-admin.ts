@@ -142,7 +142,8 @@ export async function runPersistenceAdminCli(group: Group, args: string[], conne
         owned = await createEngine(toEngineConfig(config));
         await owned.connect(toEngineConfig(config));
       }
-      result = await runPersistenceAdministration(connected ?? owned!, parsed.operation, parsed.params, config);
+      result = await runPersistenceAdministration(connected ?? owned!, parsed.operation, parsed.params, config,
+        brainId === 'host' ? 'owner' : 'mounted_database');
     }
     await writeStdoutFinal(JSON.stringify(result, bigintToStringReplacer, 2) + '\n');
   } catch (error) {

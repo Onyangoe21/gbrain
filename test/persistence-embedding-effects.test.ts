@@ -16,7 +16,7 @@ import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { installPageEmbeddings, installPageProjection, readProjectionSnapshot } from '../src/core/page-state/projections.ts';
 import { MAX_RATE_LIMIT_RETRIES } from '../src/core/embed-retry.ts';
 import { AIConfigError } from '../src/core/ai/errors.ts';
-import { invokeAI, withAIInvocationGuard } from '../src/core/ai/invocation-guard.ts';
+import { invokeAI, isAIInvocationPolicyError, withAIInvocationGuard } from '../src/core/ai/invocation-guard.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -218,7 +218,7 @@ for (const kind of ['pglite', ...(databaseUrl ? ['postgres'] : [])] as const) {
         embedding: { signature, model, embed: async (_texts, options) => {
           calls++;
           expect(depth).toBe(0);
-          expect(options?.abortSignal).toBe(controller.signal);
+          expect(options?.abortSignal?.aborted).toBe(false);
           return vectors();
         } } });
       expect(calls).toBe(1);
@@ -252,16 +252,202 @@ for (const kind of ['pglite', ...(databaseUrl ? ['postgres'] : [])] as const) {
     check('caller abort discards even a provider that returns vectors after cancellation', async () => {
       const f = await fixture();
       const controller = new AbortController();
+      const reason = new Error('caller budget cancelled');
       await run(async (_texts, options) => {
         expect(options?.maxRetries).toBe(0);
-        controller.abort();
+        controller.abort(reason);
         expect(options?.abortSignal?.aborted).toBe(true);
+        expect(options?.abortSignal?.reason).toBe(reason);
         return vectors();
       }, controller.signal);
       expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
       expect((await state(f.effectId)).state).toBe('queued');
       await due(f.effectId); await run(async () => vectors());
       expect((await state(f.effectId)).state).toBe('committed');
+    });
+
+    check('caller cancellation reaches an in-flight provider with the exact reason', async () => {
+      const f = await fixture();
+      const controller = new AbortController();
+      const reason = new Error('caller deadline');
+      const started = Promise.withResolvers<void>();
+      let observed: unknown;
+      const worker = run(async (_texts, options) => {
+        started.resolve();
+        return new Promise((_resolve, reject) => options!.abortSignal!.addEventListener('abort', () => {
+          observed = options!.abortSignal!.reason;
+          reject(observed);
+        }, { once: true }));
+      }, controller.signal);
+      await started.promise;
+      controller.abort(reason);
+      await worker;
+      expect(observed).toBe(reason);
+      expect(await state(f.effectId)).toMatchObject({ state: 'queued', attempts: 1, error_code: 'embedding_aborted' });
+      expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+      await due(f.effectId);
+      await run(async () => { throw new Error('Aborted caller must never invoke provider'); }, controller.signal);
+      expect(await state(f.effectId)).toMatchObject({ state: 'queued', attempts: 1 });
+    });
+
+    check('lost lease aborts the provider and stops renewals without overwriting the successor claim', async () => {
+      const f = await fixture();
+      const successor = randomUUID();
+      let renewals = 0;
+      const observed = new Proxy(engine, { get(target, key) {
+        if (key === 'executeRawDirect') return async (...args: Parameters<BrainEngine['executeRawDirect']>) => {
+          if (args[0].includes('UPDATE persistence_effects SET claim_expires_at')) renewals++;
+          return target.executeRawDirect(...args);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      let reason: unknown;
+      await runPersistenceEffects(observed, { engine: engine.kind }, { hostId: localHostId(), limit: 1,
+        embedding: { signature, model, embed: async (_texts, options) => {
+          await engine.executeRaw('UPDATE persistence_effects SET execution_token=$2::uuid WHERE id=$1', [f.effectId, successor]);
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error('Lost lease did not cancel the provider')), 20_000);
+            options!.abortSignal!.addEventListener('abort', () => { clearTimeout(timeout); reason = options!.abortSignal!.reason; resolve(); }, { once: true });
+          });
+          return vectors();
+        } } });
+      expect(reason).toMatchObject({ code: 'write_claim_lost' });
+      const stoppedAt = renewals;
+      await Bun.sleep(11_000);
+      expect(renewals).toBe(stoppedAt);
+      expect((await engine.executeRaw('SELECT state,execution_token FROM persistence_effects WHERE id=$1', [f.effectId]))[0])
+        .toMatchObject({ state: 'running', execution_token: successor });
+      expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+    });
+
+    check('a DB policy disabled during provider work prevents vector installation', async () => {
+      const f = await fixture();
+      try {
+        await run(async () => { await engine.setConfig('embedding_disabled', 'true'); return vectors(); });
+        expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+        expect(await publicEffectsForRequest(engine, f.row.id)).toEqual([{ kind: 'embedding', state: 'skipped', reason: 'embedding_disabled' }]);
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='embedding_disabled'"); }
+    });
+
+    check('malformed selected DB policy parks the effect without a provider call', async () => {
+      const f = await fixture();
+      await engine.setConfig('embedding_disabled', 'TRUE');
+      let calls = 0;
+      try {
+        await run(async () => { calls++; return vectors(); });
+        expect(calls).toBe(0);
+        expect(await state(f.effectId)).toMatchObject({ state: 'failed', error_code: 'embedding_configuration', attempts: 1 });
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='embedding_disabled'"); }
+    });
+
+    for (const plane of ['db', 'file'] as const) check(`${plane} disable between provider sub-batches preserves caller budget admission and stops further spend`, async () => {
+      const f = await fixture();
+      const config = { engine: engine.kind, embedding_disabled: false };
+      let calls = 0, permits = 0, settlements = 0;
+      try {
+        await withAIInvocationGuard(async () => { permits++; return { settle: async () => { settlements++; } }; }, () =>
+          runPersistenceEffects(engine, config, { hostId: localHostId(), limit: 1, embedding: { signature, model, embed: async () => {
+            const call = () => invokeAI({ operation: 'embed', kind: 'embedding' as const, model }, async () => { calls++; return vectors(); }, () => null);
+            await call();
+            if (plane === 'db') await engine.setConfig('embedding_disabled', 'true');
+            else config.embedding_disabled = true;
+            return call();
+          } } }));
+        expect(calls).toBe(1);
+        expect(permits).toBe(1);
+        expect(settlements).toBe(1);
+        expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+        expect(await publicEffectsForRequest(engine, f.row.id)).toEqual([{ kind: 'embedding', state: 'skipped', reason: 'embedding_disabled' }]);
+      } finally { await engine.executeRaw("DELETE FROM config WHERE key='embedding_disabled'"); }
+    });
+
+    check('lease loss between provider sub-batches stops spend before another parent budget admission', async () => {
+      const f = await fixture();
+      const successor = randomUUID();
+      let calls = 0, permits = 0, settlements = 0;
+      await withAIInvocationGuard(async () => { permits++; return { settle: async () => { settlements++; } }; }, () =>
+        run(async () => {
+          const call = () => invokeAI({ operation: 'embed', kind: 'embedding' as const, model }, async () => { calls++; return vectors(); }, () => null);
+          await call();
+          await engine.executeRaw('UPDATE persistence_effects SET execution_token=$2::uuid WHERE id=$1', [f.effectId, successor]);
+          return call();
+        }));
+      expect(calls).toBe(1);
+      expect(permits).toBe(1);
+      expect(settlements).toBe(1);
+      expect((await engine.executeRaw('SELECT state,execution_token FROM persistence_effects WHERE id=$1', [f.effectId]))[0])
+        .toMatchObject({ state: 'running', execution_token: successor });
+      expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+    });
+
+    for (const boundary of ['policy', 'renewal'] as const) for (const sqlstate of ['08006', '55P03', '40001']) {
+      check(`transient ${sqlstate} at ${boundary} preflight stops sub-batches but permits bounded recovery`, async () => {
+        const f = await fixture();
+        let inject = false, calls = 0, permits = 0, settlements = 0;
+        let failure: unknown;
+        const storageFailure = () => { inject = false; throw Object.assign(new Error('private fixture database payload'), { code: sqlstate }); };
+        const observed = new Proxy(engine, { get(target, key) {
+          if (key === 'getConfig') return async (name: string) => {
+            if (boundary === 'policy' && inject && name === 'embedding_disabled') storageFailure();
+            return target.getConfig(name);
+          };
+          if (key === 'executeRawDirect') return async (...args: Parameters<BrainEngine['executeRawDirect']>) => {
+            if (boundary === 'renewal' && inject && args[0].includes('UPDATE persistence_effects SET claim_expires_at')) storageFailure();
+            return target.executeRawDirect(...args);
+          };
+          const value = Reflect.get(target, key, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+        await withAIInvocationGuard(async () => { permits++; return { settle: async () => { settlements++; } }; }, () =>
+          runPersistenceEffects(observed, { engine: engine.kind }, { hostId: localHostId(), limit: 1,
+            embedding: { signature, model, embed: async () => {
+              const call = () => invokeAI({ operation: 'embed', kind: 'embedding' as const, model }, async () => { calls++; return vectors(); }, () => null);
+              await call();
+              inject = true;
+              try { return await call(); } catch (error) { failure = error; throw error; }
+            } } }));
+        expect(calls).toBe(1);
+        expect(permits).toBe(1);
+        expect(settlements).toBe(1);
+        expect(isAIInvocationPolicyError(failure)).toBe(true);
+        expect(await state(f.effectId)).toMatchObject({ state: 'queued', attempts: 1, error_code: 'embedding_storage_unavailable' });
+        expect(Number((await state(f.effectId)).wait_ms)).toBeGreaterThan(400);
+        expect(String(failure)).not.toContain('private fixture database payload');
+        expect(await publicEffectsForRequest(engine, f.row.id)).toEqual([{ kind: 'embedding', state: 'queued', reason: 'embedding_storage_unavailable' }]);
+        expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+        await due(f.effectId);
+        await runPersistenceEffects(observed, { engine: engine.kind }, { hostId: localHostId(), limit: 1,
+          embedding: { signature, model, embed: async () => { calls++; return vectors(); } } });
+        expect(calls).toBe(2);
+        expect(await state(f.effectId)).toMatchObject({ state: 'committed', attempts: 2, error_code: null });
+      });
+    }
+
+    check('transient preflight storage failures cannot extend the final allowed attempt', async () => {
+      const f = await fixture();
+      await engine.executeRaw('UPDATE persistence_effects SET attempts=$2 WHERE id=$1', [f.effectId, MAX_RATE_LIMIT_RETRIES - 1]);
+      let inject = false, calls = 0;
+      const observed = new Proxy(engine, { get(target, key) {
+        if (key === 'getConfig') return async (name: string) => {
+          if (inject && name === 'embedding_disabled') { inject = false; throw Object.assign(new Error('private fixture database payload'), { code: '08006' }); }
+          return target.getConfig(name);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      await runPersistenceEffects(observed, { engine: engine.kind }, { hostId: localHostId(), limit: 1,
+        embedding: { signature, model, embed: async () => {
+          const call = () => invokeAI({ operation: 'embed', kind: 'embedding' as const, model }, async () => { calls++; return vectors(); }, () => null);
+          await call();
+          inject = true;
+          return call();
+        } } });
+      expect(calls).toBe(1);
+      expect(await state(f.effectId)).toMatchObject({ state: 'failed', attempts: MAX_RATE_LIMIT_RETRIES, error_code: 'embedding_attempts_exhausted' });
+      await due(f.effectId);
+      await run(async () => { calls++; return vectors(); });
+      expect(calls).toBe(1);
     });
 
     check('a superseded lease discards late vectors before installation', async () => {
@@ -271,6 +457,77 @@ for (const kind of ['pglite', ...(databaseUrl ? ['postgres'] : [])] as const) {
         return vectors();
       });
       expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(0);
+    });
+
+    if (kind === 'postgres') check('two independent consumers retain one healthy multi-batch provider past the fixture lease', async () => {
+      const f = await fixture();
+      const [database] = await engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
+      const url = new URL(databaseUrl!); url.pathname = `/${database.name}`;
+      const competitor = new PostgresEngine();
+      await competitor.connect({ database_url: url.toString(), poolSize: 2 });
+      await engine.executeRaw(`CREATE FUNCTION shorten_embedding_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.kind='embedding' AND NEW.state='running' AND NEW.claim_expires_at IS DISTINCT FROM OLD.claim_expires_at THEN
+            NEW.claim_expires_at=clock_timestamp()+interval '15 seconds';
+          END IF;
+          RETURN NEW;
+        END $$`);
+      await engine.executeRaw(`CREATE TRIGGER shorten_embedding_claim BEFORE UPDATE ON persistence_effects
+        FOR EACH ROW EXECUTE FUNCTION shorten_embedding_claim()`);
+      let calls = 0, batches = 0;
+      const started = Promise.withResolvers<void>();
+      const options = { hostId: localHostId(), limit: 1, embedding: { signature, model, embed: async () => {
+        calls++; started.resolve();
+        for (let n = 0; n < 3; n++) { await Bun.sleep(11_000); batches++; }
+        return vectors();
+      } } };
+      const worker = runPersistenceEffects(engine, { engine: engine.kind }, options);
+      try {
+        await started.promise;
+        await Bun.sleep(17_000);
+        await runPersistenceEffects(competitor, { engine: competitor.kind }, { ...options,
+          embedding: { signature, model, embed: async () => { calls++; return vectors(); } } });
+        await Bun.sleep(11_000);
+        await runPersistenceEffects(competitor, { engine: competitor.kind }, { ...options,
+          embedding: { signature, model, embed: async () => { calls++; return vectors(); } } });
+        await worker;
+        expect(calls).toBe(1);
+        expect(batches).toBe(3);
+        expect(await state(f.effectId)).toMatchObject({ state: 'committed', attempts: 1 });
+        expect(await engine.executeRaw('SELECT id FROM content_chunks WHERE page_id=$1 AND embedding IS NOT NULL', [f.snapshot.page.id])).toHaveLength(1);
+      } finally {
+        await worker;
+        await engine.executeRaw('DROP TRIGGER shorten_embedding_claim ON persistence_effects');
+        await engine.executeRaw('DROP FUNCTION shorten_embedding_claim()');
+        await competitor.disconnect();
+      }
+    });
+
+    if (kind === 'postgres') check('success, provider failure, cancellation and invalid vectors all stop the heartbeat', async () => {
+      let renewals = 0;
+      const observed = new Proxy(engine, { get(target, key) {
+        if (key === 'executeRawDirect') return async (...args: Parameters<BrainEngine['executeRawDirect']>) => {
+          if (args[0].includes('UPDATE persistence_effects SET claim_expires_at')) renewals++;
+          return target.executeRawDirect(...args);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      for (const outcome of ['success', 'failure', 'cancelled', 'incomplete'] as const) {
+        const f = await fixture();
+        const controller = new AbortController();
+        await runPersistenceEffects(observed, { engine: engine.kind }, { hostId: localHostId(), limit: 1, signal: controller.signal,
+          embedding: { signature, model, embed: async () => {
+            if (outcome === 'failure') throw new Error('temporary network timeout');
+            if (outcome === 'cancelled') controller.abort(new Error('caller deadline'));
+            return outcome === 'incomplete' ? [] : vectors();
+          } } });
+        expect((await state(f.effectId)).state).toBe(outcome === 'success' ? 'committed' : 'queued');
+      }
+      const stoppedAt = renewals;
+      expect(stoppedAt).toBe(4);
+      await Bun.sleep(11_000);
+      expect(renewals).toBe(stoppedAt);
     });
 
     check('partial batches do not stamp completion or install any vectors', async () => {

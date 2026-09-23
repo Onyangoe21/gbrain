@@ -59,7 +59,7 @@ async function registrationGrant(engine: BrainEngine, params: Record<string, unk
 }
 
 export async function runPersistenceAdministration(engine: BrainEngine, operation: PersistenceAdminOperation,
-  params: Record<string, unknown>, config?: GBrainConfig): Promise<Record<string, unknown>> {
+  params: Record<string, unknown>, config?: GBrainConfig, embeddingRetryPolicy: 'owner' | 'mounted_database' = 'owner'): Promise<Record<string, unknown>> {
   if (operation === 'writer_reconcile_preview') return (await import('./reconcile.ts')).runReconcilePreview(engine, params);
   if (operation === 'writer_reconcile_apply') return (await import('./reconcile.ts')).runReconcileApply(engine, params);
   if (operation === 'writer_reconcile_audit') return (await import('./reconcile-audit.ts')).runReconcileAudit(engine, params);
@@ -85,7 +85,7 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     keys(params, ['source_id', 'request_id', 'dry_run']);
     if (params.dry_run !== undefined && typeof params.dry_run !== 'boolean') throw invalid('dry_run must be a boolean.');
     if (!isWriteRequestId(params.request_id)) throw invalid('A valid original write request UUID is required.');
-    return (await import('./effect-retry.ts')).retryEmbeddingEffect(engine, source(params.source_id), params.request_id, params.dry_run === true, config);
+    return (await import('./effect-retry.ts')).retryEmbeddingEffect(engine, source(params.source_id), params.request_id, params.dry_run === true, config, embeddingRetryPolicy);
   }
   if (operation === 'source_add' || operation === 'source_lifecycle') {
     const { managedPersistenceEnabled } = await import('./ownership.ts');
