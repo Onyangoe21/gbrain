@@ -49,7 +49,7 @@ const fetcher = async (url: string) => {
 };
 let failed = false;
 try {
-  const options = { noEmbed: true, noExtract: true, noSchemaPack: true };
+  const options = { noEmbed: true, noExtract: true, noSchemaPack: true, retryFailed: input.retryFailed === true };
   const result = input.sourceConfig.kind === 'google'
     ? await runGoogleSync(engine, input.sourceId, parseGoogleSourceConfig(input.sourceConfig, input.root), options, fetcher)
     : await runGitHubSync(engine, input.sourceId, parseGitHubSourceConfig(input.sourceConfig, input.root),

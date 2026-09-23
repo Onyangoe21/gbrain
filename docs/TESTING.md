@@ -175,7 +175,19 @@ completion, exhausted durable attempts and state-bound explicit retry.
 and their `test/e2e/` counterparts exercise admitted atom/fact replay,
 including fresh-process facts authority. `test/persistence-connectors.test.ts`
 covers managed bound/unbound Google/GitHub sources, API pagination and
-source-scoped deletions. `test/managed-maintenance.test.ts` and
+source-scoped deletions. `test/persistence-connector-retry.test.ts` covers
+explicit retry, compaction, checkpoint dependency identity, concurrent approval
+and lost acknowledgements. Each suite creates its own home, engines and
+lifecycle through `test/helpers/connector-fixture.ts`; the helper shares no
+live engine or mutable suite state. Their separate E2E entry points,
+`test/e2e/managed-connector-routing.test.ts` and
+`test/e2e/managed-connector-retry.test.ts`, retain the runner's default
+180-second per-file cap without duplicating the base cases in the retry lane.
+Linux root runners execute the complete EACCES case in an isolated `setpriv`
+child and assert UID 65534 before testing permissions. This needs a readable
+checkout, not changes to the parent process identity or checkout permissions;
+the CI runner image supplies `setpriv`.
+`test/managed-maintenance.test.ts` and
 `test/helpers/maintenance-restart.ts` cover local synthesize/patterns/
 consolidation, restart replay, retired takes and semantic snapshots;
 `test/managed-unsupported-preflight.serial.test.ts` checks unsupported bulk

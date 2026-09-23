@@ -1,10 +1,8 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
-import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { parseGitHubSourceConfig, runGitHubSync } from '../src/core/github-source.ts';
 import { parseGoogleSourceConfig, runGoogleSync } from '../src/core/google/google-source.ts';
 import { disposePersistenceConsumer, startPersistenceConsumer, waitForWrite } from '../src/core/persistence/service.ts';
@@ -14,81 +12,14 @@ import { withSubmissionAuthority } from '../src/core/minions/submission-authorit
 import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
-import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { purgeStaleCheckpoints } from '../src/core/op-checkpoint.ts';
-import type { GBrainConfig } from '../src/core/config.ts';
 import { beginConnectorSync } from '../src/core/persistence/connector-sync.ts';
+import { createConnectorFixture, options, json, googleConfig, githubConfig, contact, issueFixture, githubFetch, sourceCheckpoint } from './helpers/connector-fixture.ts';
 
-const home = mkdtempSync(join(tmpdir(), 'gbrain-connector-parity-'));
-const engines: BrainEngine[] = [];
-let closePostgres: (() => Promise<void>) | undefined;
-const env = { GBRAIN_HOME: home, CONNECTOR_TEST_TOKEN: 'synthetic-local-fixture' };
-const options = { noEmbed: true, noExtract: true, noSchemaPack: true };
-const json = (body: unknown, status = 200, headers = {}) => new Response(JSON.stringify(body), {
-  status, headers: { 'content-type': 'application/json', ...headers },
-});
-const googleConfig = { kind: 'google', g_account: 'owner@example.invalid', g_services: 'contacts', g_access: 'env', g_token_env: 'CONNECTOR_TEST_TOKEN' };
-const githubConfig = { kind: 'github', gh_scope: 'repos', gh_repos: 'acme-example/app', gh_token_env: 'CONNECTOR_TEST_TOKEN' };
-const contact = (id: string, name: string) => ({ resourceName: `people/${id}`, names: [{ displayName: name }], emailAddresses: [{ value: `${id}@example.invalid` }] });
-const issueFixture = { number: 1, title: 'Example issue', state: 'open', body: 'A useful synthetic issue body.', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z', labels: [], assignees: [], user: { login: 'example-user' }, html_url: 'https://github.com/acme-example/app/issues/1' };
-
-function githubFetch(opts: { failDetail?: boolean; failSecondPage?: boolean; deleted?: boolean; calls?: string[] } = {}) {
-  return async (url: string) => {
-    opts.calls?.push(url);
-    const u = new URL(url);
-    const path = u.pathname;
-    if (path.endsWith('/issues')) {
-      if (opts.failSecondPage && u.searchParams.has('page')) return json({ message: 'fixture listing failure' }, 400);
-      return json(opts.deleted ? [] : [issueFixture], 200, opts.failSecondPage ? { link: '<https://api.github.com/repos/acme-example/app/issues?page=2>; rel="next"' } : {});
-    }
-    if (path.endsWith('/pulls') || path.endsWith('/comments')) return json([]);
-    if (path.endsWith('/issues/1')) return opts.failDetail ? json({ message: 'fixture detail failure' }, 400) : json(issueFixture);
-    if (path === '/repos/acme-example/app') return json({ full_name: 'acme-example/app', private: true, default_branch: 'main' });
-    throw new Error('Unexpected external fixture route');
-  };
-}
-
-async function sourceCheckpoint(engine: BrainEngine, id: string) {
-  return engine.executeRaw("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint IN (SELECT intent->>'checkpointKey' FROM persistence_requests WHERE source_id=$1)", [id]);
-}
-
-async function source(engine: BrainEngine, config: Record<string, unknown>) {
-  await disposePersistenceConsumer(engine);
-  await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
-  const id = `connector-${randomUUID().slice(0, 8)}`;
-  const dir = join(home, id);
-  mkdirSync(dir);
-  await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,$3::text::jsonb)', [id, dir, JSON.stringify(config)]);
-  await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-  return { id, dir };
-}
-
-async function boundSource(engine: BrainEngine, config: Record<string, unknown>) {
-  const f = await source(engine, config);
-  await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
-  const binding = await claimWorktree(engine, f.id, f.dir);
-  await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-  return { ...f, binding };
-}
-
-beforeAll(async () => {
-  const lite = new PGLiteEngine();
-  await lite.connect({ database_path: join(home, 'database') });
-  await lite.initSchema();
-  engines.push(lite);
-  if (process.env.DATABASE_URL) {
-    const pg = await isolatedPersistencePostgres(process.env.DATABASE_URL);
-    engines.push(pg.engine);
-    closePostgres = pg.close;
-  }
-}, 120_000);
-
-afterAll(async () => {
-  for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
-  await closePostgres?.();
-  rmSync(home, { recursive: true, force: true });
-});
+const { home, engines, env, source, boundSource, standaloneConnector, setup, teardown } = createConnectorFixture();
+beforeAll(setup, 120_000);
+afterAll(teardown);
 
 test('public Google sync journals DB-only imports and repeat/restart checkpoints on both engines', async () => withEnv(env, async () => {
   for (const engine of engines) {
@@ -228,7 +159,7 @@ test('managed connectors refuse unsupported dry runs and Git filters before cred
     const f = await source(engine, config);
     let calls = 0;
     const fetcher = async () => { calls++; throw new Error('Unexpected external request'); };
-    for (const mode of [{ dryRun: true }, { skipFailed: true }, { retryFailed: true }, { srcSubpath: 'scoped' },
+    for (const mode of [{ dryRun: true }, { skipFailed: true }, { srcSubpath: 'scoped' },
       { exclude: ['private/**'] }, { includeHidden: ['.notes/**'] }, { includeGitignored: true }, { workingTree: true }, { strategy: 'code' as const }]) {
       const run = connector === 'google'
         ? runGoogleSync(engine, f.id, parseGoogleSourceConfig(config, f.dir), { ...options, ...mode }, fetcher)
@@ -558,29 +489,6 @@ test('aged live connector cursors survive actual checkpoint purge and normal inc
       : new URL(url).pathname.endsWith('/issues') && new URL(url).searchParams.has('since'))).toBe(true);
   }
 }), 120_000);
-
-async function standaloneConnector(engine: BrainEngine, f: { id: string; dir: string }, sourceConfig: Record<string, unknown>, crash = false) {
-  let database: GBrainConfig & { poolSize?: number } = { engine: 'pglite', database_path: join(home, 'database') };
-  if (engine.kind === 'postgres') {
-    const [row] = await engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
-    const url = new URL(process.env.DATABASE_URL!);
-    url.pathname = `/${row.name}`;
-    database = { engine: 'postgres', database_url: url.toString(), poolSize: 4 };
-  }
-  await disposePersistenceConsumer(engine);
-  await engine.disconnect();
-  try {
-    const child = Bun.spawn([process.execPath, 'run', join(import.meta.dir, 'helpers/connector-restart.ts')], {
-      env: { ...process.env, ...env, GBRAIN_TEST_CONNECTOR_RESTART: JSON.stringify({ database, sourceId: f.id,
-        root: f.dir, sourceConfig, body: 'Updated organization after interruption', crash }) }, stdout: 'pipe', stderr: 'pipe',
-    });
-    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000);
-    try {
-      const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-      return { stdout, stderr, exitCode };
-    } finally { clearTimeout(timer); if (child.exitCode === null) child.kill('SIGKILL'); await child.exited; }
-  } finally { await engine.connect(database); }
-}
 
 test('standalone connector restart recovers a real SIGKILL after file publication without a resident consumer', async () => withEnv(env, async () => {
   for (const engine of engines) for (const connector of ['google', 'github'] as const) {

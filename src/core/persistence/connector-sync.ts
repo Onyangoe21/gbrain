@@ -11,10 +11,10 @@ import { OperationError } from '../ops/contract.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { sealPageTextProjection } from '../page-state/projections.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
-import { authorizeStoredRequest } from './authority.ts';
+import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { prepareCanonicalProjections } from './canonical-projections.ts';
 import { digest } from './digest.ts';
-import { admitWrite, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
+import { admitWrite, admitWriteInTransaction, assertReplayIntent, getWriteRequest, getWriteRequestById, intentDigest, receiptFor } from './journal.ts';
 import { acquireWorktree, containsPath, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import { localHostId } from './identity.ts';
 import { assertPersistenceAccepting, startPersistenceConsumer, waitForWrite, writeResponse } from './service.ts';
@@ -27,6 +27,15 @@ import { assertPhysicalRoot } from './physical-root.ts';
 
 type ConnectorKind = 'google' | 'github';
 interface ConnectorSource { incarnation: string; archived: boolean; local_path: string | null; config: Record<string, unknown>; }
+interface ConnectorRetry {
+  checkpointKey: string;
+  principalId: string;
+  principalKind: string;
+  baseRequestId: string;
+  requestId: string;
+  retryOf: string;
+  attempt: number;
+}
 interface ConnectorIntent extends Record<string, unknown> {
   kind: 'managed_connector_import' | 'managed_connector_delete' | 'managed_connector_checkpoint';
   connector: ConnectorKind;
@@ -83,9 +92,9 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   if (!brain?.enabled) return null;
   assertPersistenceAccepting(engine);
   validateManagedSyncOptions(opts);
-  if (opts.dryRun || opts.skipFailed || opts.retryFailed || opts.srcSubpath || opts.exclude?.length || opts.includeHidden?.length ||
+  if (opts.dryRun || opts.skipFailed || opts.srcSubpath || opts.exclude?.length || opts.includeHidden?.length ||
       opts.includeGitignored || opts.workingTree || opts.strategy === 'code' || connector === 'google' && opts.githubItem) {
-    throw new OperationError('invalid_params', 'Managed connector sync does not support dry runs, Git file filters, or Git failure-ledger modes.');
+    throw new OperationError('invalid_params', 'Managed connector sync does not support dry runs, Git file filters, or --skip-failed.');
   }
   const caller = currentSubmissionAuthority();
   if (caller && caller.kind !== 'application') throw new OperationError('permission_denied', 'Connector sync requires a trusted local CLI writer; remote jobs cannot acquire connector credentials.');
@@ -103,7 +112,7 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   const canonicalRoot = connectorBindingRoot(sourceId, source, binding);
   if (binding) await (await acquireWorktree(binding))?.release();
   else authority.writer.databaseOnlyReason = 'connector_database';
-  const session = new ManagedConnectorSync(engine, sourceId, connector, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true);
+  const session = new ManagedConnectorSync(engine, sourceId, connector, source, authority, binding, canonicalRoot, opts.noEmbed === true, opts.noSchemaPack === true, opts.retryFailed === true);
   await session.load();
   return session;
 }
@@ -111,30 +120,76 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
 export class ManagedConnectorSync {
   private checkpoint: unknown[] = [];
   private receipts: string[] = [];
+  private retryApprovals = new Map<string, string>();
   readonly checkpointKey: string;
   constructor(private engine: BrainEngine, readonly sourceId: string, private connector: ConnectorKind,
     private source: ConnectorSource, private authority: SyncAuthority, private binding: WorktreeBinding | null,
-    private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean) {
+    private canonicalRoot: string | null, private noEmbed: boolean, private noSchemaPack: boolean, private retryFailed = false) {
     this.checkpointKey = digest({ sourceId, incarnation: source.incarnation, connector, config: source.config });
   }
   async load(): Promise<void> {
     await this.recover('__managed_sync_checkpoint__');
+    if (this.retryFailed) {
+      const blocked = await this.retryBlocker(this.engine);
+      if (blocked) {
+        await this.authorizeRetryReceipt(this.engine, blocked);
+        if (!isTerminal(blocked) && !blocked.recovery) {
+          writeResponse(await waitForWrite(this.engine, blocked, loadConfig() ?? { engine: this.engine.kind }));
+          await this.recover('__managed_sync_checkpoint__');
+        }
+        await this.refuseRetryBlocker(this.engine);
+      }
+    }
     const [row] = await this.engine.executeRaw<{ completed_keys: unknown[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1", [this.checkpointKey]);
     this.checkpoint = row?.completed_keys ?? [];
+    if (this.retryFailed) {
+      const pointers = await this.engine.executeRaw<{ completed_keys: ConnectorRetry[] }>(`SELECT completed_keys FROM op_checkpoints
+        WHERE op='managed-connector-retry' AND completed_keys->0->>'checkpointKey'=$1
+        AND completed_keys->0->>'principalId'=$2 AND completed_keys->0->>'principalKind'=$3`,
+      [this.checkpointKey, this.authority.writer.principal.id, this.authority.writer.principal.kind]);
+      this.retryApprovals = new Map(pointers.map(row => [row.completed_keys[0].baseRequestId, row.completed_keys[0].requestId]));
+    }
   }
-  private async recover(slug: string): Promise<void> {
-    await validateSyncAuthority(this.engine, this.authority, slug);
-    const [source] = await this.engine.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [this.sourceId]);
+  private async validate(engine: BrainEngine, slug: string): Promise<WorktreeBinding | null> {
+    await validateSyncAuthority(engine, this.authority, slug);
+    const [source] = await engine.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [this.sourceId]);
     if (!source || source.archived || source.incarnation !== this.source.incarnation ||
         source.local_path !== this.source.local_path || digest(source.config) !== digest(this.source.config)) {
       throw new OperationError('source_changed', 'The connector source changed during the sweep.');
     }
-    const binding = await getWorktreeBinding(this.engine, this.sourceId);
+    const binding = await getWorktreeBinding(engine, this.sourceId);
     if ((binding?.worktree_id ?? null) !== (this.binding?.worktree_id ?? null) ||
         String(binding?.owner_epoch) !== String(this.binding?.owner_epoch) ||
         connectorBindingRoot(this.sourceId, source, binding) !== this.canonicalRoot) {
       throw new OperationError('source_changed', 'The connector ownership changed during the sweep.');
     }
+    return binding;
+  }
+  private async retryBlocker(engine: BrainEngine): Promise<WriteRequest | undefined> {
+    const [row] = await engine.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
+      WHERE ((r.source_id=$1 OR r.worktree_id=$2::uuid) AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL))
+        OR EXISTS (SELECT 1 FROM persistence_effects e WHERE e.request_id=r.id AND e.recovery IS NOT NULL
+          AND (e.source_id=$1 OR e.worktree_id=$2::uuid)) ORDER BY r.sequence LIMIT 1`, [this.sourceId, this.binding?.worktree_id ?? null]);
+    return row;
+  }
+  private async authorizeRetryReceipt(engine: BrainEngine, row: WriteRequest): Promise<void> {
+    if (row.source_id !== this.sourceId || row.principal_kind !== this.authority.writer.principal.kind || row.principal_id !== this.authority.writer.principal.id) {
+      throw new OperationError('write_pending', 'Other accepted work must drain before connector retry approval.');
+    }
+    await authorizeStoredRequest(engine, row);
+  }
+  private async refuseRetryBlocker(engine: BrainEngine): Promise<void> {
+    const row = await this.retryBlocker(engine);
+    if (!row) return;
+    await this.authorizeRetryReceipt(engine, row);
+    const error = new OperationError(row.recovery || isTerminal(row) ? 'recovery_required' : 'write_pending',
+      'Accepted work must finish before connector retry approval.');
+    error.writeRequest = receiptFor(row);
+    error.writeError = row.recovery || isTerminal(row) ? 'recovery_required' : 'write_pending';
+    throw error;
+  }
+  private async recover(slug: string): Promise<void> {
+    const binding = await this.validate(this.engine, slug);
     if (!binding) return;
     const retained = () => this.engine.executeRaw<WriteRequest>(
       'SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND recovery IS NOT NULL ORDER BY sequence LIMIT 1', [binding.worktree_id]);
@@ -204,19 +259,70 @@ export class ManagedConnectorSync {
       sourcePath, noEmbed: this.noEmbed, noSchemaPack: this.noSchemaPack, checkpointKey: this.checkpointKey, checkpointBefore: this.checkpoint,
       ownerEpoch: this.binding ? String(this.binding.owner_epoch) : null, canonicalRoot: this.canonicalRoot,
       filePath: file?.path ?? null, fileBeforeHash: file?.expectedBeforeHash ?? null, ...extra };
-    const callerIntent = { ...intent, syncAuthority: undefined, newestContentAt: undefined };
+    const callerIntent = { ...intent, syncAuthority: undefined, newestContentAt: undefined,
+      ...(kind === 'managed_connector_checkpoint' ? { receipts: undefined } : {}) };
     const principal = this.authority.writer.principal;
-    const requestId = stableId({ principal, sourceId: this.sourceId, incarnation: this.source.incarnation, callerIntent });
-    let row = await getWriteRequest(this.engine, principal, requestId);
-    if (row) {
-      await authorizeStoredRequest(this.engine, row);
-      assertReplayIntent(row, intentDigest({ operation: 'submit_job', sourceId: this.sourceId, slug, callerIntent }));
-    } else {
-      row = await admitWrite(this.engine, { principal, requestId, operation: 'submit_job', sourceId: this.sourceId,
-        sourceIncarnation: this.source.incarnation, slug, pageId: snapshot?.page.id ?? null, callerIntent, intent,
-        authority: this.authority.writer, worktreeId: this.binding?.worktree_id, topologyGeneration: this.binding?.topology_generation });
+    const baseRequestId = stableId({ principal, sourceId: this.sourceId, incarnation: this.source.incarnation, callerIntent });
+    const admission = (retry?: ConnectorRetry) => {
+      const link = retry ? { retryBase: baseRequestId, retryOf: retry.retryOf, retryAttempt: retry.attempt } : {};
+      return { principal, requestId: retry?.requestId ?? baseRequestId, operation: 'submit_job', sourceId: this.sourceId,
+        sourceIncarnation: this.source.incarnation, slug, pageId: snapshot?.page.id ?? null, callerIntent: { ...callerIntent, ...link }, intent: { ...intent, ...link },
+        authority: this.authority.writer, worktreeId: this.binding?.worktree_id, topologyGeneration: this.binding?.topology_generation };
+    };
+    const selected = async (engine: BrainEngine) => {
+      const [pointer] = await engine.executeRaw<{ completed_keys: ConnectorRetry[] }>(
+        "SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector-retry' AND fingerprint=$1", [baseRequestId]);
+      const retry = pointer?.completed_keys[0];
+      const input = admission(retry);
+      const row = await getWriteRequest(engine, principal, input.requestId);
+      if (row) {
+        await authorizeStoredRequest(engine, row);
+        assertReplayIntent(row, intentDigest(input));
+      } else if (retry) throw new OperationError('storage_error', 'The approved connector retry receipt is unavailable.');
+      return { retry, input, row };
+    };
+    const mayRetry = (row: WriteRequest | null) => this.retryFailed && row && ['failed', 'conflict'].includes(row.state) &&
+      row.request_id === (this.retryApprovals.get(baseRequestId) ?? baseRequestId);
+    const prior = await selected(this.engine);
+    let row = prior.row;
+    if (mayRetry(row)) {
+      const lock = this.binding ? await acquireWorktree(this.binding, 1000) : null;
+      try {
+        if (this.binding && !lock) {
+          await this.refuseRetryBlocker(this.engine);
+          throw new OperationError('write_pending', 'The canonical owner is busy; retry approval has not changed.');
+        }
+        row = await this.engine.transaction(async tx => {
+          if (this.binding) await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [this.binding.worktree_id]);
+          await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [this.sourceId]);
+          await this.validate(tx, slug);
+          await authorizeWrite(tx, this.authority.writer, 'submit_job', slug, true);
+          const current = await selected(tx);
+          if (!current.row) throw new OperationError('storage_error', 'The failed connector receipt is unavailable.');
+          await authorizeStoredRequest(tx, current.row, true);
+          if (!mayRetry(current.row)) return current.row;
+          await this.refuseRetryBlocker(tx);
+          const [checkpoint] = await tx.executeRaw<{ completed_keys: unknown[] }>(
+            "SELECT completed_keys FROM op_checkpoints WHERE op='managed-connector' AND fingerprint=$1 FOR UPDATE", [this.checkpointKey]);
+          if (digest(checkpoint?.completed_keys ?? []) !== digest(this.checkpoint)) throw new OperationError('revision_conflict', 'The connector cursor changed before retry approval.');
+          const attempt = (current.retry?.attempt ?? 0) + 1;
+          const retry: ConnectorRetry = { checkpointKey: this.checkpointKey,
+            principalId: principal.id, principalKind: principal.kind, baseRequestId, retryOf: current.row.request_id, attempt,
+            requestId: stableId({ baseRequestId, retryOf: current.row.request_id, attempt }) };
+          const accepted = await admitWriteInTransaction(tx, admission(retry));
+          await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-connector-retry',$1,$2::text::jsonb)
+            ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()`, [baseRequestId, JSON.stringify([retry])]);
+          return accepted;
+        });
+      } catch (error) {
+        if (error instanceof OperationError) throw error;
+        throw new OperationError('storage_error', 'Connector retry approval could not be confirmed.',
+          'Repeat the same connector sync options; an admitted replacement keeps its existing request identity.');
+      } finally { await lock?.release(); }
+    } else if (!row) {
+      row = await admitWrite(this.engine, prior.input);
     }
-    row = await waitForWrite(this.engine, row, loadConfig() ?? { engine: this.engine.kind });
+    row = await waitForWrite(this.engine, row!, loadConfig() ?? { engine: this.engine.kind });
     writeResponse(row);
     if (kind !== 'managed_connector_checkpoint') this.receipts.push(row.id);
     return row;

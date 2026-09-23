@@ -556,8 +556,22 @@ not a Git cursor. A deliberately unbound API source uses reviewed
 `connector_database` DB-only authority; an existing bound source retains
 canonical file publication and physical-root fences. Activation/status expose
 that distinction, and neither mode invents a binding. Managed connector
-`--dry-run` and Git filtering/working-tree/code/failure-ledger options refuse
+`--dry-run`, `--skip-failed`, and Git filtering/working-tree/code options refuse
 before credentials or network access rather than pretending to preview.
+After repairing a terminal connector storage failure, explicitly run
+`gbrain sync --source <connector-source-id> --retry-failed` with the same options.
+Ordinary replay does not reopen a failed receipt. Explicit retry authorizes a
+new, linked attempt after current and originally accepted grants, source,
+canonical owner and idle state are checked. The old receipt stays immutable,
+including after receipt compaction. A durable retry pointer is committed with
+the new admission; repeated or restarted calls reuse its pending attempt rather
+than granting another one. Retry does not reset the API bookmark or bypass
+canonical-file drift checks, and both connector cursors and retry pointers
+survive generic checkpoint TTL cleanup. A newly failed replacement requires
+another explicit retry after inspecting and repairing its cause; cancelled
+receipts are not retry-approved. No connector API data is fetched before the
+source/owner and active-work preflight, although deriving exact matching input
+can require a normal API fetch before retry approval.
 For PGLite, `dream` and `jobs --follow` still need exclusive engine access:
 stop the resident owner and any supervisor using their normal shutdown path,
 wait for writes to drain, run the inline command, then restart the owner. The

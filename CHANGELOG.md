@@ -81,8 +81,10 @@ upgraded owner has reopened and the scoped readback checks pass.
   retired takes leave facts unconsolidated.
 - Google/GitHub connectors use guarded imports, deletion and checkpoint CAS.
   Unbound API sources explicitly publish to the database; bound sources retain
-  canonical file publication. Google embedding requests respect the 100-item
-  provider limit.
+  canonical file publication. Restarted sync recovers retained publication;
+  explicit `--retry-failed` replaces a failed attempt without changing its old
+  receipt or resetting the API bookmark. Google embedding requests respect the
+  100-item provider limit.
 - Fact reconciliation preserves valid existing vectors on failed embedding
   and cancellation while retaining privacy/withdrawal changes. Explicit
   null-vector backfill validates source, model, row version, selected-brain
