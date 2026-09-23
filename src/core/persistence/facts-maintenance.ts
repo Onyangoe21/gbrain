@@ -16,7 +16,7 @@ import { authorizeFactsBackstop } from './effect-facts.ts';
 import { admitWriteInTransaction, getWriteRequest, getWriteRequestById, receiptFor } from './journal.ts';
 import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
 import { digest, requireUuid, sha256 } from './digest.ts';
-import type { WriteAuthority, WriteRequest } from './model.ts';
+import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
 
 export interface ManagedFactsResult {
@@ -35,7 +35,30 @@ export interface ManagedFactIntent extends Record<string, unknown> {
 export interface ManagedFactsSession {
   authority: WriteAuthority; binding: WorktreeBinding | null; config: GBrainConfig;
   batchKey: string; inputDigest: string; origin: ManagedFactOrigin | null; originalRequestId: string | null;
+  completionRequestId: string;
   embedding?: FactEmbeddingSignature | null;
+}
+
+function managedFactRequestId(batchKey: string, slug: string): string {
+  const hex = digest([batchKey, slug]);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+async function validateManagedFactsCompletion(engine: BrainEngine, session: ManagedFactsSession, prior: WriteRequest): Promise<void> {
+  await authorizeStoredRequest(engine, prior);
+  const inputDigest = prior.intent?.inputDigest ?? prior.outcome?.input_digest;
+  if (prior.operation !== 'extract_facts' || prior.slug !== '__managed_facts_complete__'
+    || prior.source_id !== session.authority.sourceId || prior.source_incarnation !== session.authority.sourceIncarnation
+    || inputDigest !== undefined && inputDigest !== session.inputDigest) {
+    throw new OperationError('idempotency_conflict', 'This request ID already belongs to another operation or extraction input.');
+  }
+  if (prior.compacted && !prior.intent && isTerminal(prior) && prior.state !== 'committed') {
+    const error = new OperationError('facts_payload_expired', 'The accepted fact extraction failed and its retained payload has expired.',
+      'Inspect the original receipt. Any new extraction requires separate approval and a new request identity.');
+    error.writeRequest = receiptFor(prior);
+    throw error;
+  }
+  if (inputDigest !== session.inputDigest) throw new OperationError('idempotency_conflict', 'The retained fact request cannot verify this extraction input.');
 }
 
 export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: GBrainConfig,
@@ -141,16 +164,12 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
     model: ctx.model ?? null, filter: ctx.notabilityFilter ?? 'all' });
   const seed = ctx.persistenceRequestId ?? (ctx.requestId ? requireUuid(ctx.requestId) : inputDigest);
   const batchKey = digest(['managed-facts-v1', authority.principal, source.incarnation, seed]);
-  if (ctx.requestId) {
-    const prior = await getWriteRequest(engine, authority.principal, requireUuid(ctx.requestId));
-    if (prior) {
-      await authorizeStoredRequest(engine, prior);
-      if (prior.operation !== 'extract_facts' || prior.source_id !== ctx.sourceId ||
-        (prior.intent?.inputDigest ?? prior.outcome?.input_digest) !== inputDigest) throw new OperationError('idempotency_conflict', 'This request ID already belongs to another operation or extraction input.');
-    }
-  }
-  return { authority, binding: writeThrough ? binding : null, config: ctx.operationContext?.config ?? ctx.config ?? { engine: engine.kind } as GBrainConfig,
-    batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null };
+  const session: ManagedFactsSession = { authority, binding: writeThrough ? binding : null, config: ctx.operationContext?.config ?? ctx.config ?? { engine: engine.kind } as GBrainConfig,
+    batchKey, inputDigest, origin, originalRequestId: ctx.persistenceRequestId ?? null,
+    completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__') };
+  const prior = await getWriteRequest(engine, authority.principal, session.completionRequestId);
+  if (prior) await validateManagedFactsCompletion(engine, session, prior);
+  return session;
 }
 
 async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSession, rows: WriteRequest[]): Promise<ManagedFactsResult> {
@@ -175,10 +194,12 @@ async function collectManagedFacts(engine: BrainEngine, session: ManagedFactsSes
 export async function resumeManagedFacts(engine: BrainEngine, session: ManagedFactsSession): Promise<ManagedFactsResult | null> {
   const rows = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE operation='extract_facts'
     AND source_id=$1 AND source_incarnation=$2::uuid AND principal_kind=$3 AND principal_id=$4
-    AND COALESCE(intent->>'batchKey',outcome->>'batch_key')=$5 ORDER BY sequence`, [session.authority.sourceId, session.authority.sourceIncarnation,
-    session.authority.principal.kind, session.authority.principal.id, session.batchKey]);
+    AND (request_id=$6::uuid OR COALESCE(intent->>'batchKey',outcome->>'batch_key')=$5) ORDER BY sequence`, [session.authority.sourceId, session.authority.sourceIncarnation,
+    session.authority.principal.kind, session.authority.principal.id, session.batchKey, session.completionRequestId]);
   if (!rows.length) return null;
-  if (!rows.some(row => (row.intent?.kind ?? row.outcome?.kind) === 'managed_facts_complete')) throw new OperationError('storage_error', 'The accepted facts batch has no completion receipt.');
+  const completion = rows.find(row => row.request_id === session.completionRequestId);
+  if (!completion) throw new OperationError('storage_error', 'The accepted facts batch has no completion receipt.');
+  await validateManagedFactsCompletion(engine, session, completion);
   return collectManagedFacts(engine, session, rows);
 }
 
@@ -220,9 +241,7 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
       origin: session.origin, originalRequestId: session.originalRequestId, children } as ManagedFactIntent }]) {
       if (ctx.abortSignal?.aborted) throw new DOMException('Fact extraction was aborted before admission.', 'AbortError');
       await authorizePageVisibility(tx, session.authority, input.slug);
-      const hex = digest([session.batchKey, input.slug]);
-      const requestId = input.intent.kind === 'managed_facts_complete' && ctx.requestId ? requireUuid(ctx.requestId)
-        : `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+      const requestId = input.intent.kind === 'managed_facts_complete' ? session.completionRequestId : managedFactRequestId(session.batchKey, input.slug);
       const row = await admitWriteInTransaction(tx, { principal: session.authority.principal, authority: session.authority,
         operation: 'extract_facts', sourceId, sourceIncarnation: session.authority.sourceIncarnation,
         worktreeId: session.binding?.worktree_id, topologyGeneration: session.binding?.topology_generation,
