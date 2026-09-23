@@ -1,7 +1,8 @@
 import type { BrainEngine, NewFact } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { FactsBackstopCtx } from '../facts/backstop.ts';
-import { ENTITY_HINTS_CAP, type ExtractedFact } from '../facts/extract.ts';
+import { ENTITY_HINTS_CAP, type ExtractedFact, type FactEmbeddingSignature } from '../facts/extract.ts';
+import { readFactsEmbeddingDim } from '../embedding-dim-check.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { OperationError } from '../ops/contract.ts';
 import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
@@ -29,10 +30,42 @@ export interface ManagedFactIntent extends Record<string, unknown> {
   kind: 'managed_facts_entity' | 'managed_facts_complete';
   batchKey: string; inputDigest: string; origin: ManagedFactOrigin | null; originalRequestId: string | null;
   expected_revision?: string; facts?: FrozenExtractedFact[]; children?: string[];
+  embedding?: FactEmbeddingSignature | null;
 }
 export interface ManagedFactsSession {
   authority: WriteAuthority; binding: WorktreeBinding | null; config: GBrainConfig;
   batchKey: string; inputDigest: string; origin: ManagedFactOrigin | null; originalRequestId: string | null;
+  embedding?: FactEmbeddingSignature | null;
+}
+
+export async function resolveManagedFactsEmbedding(engine: BrainEngine, config: GBrainConfig,
+  lock = false): Promise<FactEmbeddingSignature | null> {
+  const rows = await engine.executeRaw<{ key: string; value: string }>(`SELECT key,value FROM config
+    WHERE key IN ('embedding_model','embedding_dimensions','embedding_disabled') ORDER BY key${lock ? ' FOR SHARE' : ''}`);
+  const values = Object.fromEntries(rows.map(row => [row.key, row.value]));
+  if (values.embedding_disabled !== undefined && values.embedding_disabled !== 'true' && values.embedding_disabled !== 'false') {
+    throw new OperationError('embedding_configuration', 'Selected brain embedding_disabled must be true or false.');
+  }
+  if (config.embedding_disabled || values.embedding_disabled === 'true') return null;
+  const model = values.embedding_model;
+  if (!model) return null;
+  const dimensions = /^[1-9]\d*$/.test(values.embedding_dimensions ?? '') ? Number(values.embedding_dimensions) : null;
+  if (!/^[^\s:]+:[^\s]+$/.test(model) || !dimensions || !Number.isSafeInteger(dimensions)) {
+    throw new OperationError('embedding_configuration', 'The selected brain has no verifiable facts embedding model and dimensions.');
+  }
+  const shape = await readFactsEmbeddingDim(engine);
+  if (!shape.exists || !shape.columnType || shape.dims !== dimensions) {
+    throw new OperationError('embedding_configuration', 'The selected brain facts embedding provenance does not match its vector column.');
+  }
+  return { model, dimensions };
+}
+
+export async function assertManagedFactsEmbedding(engine: BrainEngine, config: GBrainConfig,
+  expected: FactEmbeddingSignature | null | undefined, lock = false): Promise<void> {
+  const current = await resolveManagedFactsEmbedding(engine, config, lock);
+  if (!expected || !current || expected.model !== current.model || expected.dimensions !== current.dimensions) {
+    throw new OperationError('embedding_configuration', 'The selected brain facts embedding policy or model changed; retained vectors cannot be installed.');
+  }
 }
 
 export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
@@ -151,6 +184,8 @@ export async function resumeManagedFacts(engine: BrainEngine, session: ManagedFa
 
 export async function publishManagedFacts(engine: BrainEngine, session: ManagedFactsSession, ctx: FactsBackstopCtx,
   facts: ExtractedFact[], visibility: 'private' | 'world', pageSlug?: string): Promise<ManagedFactsResult> {
+  const embedded = facts.some(fact => fact.embedding !== null && fact.embedding !== undefined);
+  if (embedded) await assertManagedFactsEmbedding(engine, session.config, session.embedding);
   const sourceId = session.authority.sourceId;
   const groups = new Map<string, FrozenExtractedFact[]>();
   for (const fact of facts) {
@@ -173,9 +208,11 @@ export async function publishManagedFacts(engine: BrainEngine, session: ManagedF
     if (snapshot?.page.deleted_at || group.some(fact => fact.entity_slug !== null) && !snapshot) throw new OperationError('page_identity_changed', 'The resolved fact entity was removed.');
     inputs.push({ slug, pageId: snapshot?.page.id ?? null, intent: { kind: 'managed_facts_entity', batchKey: session.batchKey,
       inputDigest: session.inputDigest, origin: session.origin, originalRequestId: session.originalRequestId,
+      embedding: session.embedding ?? null,
       ...(snapshot ? { expected_revision: snapshot.revision } : {}), facts: group } });
   }
   const rows = await engine.transaction(async tx => {
+    if (embedded) await assertManagedFactsEmbedding(tx, session.config, session.embedding, true);
     const children: string[] = [];
     const accepted: WriteRequest[] = [];
     for (const input of [...inputs, { slug: '__managed_facts_complete__', pageId: null, intent: {

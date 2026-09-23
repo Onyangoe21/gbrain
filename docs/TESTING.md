@@ -228,8 +228,8 @@ owner is **not** proven delegated by the live fact-backfill IPC test.
 `test/facts-worker-config.test.ts` and its PostgreSQL E2E counterpart dispose
 the original consumer before executing a real facts-absorb job. They verify the
 worker passes trusted selected configuration, ignores job-supplied configuration
-and settles the entity-page effect without extra chunk embedding when disabled.
-The existing fact-extraction embedding behavior is outside that assertion.
+and settles the entity-page effect with zero fact or chunk embedding calls when
+disabled. Fact extraction still captures the generated fact with a NULL embedding.
 
 `test/managed-atoms-cli.slow.test.ts` exercises real disk-backed PGLite CLI
 recovery with a loopback provider: live-owner refusal, graceful owner stop,

@@ -14,7 +14,13 @@ import { writeFactsToFence } from '../src/core/facts/fence-write.ts';
 
 let engine: PGLiteEngine;
 beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 60_000);
-beforeEach(async () => { await disposePersistenceConsumer(engine); await resetPgliteState(engine); configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'test' } }); });
+beforeEach(async () => {
+  await disposePersistenceConsumer(engine);
+  await resetPgliteState(engine);
+  await engine.setConfig('embedding_model', 'openai:text-embedding-3-large');
+  await engine.setConfig('embedding_dimensions', '1536');
+  configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'test' } });
+});
 afterEach(() => { __setChatTransportForTests(null); __setEmbedTransportForTests(null); resetGateway(); });
 afterAll(async () => { await engine.disconnect(); });
 

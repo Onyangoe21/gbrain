@@ -44,6 +44,8 @@ import type { PageType } from '../types.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
 import type { GBrainConfig } from '../config.ts';
+import { isAvailable } from '../ai/gateway.ts';
+import { withAIInvocationPreflight } from '../ai/invocation-guard.ts';
 
 /**
  * Notability-filter vocabulary shared by the durable facts-absorb payload
@@ -565,11 +567,14 @@ async function runPipelineBodyInner(
   if (abortSignal?.aborted) {
     return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [] };
   }
-  const { prepareManagedFactsSession, resumeManagedFacts, publishManagedFacts } = await import('../persistence/facts-maintenance.ts');
+  const { prepareManagedFactsSession, resumeManagedFacts, publishManagedFacts, resolveManagedFactsEmbedding,
+    assertManagedFactsEmbedding } = await import('../persistence/facts-maintenance.ts');
   const managed = await prepareManagedFactsSession(ctx, input);
   if (managed) {
     const replay = await resumeManagedFacts(ctx.engine, managed);
     if (replay) return replay;
+    const embedding = await resolveManagedFactsEmbedding(ctx.engine, managed.config);
+    managed.embedding = embedding && isAvailable('embedding', embedding.model) ? embedding : null;
   }
 
   const filter = ctx.notabilityFilter ?? 'all';
@@ -585,7 +590,7 @@ async function runPipelineBodyInner(
     : filter === 'medium-and-up'
       ? { allowed: ['high', 'medium'] as const, invalid: 'drop' as const }
       : undefined;
-  const outcome = await extractFactsFromTurnWithOutcome({
+  const extract = () => extractFactsFromTurnWithOutcome({
     turnText: input.turnText,
     sessionId: ctx.sessionId,
     entityHints: ctx.entityHints,
@@ -595,7 +600,14 @@ async function runPipelineBodyInner(
     abortSignal,
     model: ctx.model,
     notabilityAdmission,
+    ...(managed ? { embedding: managed.embedding ?? null } : {}),
   });
+  const outcome = managed ? await withAIInvocationPreflight(async call => {
+    if (call.kind !== 'embedding') return;
+    abortSignal?.throwIfAborted();
+    await assertManagedFactsEmbedding(ctx.engine, managed.config, managed.embedding);
+    if (call.model !== managed.embedding!.model) throw new Error('Fact embedding provider does not match the selected brain.');
+  }, extract) : await extract();
 
   if (!outcome.ok) {
     // Transport-class failures PROPAGATE as a typed error: the queue-mode

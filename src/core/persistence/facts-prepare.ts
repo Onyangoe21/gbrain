@@ -13,6 +13,7 @@ import { preparePageMutation } from './page-prepare.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteRequest } from './model.ts';
 import type { ManagedFactIntent, FrozenExtractedFact } from './facts-maintenance.ts';
+import { assertManagedFactsEmbedding } from './facts-maintenance.ts';
 
 function thawFact(fact: FrozenExtractedFact): NewFact & { entity_slug: string | null; kind: NonNullable<NewFact['kind']>; visibility: NonNullable<NewFact['visibility']> } {
   return { ...fact, entity_slug: fact.entity_slug ?? null, kind: fact.kind ?? 'fact', visibility: fact.visibility ?? 'private',
@@ -26,7 +27,14 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
     || row.authority.slugPrefixes !== null || row.authority.restrictedNamespace || row.authority.delegated) {
     throw new OperationError('permission_denied', 'Unsupported fact extraction intent or confined authority.');
   }
-  const validate = async (tx: BrainEngine) => {
+  const embedded = p.facts?.some(fact => fact.embedding !== null && fact.embedding !== undefined);
+  const validate = async (tx: BrainEngine, lock = false) => {
+    if (embedded) {
+      await assertManagedFactsEmbedding(tx, config, p.embedding, lock);
+      if (p.facts!.some(fact => fact.embedding && (fact.embedding.length !== p.embedding!.dimensions || !fact.embedding.every(Number.isFinite)))) {
+        throw new OperationError('embedding_configuration', 'Retained fact vectors do not match their embedding signature.');
+      }
+    }
     if (p.originalRequestId) {
       const original = await getWriteRequestById(tx, p.originalRequestId);
       if (!original || original.state !== 'committed' || original.source_id !== row.source_id || original.source_incarnation !== row.source_incarnation
@@ -109,7 +117,7 @@ export async function prepareManagedFactsMutation(engine: BrainEngine, row: Writ
   }
   return { observedRevision: snapshot?.revision ?? null, file: page?.file, noop: entries.every(entry => entry.duplicateId !== null || entry.duplicateOf !== undefined),
     additionalPageKeys, validate: async tx => {
-      await validate(tx);
+      await validate(tx, true);
       await page?.validate?.(tx);
       for (const entry of entries) {
         await assertFactNotWithdrawn(tx, row.source_id, entry.fact);

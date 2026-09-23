@@ -76,7 +76,7 @@ export async function exerciseFactsWorkerConfig(engine: BrainEngine): Promise<vo
       await disposePersistenceConsumer(engine);
       expect(settled).toBe(true);
       expect(embeddedTexts.filter(text => text !== FACT)).toEqual([]);
-      expect(embeddedTexts.filter(text => text === FACT)).toHaveLength(1);
+      expect(embeddedTexts.filter(text => text === FACT)).toHaveLength(0);
       expect(consumer.config.embedding_disabled).toBe(true);
       expect(await engine.executeRaw("SELECT id FROM facts WHERE source_id=$1 AND fact=$2", [sourceId, FACT])).toHaveLength(1);
       const requests = await engine.executeRaw<{ principal_kind: string; principal_id: string }>("SELECT principal_kind,principal_id FROM persistence_requests WHERE source_id=$1 AND operation='extract_facts'", [sourceId]);
