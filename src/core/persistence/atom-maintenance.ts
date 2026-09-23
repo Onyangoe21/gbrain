@@ -65,16 +65,19 @@ export async function managedAtomSession(engine: BrainEngine, sourceId: string, 
   await authorizeWrite(engine, authority, 'put_page', 'atoms/preflight');
   const binding = await getWorktreeBinding(engine, sourceId);
   const root = source.local_path || (sourceId === 'default' ? await engine.getConfig('sync.repo_path') : null);
-  if (root && !binding) throw new OperationError('owner_unavailable', 'Atom maintenance requires the configured canonical owner.');
-  if (binding && (binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path)) {
+  const writeThrough = !/^(false|0|off|no)$/i.test(await engine.getConfig('sync.write_through') ?? 'true');
+  if (writeThrough && root && !binding) throw new OperationError('owner_unavailable', 'Atom maintenance requires the configured canonical owner.');
+  if (writeThrough && binding && (binding.owner_host_id !== localHostId() || binding.state !== 'active' || !binding.local_path)) {
     throw new OperationError('owner_unavailable', 'The canonical atom owner is unavailable; no extraction was started.');
   }
-  if (binding) {
+  if (writeThrough && binding) {
     const lock = await acquireWorktree(binding);
     if (!lock) throw new OperationError('writer_lock_unavailable', 'The canonical atom writer is busy; no extraction was started.');
     await lock.release();
   }
-  const session: ManagedAtomSession = { sourceId, incarnation: source.incarnation, authority, binding, config: { engine: engine.kind } as GBrainConfig };
+  if (!writeThrough) authority.databaseOnlyReason = 'disabled_by_config';
+  else if (!binding) authority.databaseOnlyReason = 'no_repo_configured';
+  const session: ManagedAtomSession = { sourceId, incarnation: source.incarnation, authority, binding: writeThrough ? binding : null, config: { engine: engine.kind } as GBrainConfig };
   if (retry) {
     if (!retry.retryId || retry.retryId.length > 128) throw new OperationError('invalid_params', 'A bounded explicit atom retry identity is required.');
     const prior = await getWriteRequest(engine, authority.principal, requireUuid(retry.requestId));
@@ -155,7 +158,7 @@ export async function resumeManagedAtoms(engine: BrainEngine, session: ManagedAt
 }
 
 export async function publishManagedAtoms(engine: BrainEngine, session: ManagedAtomSession, origin: AtomOrigin,
-  atoms: Array<{ slug: string; content: string; links: LinkBatchInput[] }>, failure?: string): Promise<WriteReceipt[]> {
+  atoms: Array<{ slug: string; content: string; links: LinkBatchInput[]; expectedTarget?: { pageId: number | null; revision: string | null } }>, failure?: string): Promise<WriteReceipt[]> {
   const key = runKey(session, origin);
   const inputs: Array<{ slug: string; pageId: number | null; intent: AtomIntent }> = [];
   for (const atom of atoms) {
@@ -165,9 +168,13 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
       (origin.kind === 'page' ? snapshot.page.frontmatter.source_slug !== origin.locator : snapshot.page.frontmatter.source_path !== origin.locator))) {
       throw new OperationError('page_identity_changed', 'The atom target belongs to another origin or was removed.');
     }
-    inputs.push({ slug: atom.slug, pageId: snapshot?.page.id ?? null, intent: { kind: 'managed_atom_page', runKey: key, origin,
+    const target = atom.expectedTarget ?? { pageId: snapshot?.page.id ?? null, revision: snapshot?.revision ?? null };
+    if ((snapshot?.page.id ?? null) !== target.pageId || (snapshot?.revision ?? null) !== target.revision) {
+      throw new OperationError('page_identity_changed', 'The reviewed atom retry target changed before admission.');
+    }
+    inputs.push({ slug: atom.slug, pageId: target.pageId, intent: { kind: 'managed_atom_page', runKey: key, origin,
       ...(session.retry ? { checkpointKey: session.retry.checkpointKey, expectedCheckpoint: session.retry.expectedCheckpoint } : {}),
-      ...(snapshot ? { expected_revision: snapshot.revision } : {}), content: atom.content, links: atom.links } as AtomIntent });
+      ...(target.revision ? { expected_revision: target.revision } : {}), content: atom.content, links: atom.links } as AtomIntent });
   }
   const rows = await engine.transaction(async tx => {
     const children: string[] = [];

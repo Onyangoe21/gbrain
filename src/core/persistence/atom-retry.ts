@@ -23,17 +23,19 @@ export async function retryManagedAtomBatch(engine: BrainEngine, sourceId: strin
     if (checkpoint && !checkpoint[0]?.failure) return { status: 'completed', replayed: true, model_rerun: false };
     const saved = retry.rows.filter(row => row.intent?.kind === 'managed_atom_page');
     if (saved.length) {
+      const atoms: Parameters<typeof publishManagedAtoms>[3] = [];
       for (const row of saved) {
+        const p = row.intent as AtomIntent;
         const target = await engine.readPageSnapshot(row.slug, { sourceId, includeDeleted: true });
-        if (row.state === 'committed' ? target?.revision !== row.outcome?.revision : (target?.page.id ?? null) !== row.page_id) {
+        const revision = row.state === 'committed' ? row.outcome?.revision : p.expected_revision ?? null;
+        if (typeof revision !== 'string' && (row.state === 'committed' || revision !== null)) throw new OperationError('storage_error', 'The retained atom publication revision is unavailable.');
+        const pageId = row.state === 'committed' ? row.page_id ?? target?.page.id ?? null : row.page_id;
+        if ((target?.page.id ?? null) !== pageId || (target?.revision ?? null) !== revision) {
           throw new OperationError('page_identity_changed', 'An atom target changed independently of the failed publication.');
         }
-      }
-      const atoms = saved.map(row => {
-        const p = row.intent as AtomIntent;
         if (typeof p.content !== 'string') throw new OperationError('storage_error', 'The retained atom publication content is unavailable.');
-        return { slug: row.slug, content: p.content, links: p.links ?? [] };
-      });
+        atoms.push({ slug: row.slug, content: p.content, links: p.links ?? [], expectedTarget: { pageId, revision } });
+      }
       const receipts = await publishManagedAtoms(engine, session, current, atoms);
       return { status: 'completed', model_rerun: false, write_requests: receipts };
     }
