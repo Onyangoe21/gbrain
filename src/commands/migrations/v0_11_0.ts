@@ -406,8 +406,6 @@ function phaseFInstall(opts: OrchestratorOpts): OrchestratorPhaseResult {
     execSync('gbrain autopilot --install --yes', { stdio: 'inherit', timeout: 60_000, env: process.env });
     return { name: 'install', status: 'complete' };
   } catch (e) {
-    // Install is best-effort — log but don't fail the whole migration. User
-    // can re-run `gbrain autopilot --install` manually.
     return { name: 'install', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
 }
@@ -452,7 +450,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   // Bug 3 — Phase G (record in completed.jsonl) moved to the runner. The
   // runner in apply-migrations.ts persists the result after orchestrator
   // returns, so we just decide the status here.
-  const status: 'complete' | 'partial' = (pending_host_work > 0) ? 'partial' : 'complete';
+  const status: 'complete' | 'partial' = pending_host_work > 0 || phases.some(p => p.status === 'failed') ? 'partial' : 'complete';
   phases.push({ name: 'record', status: opts.dryRun ? 'skipped' : 'complete', detail: `status=${status} (ledger write in runner)` });
 
   // Post-run: print pending-host-work summary if anything needs host action.

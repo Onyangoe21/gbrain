@@ -47,6 +47,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { throwIfAborted } from '../abort-check.ts';
@@ -458,7 +459,7 @@ export async function verifyAndRepairDreamPages(
   engine: BrainEngine,
   refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
   transcriptsByPath: Map<string, TranscriptForVerify>,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; maintenance?: MaintenanceAuthority | null } = {},
 ): Promise<QuoteVerifyStats> {
   const stats = emptyStats();
   // Dedupe defensively by (source, slug) and group by transcript.
@@ -488,11 +489,13 @@ export async function verifyAndRepairDreamPages(
 
     for (const ref of group) {
       throwIfAborted(opts.signal, '[dream] quote verify');
+      if (opts.maintenance && ref.source_id !== opts.maintenance.writer.sourceId) throw new Error('Maintenance output source changed.');
       try {
-        const page = await engine.getPage(ref.slug, { sourceId: ref.source_id });
+        const snapshot = opts.maintenance ? await engine.readPageSnapshot(ref.slug, { sourceId: ref.source_id }) : null;
+        const page = opts.maintenance ? snapshot?.page : await engine.getPage(ref.slug, { sourceId: ref.source_id });
         if (!page) { stats.errors++; continue; }
         stats.pages_checked++;
-        const tags = await engine.getTags(ref.slug, { sourceId: ref.source_id });
+        const tags = snapshot?.tags ?? await engine.getTags(ref.slug, { sourceId: ref.source_id });
         const md = serializePageToMarkdown(page, tags);
         const { fm, body } = splitFrontmatter(md);
         const r = repairBody(body, grounded);
@@ -509,7 +512,8 @@ export async function verifyAndRepairDreamPages(
           // noEmbed: the phase-end embed sweep backfills (oneshot deferEmbeds
           // parity). Provenance fields null → engine COALESCE keeps the
           // first-write record intact.
-          await importFromContent(engine, ref.slug, fm + r.body, {
+          if (opts.maintenance) await publishMaintenancePage(engine, opts.maintenance, ref.slug, fm + r.body, { expectedRevision: snapshot!.revision });
+          else await importFromContent(engine, ref.slug, fm + r.body, {
             noEmbed: true,
             remote: false,
             sourceId: ref.source_id,
@@ -517,6 +521,7 @@ export async function verifyAndRepairDreamPages(
           stats.pages_repaired++;
         }
       } catch (e) {
+        if (opts.maintenance) throw e;
         // Fail-open: a verify bug never kills the phase (pacer precedent) —
         // but a cooperative abort must still unwind.
         throwIfAborted(opts.signal, '[dream] quote verify');

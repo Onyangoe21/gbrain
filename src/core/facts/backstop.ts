@@ -41,6 +41,9 @@ import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
 import { isFactsBackstopEligible } from './eligibility.ts';
 import type { PageType } from '../types.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import type { WriteReceipt } from '../persistence/types.ts';
+import type { GBrainConfig } from '../config.ts';
 
 /**
  * Notability-filter vocabulary shared by the durable facts-absorb payload
@@ -57,6 +60,11 @@ export function coerceNotabilityFilter(v: unknown): FactNotabilityFilter {
 
 export interface FactsBackstopCtx {
   engine: BrainEngine;
+  config?: GBrainConfig;
+  operationContext?: OperationContext;
+  persistenceRequestId?: string;
+  requestId?: string;
+  requestIntent?: Record<string, unknown>;
   /** Brain source identifier; default 'default'. */
   sourceId: string;
   /** source_session for provenance; null if absent. */
@@ -115,6 +123,7 @@ export type FactsBackstopResult =
       duplicate: number;
       superseded: number;
       fact_ids: number[];
+      write_requests?: WriteReceipt[];
       skipped?: 'extraction_disabled' | 'extraction_unavailable' | `eligibility_failed:${string}`;
       /** Set when the LLM extraction step failed non-transport-fatally (see runPipelineWithBody). */
       skipped_reason?: import('./extract.ts').ExtractFailureReason;
@@ -268,6 +277,14 @@ export async function runFactsBackstop(
     return mode === 'queue'
       ? { mode: 'queue', enqueued: false, queueDepth: 0, skipped }
       : { mode: 'inline', inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped };
+  }
+  const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
+  if (await managedPersistenceEnabled(ctx.engine)) {
+    if (mode !== 'inline') {
+      const { OperationError } = await import('../ops/contract.ts');
+      throw new OperationError('writer_coordinator_required', 'Managed page backstops must use the durable publication outbox.');
+    }
+    return { mode: 'inline', ...await runPipeline(parsedPage, ctx, ctx.abortSignal) };
   }
 
   // --- Extraction availability gate (engine-aware, EXECUTION-process only) ---
@@ -448,6 +465,7 @@ export async function runFactsPipeline(
   entity_slugs: string[];
   /** Set when the LLM extraction step failed non-transport-fatally (see runPipelineWithBody). */
   skipped_reason?: import('./extract.ts').ExtractFailureReason;
+  write_requests?: WriteReceipt[];
 }> {
   return runPipelineWithBody({
     turnText,
@@ -547,6 +565,12 @@ async function runPipelineBodyInner(
   if (abortSignal?.aborted) {
     return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], entity_slugs: [] };
   }
+  const { prepareManagedFactsSession, resumeManagedFacts, publishManagedFacts } = await import('../persistence/facts-maintenance.ts');
+  const managed = await prepareManagedFactsSession(ctx, input);
+  if (managed) {
+    const replay = await resumeManagedFacts(ctx.engine, managed);
+    if (replay) return replay;
+  }
 
   const filter = ctx.notabilityFilter ?? 'all';
   // `all` means ALL TIERS — a pinned contract (test/facts-backstop.test.ts
@@ -601,6 +625,7 @@ async function runPipelineBodyInner(
   // facts.default_visibility (fail-closed to 'private').
   const { resolveDefaultVisibility } = await import('./visibility.ts');
   const visibility = ctx.visibility ?? (await resolveDefaultVisibility(ctx.engine));
+  if (managed) return publishManagedFacts(ctx.engine, managed, ctx, facts, visibility, input.pageSlug);
 
   let inserted = 0;
   let duplicate = 0;

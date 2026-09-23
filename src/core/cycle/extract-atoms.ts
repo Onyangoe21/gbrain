@@ -78,6 +78,9 @@ import { resolveTierDefault } from '../model-config.ts';
 import { isUndefinedTableError, warnOncePerProcess } from '../utils.ts';
 import { normalizeForGrounding } from './synthesize-verify.ts';
 import type { TranscriptPageIndex } from '../transcripts/discover.ts';
+import { managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, MANAGED_ATOM_DISCOVERY_SQL, type AtomOrigin } from '../persistence/atom-maintenance.ts';
+import { OperationError } from '../ops/contract.ts';
+import type { WriteReceipt } from '../persistence/types.ts';
 
 const DEFAULT_BUDGET_USD = 0.3;
 // #4529 + #4540: per-item extractor caps, overridable via
@@ -168,6 +171,7 @@ async function resolveExtractableTypes(): Promise<string[]> {
 }
 
 export interface ExtractAtomsOpts {
+  _managedRetry?: { requestId: string; retryId: string };
   brainDir?: string;
   sourceId?: string;
   dryRun?: boolean;
@@ -375,6 +379,7 @@ export async function discoverExtractablePages(
       ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
       AND length(COALESCE(p.compiled_truth, '')) >= $3
       AND COALESCE(p.frontmatter->>'atoms_scan_hash', '') <> substring(p.content_hash from 1 for 16)
+      ${MANAGED_ATOM_DISCOVERY_SQL}
       ${hasFilter ? "AND p.slug = ANY($5::text[])" : ''}
       AND NOT EXISTS (
         SELECT 1
@@ -382,6 +387,7 @@ export async function discoverExtractablePages(
         WHERE atom.type = 'atom'
           AND atom.source_id = $1
           AND atom.frontmatter->>'source_hash' = substring(p.content_hash from 1 for 16)
+          AND COALESCE(atom.frontmatter->>'managed_extraction', '') <> 'true'
           AND atom.deleted_at IS NULL
       )
     ORDER BY p.updated_at DESC
@@ -449,10 +455,12 @@ export async function countExtractAtomsBacklog(
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
            AND length(COALESCE(p.compiled_truth, '')) >= $3
            AND COALESCE(p.frontmatter->>'atoms_scan_hash', '') <> substring(p.content_hash from 1 for 16)
+           ${MANAGED_ATOM_DISCOVERY_SQL}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
              WHERE atom.type = 'atom' AND atom.source_id = $1
                AND atom.frontmatter->>'source_hash' = substring(p.content_hash from 1 for 16)
+               AND COALESCE(atom.frontmatter->>'managed_extraction', '') <> 'true'
                AND atom.deleted_at IS NULL
            )`
       : `SELECT COUNT(*) AS cnt FROM pages p
@@ -464,10 +472,12 @@ export async function countExtractAtomsBacklog(
            ${RAW_SOURCE_HOLDER_EXCLUSION_SQL}
            AND length(COALESCE(p.compiled_truth, '')) >= $2
            AND COALESCE(p.frontmatter->>'atoms_scan_hash', '') <> substring(p.content_hash from 1 for 16)
+           ${MANAGED_ATOM_DISCOVERY_SQL}
            AND NOT EXISTS (
              SELECT 1 FROM pages atom
              WHERE atom.type = 'atom' AND atom.source_id = p.source_id
                AND atom.frontmatter->>'source_hash' = substring(p.content_hash from 1 for 16)
+               AND COALESCE(atom.frontmatter->>'managed_extraction', '') <> 'true'
                AND atom.deleted_at IS NULL
            )`;
     const extractableTypes = await resolveExtractableTypes();
@@ -525,6 +535,7 @@ export async function atomsExistingForHashes(
         WHERE type = 'atom'
           AND source_id = $1
           AND deleted_at IS NULL
+          AND COALESCE(frontmatter->>'managed_extraction', '') <> 'true'
           AND frontmatter->>'source_hash' = ANY($2::text[])`,
       [sourceId, contentHash16s],
     );
@@ -635,6 +646,8 @@ export async function runPhaseExtractAtoms(
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
   const chat = opts._chat ?? gatewayChat;
+  const managed = opts.dryRun ? null : await managedAtomSession(engine, sourceId, opts._managedRetry);
+  const writeRequests: WriteReceipt[] = [];
 
   // 1a. Get transcripts (test seam OR production discovery).
   //     v0.41.2.1: config loader switched to loadConfigWithEngine() so the
@@ -1020,7 +1033,7 @@ export async function runPhaseExtractAtoms(
   async function recordItemFailureCount(
     item: { kind: string; slug?: string; filePath?: string; contentHash: string },
   ): Promise<number | null> {
-    if (opts.dryRun) return null;
+    if (opts.dryRun || managed) return null;
     const hash16 = item.contentHash.slice(0, 16);
     if (item.kind === 'transcript') {
       if (!item.filePath) return null;
@@ -1085,6 +1098,11 @@ export async function runPhaseExtractAtoms(
     // can split a surrogate pair at the boundary).
     const promptContent = truncateUtf8(item.content, maxInputChars);
     try {
+      const origin: AtomOrigin | null = managed ? await readAtomOrigin(engine, managed, item) : null;
+      if (managed && origin && await resumeManagedAtoms(engine, managed, origin)) {
+        duplicatesSkipped++;
+        continue;
+      }
       const result = await chat({
         model: extractModel,
         system: EXTRACT_PROMPT,
@@ -1113,6 +1131,7 @@ export async function runPhaseExtractAtoms(
       if (!parseOutcome.ok) {
         malformedOutputs++;
         hardFailureCount++;
+        if (managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
         const failCount = await recordItemFailureCount(item);
         failures.push({
           source: originLabel,
@@ -1157,7 +1176,8 @@ export async function runPhaseExtractAtoms(
         // row is (source_id, file_path, content_hash)-keyed, so editing the
         // file re-eligibilizes it — which is what makes the permanence safe.
         if (!opts.dryRun) {
-          if (item.kind === 'page') await stampAtomsScanHash(item);
+          if (managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, []));
+          else if (item.kind === 'page') await stampAtomsScanHash(item);
           else await stampTranscriptTombstone(item.filePath, item.contentHash);
         }
         if (item.kind === 'transcript') transcriptsProcessed++;
@@ -1177,6 +1197,7 @@ export async function runPhaseExtractAtoms(
         // deterministic slugs upsert instead of duplicating.
         const hash16 = item.contentHash.slice(0, 16);
         const importedSlugs: string[] = [];
+        const managedAtoms: Array<{ slug: string; content: string; links: LinkBatchInput[] }> = [];
         // #3961: provenance edges source-page → atom, accumulated during the
         // atom loop and flushed BEFORE the completion-receipt flip (see the
         // write below). Page-kind items only — transcripts are files, not
@@ -1234,7 +1255,8 @@ export async function runPhaseExtractAtoms(
               atom_type: atom.atom_type,
               ...originFrontmatter,
               // Provisional until the whole item's atoms persist (see above).
-              source_hash: `pending:${hash16}`,
+              source_hash: managed ? hash16 : `pending:${hash16}`,
+              ...(origin ? { visibility: origin.visibility, managed_extraction: true } : {}),
               ...quoteFields,
               ...(atom.lesson && { lesson: atom.lesson }),
               ...(atom.concepts && atom.concepts.length > 0 && { concepts: atom.concepts }),
@@ -1247,10 +1269,11 @@ export async function runPhaseExtractAtoms(
             '',
             { type: 'atom', title: atom.title, tags: [] },
           );
-          await importFromContent(engine, slug, md, {
-            sourceId,
-            noEmbed: !isAvailable('embedding'),
-          });
+          if (managed) managedAtoms.push({ slug, content: md, links: [] });
+          else await importFromContent(engine, slug, md, {
+              sourceId,
+              noEmbed: !isAvailable('embedding'),
+            });
           importedSlugs.push(slug);
           if (item.kind === 'page') {
             provenanceLinks.push({
@@ -1274,7 +1297,7 @@ export async function runPhaseExtractAtoms(
               });
             }
           }
-          totalAtomsExtracted++;
+          if (!managed) totalAtomsExtracted++;
         }
         // #3961: bank the provenance edges so `gbrain backlinks <source-page>`
         // and the graph surface atom lineage. ON CONFLICT-deduped by the
@@ -1285,6 +1308,11 @@ export async function runPhaseExtractAtoms(
         // completed page with no edges forever. A failure here throws to the
         // item catch: the provisional hashes keep the item discoverable and
         // the deterministic slugs make the retry converge.
+        if (managed && origin) {
+          for (const atom of managedAtoms) atom.links = provenanceLinks.filter(link => link.to_slug === atom.slug);
+          writeRequests.push(...await publishManagedAtoms(engine, managed, origin, managedAtoms));
+          totalAtomsExtracted += managedAtoms.length;
+        } else {
         if (provenanceLinks.length > 0) {
           await engine.addLinksBatch(provenanceLinks, { auditSite: 'cycle.extract_atoms.provenance' }); // gbrain-allow-direct-insert: atom-provenance edges derived from the extraction itself (no markdown body to reconcile from)
         }
@@ -1301,6 +1329,7 @@ export async function runPhaseExtractAtoms(
         if (item.kind === 'page') {
           await stampAtomsScanHash(item);
         }
+        }
       } else {
         totalAtomsExtracted += atoms.length; // count for dry-run reporting
       }
@@ -1310,6 +1339,7 @@ export async function runPhaseExtractAtoms(
       // Reporter rate-limits to ~1 line/sec; safe to tick every iter.
       opts.progress?.tick(1, `${totalAtomsExtracted} atoms / ${duplicatesSkipped} skipped`);
     } catch (err) {
+      if (err instanceof OperationError && err.writeRequest) writeRequests.push(err.writeRequest);
       if (err instanceof BudgetExhausted) {
         budgetExhausted = true;
         if (item.kind === 'transcript') transcriptsSkipped++;
@@ -1354,7 +1384,7 @@ export async function runPhaseExtractAtoms(
   // v0.42 Wave B2: write extract receipt + rollup row when the phase
   // actually extracted atoms. Both are best-effort per F-OUT-19 —
   // audit-trail / search-visibility surfaces don't block the phase result.
-  if (!opts.dryRun && totalAtomsExtracted > 0) {
+  if (!opts.dryRun && !managed && totalAtomsExtracted > 0) {
     const runId = `atoms-${Date.now().toString(36)}-${sourceId.slice(0, 4)}`;
     try {
       await writeReceipt(engine, {
@@ -1420,6 +1450,7 @@ export async function runPhaseExtractAtoms(
       pages_skipped_budget: pagesSkipped,
       duplicates_skipped: duplicatesSkipped,
       failures,
+      ...(managed ? { write_requests: writeRequests } : {}),
       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
       malformed_outputs: malformedOutputs,
       tombstoned_for_failures: tombstonedForFailures,
