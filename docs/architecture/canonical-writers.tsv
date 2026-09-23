@@ -33,6 +33,7 @@ src/core/company-brain/profile.ts	1	engine_guard	Company-profile legacy deletes 
 src/core/company-brain/runtime.ts	1	projection	Only source policy metadata advances under the company-source lock and brain/source row locks; the same transaction validates immutable approval and creates a receipt with source-incarnation and managed owner/topology fences, without source-file writes.
 src/core/cycle/drift.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/extract-atoms.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
+src/core/cycle/extract-atoms-page-state.ts	1	engine_guard	Atom completion updates and cardinality checks share one transaction; managed canonical SQL remains fenced and scan/failure bookkeeping is stored separately.
 src/core/cycle/extract-facts.ts	2	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/extract-takes.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/grade-takes.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.

@@ -1206,7 +1206,7 @@ deferred M-effort issues above are NOT repeated here.
   test/skillpack-harness-bridge.test.ts (get_skill ∉ STARTER_OPS) and the
   warn text in src/commands/skillpack/harness.ts must move with it. **Why:**
   the biggest single unlock for cold-pull stubs. **Effort:** S (decision) +
-  S (change). **Priority:** P2. Completed in v0.52.2.0: starter includes
+  S (change). **Priority:** P2. Completed in v0.52.3.0: starter includes
   authorized shared discovery, assets, and own-principal membership; publication
   gates and explicit capabilities still apply. The verbs surface is unchanged.
 - [ ] **P3 — duplicate-skill-name coexistence doctor check.** **What:** a
@@ -4053,7 +4053,7 @@ deliberately scoped out of the wave (see plan + GSTACK REVIEW REPORT at
 - [ ] **#1569-followup: root-cause the 56K-file sync wedge with the reporter's repro.** v0.41.37.0 shipped ReDoS hardening (input-length cap + star-height lint + `--no-schema-pack` escape) + diagnostics (`GBRAIN_SYNC_TRACE=1` begin-heartbeat + PGLite serve/sync concurrency doc), but did NOT root-cause the deterministic wedge at ~3100 files — the reporter's redos-guard hypothesis didn't hold (it's not on the sync path). Get the reporter's sample files (`/tmp/gbrain-hang-sample.txt`, `/tmp/gbrain-prewedge-sample.txt`), reproduce, and pin the resume-mode deep-recursion pre-import phase (prime suspect: the walk/diff/checkpoint path). Priority: P1 once a repro exists; tracked on the #1569 thread.
 ## MCP skillpack distribution — PR2 (v0.41.37+)
 
-Shared-brain distribution is implemented in v0.52.2.0 through source-qualified
+Shared-brain distribution is implemented in v0.52.3.0 through source-qualified
 sealed revisions, approved `get_skill_asset` delivery, and enrolled local caches.
 This subsumes the shared-brain catalog/bundle use case without an archive endpoint.
 The older third-party tarball installation and host-global merge proposals below

@@ -4,15 +4,32 @@ import type { SyncOpts, SyncResult } from '../../commands/sync.ts';
 import { loadConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
 import { currentJobSignal } from '../minions/submission-authority.ts';
-import { digest } from './digest.ts';
-import { getWriteRequest, admitWrite } from './journal.ts';
+import { digest, sha256 } from './digest.ts';
+import { getWriteRequest, admitWrite, receiptFor } from './journal.ts';
 import { assertPersistenceAccepting, foregroundWriteCompletions, startPersistenceConsumer, waitForWrite } from './service.ts';
-import { discoverManagedSync, resolveManagedSyncContext, readSyncContent, syncRawHash, type SyncDiscovery } from './sync-discovery.ts';
+import { discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncRawHash, type SyncDiscovery } from './sync-discovery.ts';
 import { managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, type SyncAuthority } from './sync-authority.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
 import { readCommittedBlob } from '../company-brain/revision.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
+import { recordFailures, clearFailures } from '../sync-failure-ledger.ts';
+import { writeFailureDiagnostic } from './verb-errors.ts';
+import { isTerminalWriteState, publicWriteReceipt, type WriteReceipt } from './types.ts';
+import type { WriteRequest } from './model.ts';
+
+export interface ManagedSyncWriteDiagnostic {
+  source_id: string;
+  slug: string;
+  path: string | null;
+  write_error: string;
+  reason: string;
+  message: string;
+  suggestion: string;
+  write_request: WriteReceipt;
+  line_endings?: 'crlf_lf_only';
+  ledger_recorded?: boolean;
+}
 
 interface Pending { requestId: string; slug: string; pageId: number | null; intent: SyncIntent; }
 interface Cursor extends SyncDiscovery { runId: string; index: number; authority: SyncAuthority; pending?: Pending; done?: boolean; companyReceiptId?: string;
@@ -53,6 +70,31 @@ function result(cursor: Cursor, status: SyncResult['status'], reason?: SyncResul
   return { status, fromCommit: cursor.from, toCommit: cursor.target, added: cursor.counts.added, modified: cursor.counts.modified,
     deleted: cursor.counts.deleted, renamed: 0, chunksCreated: cursor.counts.chunks, embedded: 0, pagesAffected: [],
     filesImported: cursor.index, bankedFiles: cursor.index, ...(cursor.uncommitted ? { uncommitted: cursor.uncommitted } : {}), ...(reason ? { reason } : {}) };
+}
+function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): ManagedSyncWriteDiagnostic {
+  const terminal = isTerminalWriteState(row.state);
+  const code = terminal ? row.error_code ?? (row.state === 'cancelled' ? 'cancelled' : 'storage_error') : 'write_pending';
+  const blockedReason = ['writer_busy', 'writer_pool_capacity', 'owner_unavailable', 'recovery_required', 'writer_lock_unavailable',
+    'database_contention', 'consumer_stopping', 'revision_changed_repreparing'].includes(row.blocked_reason ?? '') ? row.blocked_reason! : 'write_pending';
+  const detail = terminal ? writeFailureDiagnostic(code, row.error_message) : {
+    reason: blockedReason, message: 'The write is accepted but not committed; the sync checkpoint has not advanced.',
+    suggestion: 'Re-run the same sync options to resume this request. Do not submit a replacement request or skip the pending write.',
+  };
+  const diagnostic: ManagedSyncWriteDiagnostic = { source_id: cursor.sourceId, slug: pending.slug,
+    path: pending.intent.path, write_error: code, ...detail, write_request: publicWriteReceipt(receiptFor(row)) };
+  if (terminal) diagnostic.suggestion += ' After repair, run gbrain sync with the same source/options and --retry-failed to start a new request. Without --retry-failed, the frozen terminal request returns the same outcome. --skip-failed cannot bypass a managed write.';
+  if (diagnostic.reason === 'pinned_git_worktree_conflict' && pending.intent.path && pending.intent.content !== null) {
+    try {
+      const bytes = readSyncFile(cursor.root, pending.intent.path);
+      if (bytes && sha256(bytes) === pending.intent.rawHash && sha256(bytes) !== sha256(pending.intent.content)
+        && bytes.equals(Buffer.from(bytes.toString('utf8')))
+        && bytes.toString('utf8').replace(/\r\n/g, '\n') === pending.intent.content.replace(/\r\n/g, '\n')) {
+        diagnostic.line_endings = 'crlf_lf_only';
+        diagnostic.message += ' The frozen working-tree and Git versions differ only by CRLF/LF line endings; exact byte protection still applies.';
+      }
+    } catch {}
+  }
+  return diagnostic;
 }
 async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string): Promise<Pending> {
   const entry = cursor.entries[cursor.index];
@@ -169,11 +211,19 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
       principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: pending.intent, intent: pending.intent });
     await validateSyncAuthority(engine, cursor.authority, pending.slug);
     const done = await waitForWrite(engine, row, config, 5000);
-    if (!['committed','failed','conflict','cancelled'].includes(done.state)) return result(cursor, 'partial', 'writer_pending');
+    if (!isTerminalWriteState(done.state)) return { ...result(cursor, 'partial', 'writer_pending'), managedWrite: writeDiagnostic(cursor, pending, done) };
     if (done.state !== 'committed') {
+      const diagnostic = writeDiagnostic(cursor, pending, done);
+      try {
+        recordFailures(cursor.sourceId, [{ path: pending.intent.path ?? '<checkpoint>',
+          error: `${diagnostic.write_error}: ${diagnostic.message} Request: ${done.request_id}` }], cursor.target);
+        diagnostic.ledger_recorded = true;
+      } catch { diagnostic.ledger_recorded = false; }
       return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1,
-        failureCodes: [{ code: done.error_code ?? 'storage_error', count: 1 }] };
+        failureCodes: [{ code: diagnostic.write_error, count: 1 }], managedWrite: diagnostic };
     }
+    try { clearFailures(cursor.sourceId, [pending.intent.path ?? '<checkpoint>']); }
+    catch { console.warn('[sync-failures] Could not clear the local ledger; the durable write receipt is committed.'); }
     if (pending.intent.kind === 'managed_sync_checkpoint') {
       cursor = (await readCursor(engine, key))!;
       if (!cursor?.done) throw new OperationError('storage_error', 'Committed sync checkpoint lost its cursor.');

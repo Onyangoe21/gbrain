@@ -46,6 +46,9 @@ test('shared administration never partially activates an unreviewed base protoco
   await engine.executeRaw("UPDATE sources SET local_path=$1 WHERE id='default'", [root]);
   await claimWorktree(engine, 'default', root);
   const state = await writerAdminState(engine);
+  const preview = await runPersistenceAdministration(engine, 'writer_activate', { shared_skills: true, confirm_quiesced: true, dry_run: true });
+  expect(preview.drift_audit).toMatchObject({ snapshot_only: true });
+  expect(await writerAdminState(engine)).toBe(state);
   await expect(runPersistenceAdministration(engine, 'writer_activate', { shared_skills: true, confirm_quiesced: true,
     admin_intent: 'writer_activate', expected_state: state })).rejects.toMatchObject({ code: 'writer_registration_required' });
   expect(await writerAdminState(engine)).toBe(state);

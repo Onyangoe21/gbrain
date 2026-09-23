@@ -59,7 +59,7 @@ export async function importManagedFile(engine: BrainEngine, filePath: string, s
     params = (await readPending())!;
   }
   try {
-    const outcome = await submitPageMutation(ctx, { operation: 'put_page', params, waitMs: 30_000 });
+    const outcome = await submitPageMutation(ctx, { operation: 'put_page', params, waitMs: 30_000, managedFileImport: true });
     await engine.executeRaw('DELETE FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb', [op, key, JSON.stringify([params])]);
     return { slug: String(outcome.slug), status: outcome.status as ImportResult['status'], chunks: Number(outcome.chunks ?? 0),
       ...(typeof outcome.error === 'string' ? { error: outcome.error } : {}),

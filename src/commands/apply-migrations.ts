@@ -99,7 +99,7 @@ Usage:
   gbrain apply-migrations --dry-run      Print the plan; take no action.
   gbrain apply-migrations --dry-run --json
                                         Include read-only content inventories and conflicts.
-  gbrain apply-migrations --migration 0.52.2 --export-db-only --content-root <path>
+  gbrain apply-migrations --migration 0.52.3 --export-db-only --content-root <path>
     [--export-source <id>] --dry-run --json
                                         Preview a lossless host-side DB-only content export.
     --confirm-quiesced                   Attest old writers and skill servers are stopped.

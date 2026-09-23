@@ -1,6 +1,6 @@
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
-import { activatePersistence } from './activation.ts';
+import { activatePersistence, type ActivationReport } from './activation.ts';
 import { existingLocalHostId, localHostId } from './identity.ts';
 import { acquireWorktree, getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
 import type { NativeLockHandle } from './native-lock.ts';
@@ -9,7 +9,7 @@ import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from '.
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 
 export async function activateSharedSkillPersistence(engine: BrainEngine,
-  options: { confirmQuiesced?: boolean; dryRun?: boolean; expectedState?: string } = {}): Promise<{ activated: boolean; protocol_version: 2; filesystem_sources: number }> {
+  options: { confirmQuiesced?: boolean; dryRun?: boolean; expectedState?: string } = {}): Promise<{ activated: boolean; protocol_version: 2; filesystem_sources: number; drift_audit?: ActivationReport['drift_audit'] }> {
   const quiescence = () => new OperationError('writer_not_quiesced',
     'Stop and exclude older canonical writers and direct-file skill servers before enabling shared skill publication.',
     'Run this activation on every canonical owner only after verifying process shutdown and canonical-root write access.');
@@ -54,7 +54,8 @@ export async function activateSharedSkillPersistence(engine: BrainEngine,
         || (await tx.executeRaw('SELECT id FROM gbrain_cycle_locks LIMIT 1')).length
         || (await tx.executeRaw("SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1")).length
         || (await tx.executeRaw("SELECT id FROM persistence_effects WHERE state IN ('queued','running') OR recovery IS NOT NULL LIMIT 1")).length) throw quiescence();
-      if (options.dryRun) return { activated: false, protocol_version: 2, filesystem_sources: current.length };
+      if (options.dryRun) return { activated: false, protocol_version: 2, filesystem_sources: current.length,
+        ...(base.drift_audit ? { drift_audit: base.drift_audit } : {}) };
       for (const binding of current) await tx.executeRaw(`INSERT INTO persistence_writer_protocols(worktree_id,host_id,owner_epoch,protocol_version)
         VALUES($1::uuid,$2::uuid,$3,2) ON CONFLICT(worktree_id,host_id) DO UPDATE SET
         owner_epoch=excluded.owner_epoch,protocol_version=2,registered_at=now()`, [binding.worktree_id, hostId, binding.owner_epoch]);
