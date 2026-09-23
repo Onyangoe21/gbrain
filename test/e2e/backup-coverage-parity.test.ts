@@ -7,6 +7,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { computeBackupCoverage } from '../../src/core/backup/coverage.ts';
 import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
+import { makeGitFixture } from '../helpers/git-fixture.ts';
 
 (hasDatabase() ? describe : describe.skip)('backup remote evidence across isolated engines', () => {
   let temporary: string;
@@ -23,7 +24,8 @@ import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
     remote = join(temporary, 'origin.git');
     mkdirSync(root);
     const git = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { stdio: 'pipe' });
-    git('init', '-b', 'main');
+    await makeGitFixture(root);
+    git('branch', '-M', 'main');
     writeFileSync(join(root, 'memory.md'), '# Source fixture\n');
     git('add', '.'); git('commit', '-m', 'fixture');
     git('init', '--bare', '-b', 'main', remote);

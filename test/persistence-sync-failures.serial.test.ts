@@ -8,6 +8,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
@@ -33,7 +34,7 @@ const git = (root: string, ...args: string[]) => execFileSync('git', ['-C', root
 function commit(root: string) { git(root, 'add', '.'); git(root, 'commit', '-qm', 'fixture content'); return git(root, 'rev-parse', 'HEAD'); }
 async function fixture(engine: BrainEngine, files: Record<string, string>) {
   const id = `sync-${randomUUID().replace(/-/g, '').slice(0, 20)}`, root = join(home, id);
-  mkdirSync(root); git(root, 'init', '-q');
+  mkdirSync(root); await makeGitFixture(root);
   for (const [path, text] of Object.entries(files)) writeFileSync(join(root, path), text);
   const head = commit(root);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');

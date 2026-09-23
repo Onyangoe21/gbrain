@@ -15,14 +15,14 @@ import { PHYSICAL_ROOT_MARKER } from '../src/core/persistence/physical-root-reco
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { reviewedWriterIntent } from './helpers/writer-admin-intent.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 for (const kind of ['pglite', 'postgres'] as const) describe.skipIf(kind === 'postgres' && !process.env.DATABASE_URL)(`deliberate onboarding (${kind})`, () => {
   let engine: BrainEngine, close: (() => Promise<void>) | undefined;
   const home = mkdtempSync(join(tmpdir(), 'gbrain-onboarding-')), root = join(home, 'canonical');
   beforeAll(async () => {
     mkdirSync(root);
-    execFileSync('git', ['init', '-q', root]);
-    execFileSync('git', ['-C', root, 'commit', '--allow-empty', '-qm', 'Initialize isolated onboarding fixture']);
+    await makeGitFixture(root);
     if (kind === 'postgres') ({ engine, close } = await isolatedPersistencePostgres(process.env.DATABASE_URL!));
     else { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }
   }, 120_000);

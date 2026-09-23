@@ -10,6 +10,7 @@ import { __setBackupStatusPathForTests, loadBackupStatus, saveBackupStatus } fro
 import { checkBackupCoverage } from '../src/commands/doctor/checks/backup-coverage.ts';
 import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, BACKUP_REMOTE_BUDGET_MS, BACKUP_REMOTE_TIMEOUT_MS } from '../src/core/backup/repository.ts';
+import { makeGitFixture } from './helpers/git-fixture.ts';
 
 let tmp: string;
 let oldHome: string | undefined;
@@ -32,11 +33,12 @@ afterEach(() => {
 function git(root: string, ...args: string[]): string {
   return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
-function repository(name = 'source') {
+async function repository(name = 'source') {
   const root = join(tmp, name);
   const remote = join(tmp, `${name}.git`);
   mkdirSync(root);
-  git(root, 'init', '-b', 'main');
+  await makeGitFixture(root);
+  git(root, 'branch', '-M', 'main');
   writeFileSync(join(root, 'note.md'), '# Fixture memory\n');
   git(root, 'add', '.');
   git(root, 'commit', '-m', 'fixture');
@@ -54,7 +56,7 @@ function engine(roots: string[]): BrainEngine {
 }
 
 test('a deleted remote cannot be verified by a surviving tracking ref', async () => {
-  const { root, remote } = repository();
+  const { root, remote } = await repository();
   rmSync(remote, { recursive: true });
   expect(git(root, 'rev-parse', 'origin/main')).toBe(git(root, 'rev-parse', 'HEAD'));
   const result = await computeBackupCoverage(engine([root]), verified);
@@ -65,7 +67,7 @@ test('a deleted remote cannot be verified by a surviving tracking ref', async ()
 });
 
 test('only a clean matching remote commit is verified, and git never covers the full database', async () => {
-  const { root } = repository();
+  const { root } = await repository();
   const result = await computeBackupCoverage(engine([root]), verified);
   expect(result.overall).toBe('ok');
   expect(result.totals.recoverable_repos).toBe(1);
@@ -74,7 +76,7 @@ test('only a clean matching remote commit is verified, and git never covers the 
 });
 
 test('a removed remote branch and a changed remote commit invalidate local tracking evidence', async () => {
-  const { root, remote } = repository();
+  const { root, remote } = await repository();
   git(remote, 'update-ref', '-d', 'refs/heads/main');
   let result = await computeBackupCoverage(engine([root]), verified);
   expect(result.totals.recoverable_repos).toBe(0);
@@ -89,7 +91,7 @@ test('a removed remote branch and a changed remote commit invalidate local track
 });
 
 test('unpushed, dirty and failed-push states are never fully recoverable', async () => {
-  const { root } = repository();
+  const { root } = await repository();
   git(root, 'commit', '--allow-empty', '-m', 'not pushed');
   let result = await computeBackupCoverage(engine([root]), verified);
   expect(result.overall).toBe('warn');
@@ -112,7 +114,7 @@ test('unpushed, dirty and failed-push states are never fully recoverable', async
 });
 
 test('local-only checks cannot certify a configured remote', async () => {
-  const { root } = repository();
+  const { root } = await repository();
   const result = await computeBackupCoverage(engine([root]), { localGitProbes: true, now });
   expect(result.totals.configured_repos).toBe(1);
   expect(result.totals.recoverable_repos).toBe(0);
@@ -120,7 +122,7 @@ test('local-only checks cannot certify a configured remote', async () => {
 });
 
 test('remote doctor reads aggregate cache only and downgrades expired evidence', async () => {
-  const { root } = repository();
+  const { root } = await repository();
   saveBackupStatus(await computeBackupCoverage(engine([root]), verified));
   const untouched = new Proxy({}, { get: () => { throw new Error('remote accessed the engine'); } }) as BrainEngine;
   const check = await checkBackupCoverage(untouched, { now: new Date(now.getTime() + 2 * 60 * 60 * 1000) });
@@ -132,7 +134,7 @@ test('remote doctor reads aggregate cache only and downgrades expired evidence',
 });
 
 test('failed refresh cannot silently reuse verified cache as a fresh success', async () => {
-  const { root } = repository();
+  const { root } = await repository();
   await getBackupStatus(engine([root]), { ...verified, forceRefresh: true });
   const before = readFileSync(join(tmp, 'status.json'), 'utf8');
   const down = { kind: 'pglite', executeRaw: async () => { throw new Error('offline'); } } as unknown as BrainEngine;
@@ -144,7 +146,7 @@ test('failed refresh cannot silently reuse verified cache as a fresh success', a
 });
 
 test('remote-ref readback is capped, cached, and never performed for untrusted or background readers', async () => {
-  const roots = Array.from({ length: BACKUP_REMOTE_PROBE_CAP + 2 }, (_, i) => repository(`source-${i}`).root);
+  const roots = await Promise.all(Array.from({ length: BACKUP_REMOTE_PROBE_CAP + 2 }, async (_, i) => (await repository(`source-${i}`)).root));
   const run = childProcess.execFile;
   const commands: string[][] = [];
   const probe = spyOn(childProcess, 'execFile').mockImplementation(((file: string, args: string[], options: unknown, callback: unknown) => {
@@ -167,7 +169,7 @@ test('remote-ref readback is capped, cached, and never performed for untrusted o
 });
 
 test('timeouts spend a sweep-wide deadline, return no credentials, and never verify offline remotes', async () => {
-  const roots = Array.from({ length: 5 }, (_, i) => repository(`offline-${i}`).root);
+  const roots = await Promise.all(Array.from({ length: 5 }, async (_, i) => (await repository(`offline-${i}`)).root));
   const timeouts: number[] = [];
   const probe = spyOn(childProcess, 'execFile').mockImplementation(((file: string, args: string[], options: { timeout: number }, callback: Function) => {
     timeouts.push(options.timeout);
@@ -189,7 +191,7 @@ test('timeouts spend a sweep-wide deadline, return no credentials, and never ver
 }, 15_000);
 
 test('a fresh aggregate cache never exposes commit or source identities to MCP', async () => {
-  const { root } = repository();
+  const { root } = await repository();
   await getBackupStatus(engine([root]), verified);
   const check = await checkBackupCoverage(engine([root]), { now });
   expect(check.status).toBe('ok');
@@ -199,7 +201,7 @@ test('a fresh aggregate cache never exposes commit or source identities to MCP',
 });
 
 test('fresh remote evidence supersedes a historical failed push but a new mismatch does not', async () => {
-  const { root, remote } = repository();
+  const { root, remote } = await repository();
   const statusPath = pushStatusPathForRoot(root);
   mkdirSync(join(statusPath, '..'), { recursive: true });
   writeFileSync(statusPath, JSON.stringify({ ok: false, reason: 'https://fixture-user:fixture-password@example.invalid/private', ts: now.toISOString(), repoRoot: root }));
@@ -222,7 +224,7 @@ test('fresh remote evidence supersedes a historical failed push but a new mismat
 });
 
 test('successive bounded checks prioritize pending roots and retain identity-bound fresh evidence', async () => {
-  const roots = Array.from({ length: BACKUP_REMOTE_PROBE_CAP + 2 }, (_, i) => repository(`rotate-${i}`).root);
+  const roots = await Promise.all(Array.from({ length: BACKUP_REMOTE_PROBE_CAP + 2 }, async (_, i) => (await repository(`rotate-${i}`)).root));
   const run = childProcess.execFile;
   const commands: string[][] = [];
   const probe = spyOn(childProcess, 'execFile').mockImplementation(((file: string, args: string[], options: unknown, callback: unknown) => {
@@ -255,7 +257,7 @@ test('successive bounded checks prioritize pending roots and retain identity-bou
 
 test('retained evidence is invalidated by local identity, source, commit, remote, push and clock changes', async () => {
   for (const change of ['head', 'branch', 'origin', 'replacement', 'dirty', 'push', 'source', 'future', 'stale']) {
-    const { root, remote } = repository(`identity-${change}`);
+    const { root, remote } = await repository(`identity-${change}`);
     const first = await assessBackupRepository(root, 'source_repo', 'source-id', now, { remaining: 1 });
     const retained = await assessBackupRepository(root, 'source_repo', 'source-id', now, undefined, first);
     expect(retained.verification?.state).toBe('verified');
