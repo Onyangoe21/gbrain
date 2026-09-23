@@ -1,4 +1,5 @@
-import { maintenancePreflight, publishMaintenancePage, stampMaintenancePage, verifyMaintenanceOutputs, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { postprocessManagedSynthesis } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -1063,7 +1064,7 @@ async function runPhaseSynthesizeInner(
     // rescued/passed transcript whose child declined to write (task D) is
     // distinguishable from a triage miss in the phase telemetry.
     const jobsWithPages = new Set<number>();
-    const writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages);
+    let writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages);
 
     // F1b/F4b: mechanical quote verify/repair on this phase's newly-created
     // pages, BEFORE the provenance stamp / reverse-write / embed sweep so the
@@ -1071,27 +1072,27 @@ async function runPhaseSynthesizeInner(
     // repaired body. Fail-open (abort still unwinds); kill switch:
     // dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
-    if (config.quoteVerify && writtenRefs.length > 0) {
+    if (maintenance) {
+      const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
+        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, signal: opts.signal });
+      writtenRefs = processed.writtenRefs;
+      quoteVerifyStats = config.quoteVerify ? processed.stats : null;
+    } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(
         worthProcessing.map(t => [t.filePath, { content: t.content, hash6: t.contentHash.slice(0, 6) }]),
       );
       try {
-        quoteVerifyStats = await verifyAndRepairDreamPages(engine, writtenRefs, transcriptsForVerify, { signal: opts.signal, maintenance });
+        quoteVerifyStats = await verifyAndRepairDreamPages(engine, writtenRefs, transcriptsForVerify, { signal: opts.signal });
       } catch (e) {
-        if (maintenance) throw e;
         throwIfAborted(opts.signal, '[dream] quote verify');
         process.stderr.write(`[dream] quote verify pass failed open: ${e instanceof Error ? e.message : String(e)}\n`);
       }
     }
 
-    // #2569: persist the dream-output identity marker into the DB frontmatter
-    // of every child-written page BEFORE reverse-rendering, so generated pages
-    // are queryable (`frontmatter->>'dream_generated'`) and a later put_page
-    // write-through (which re-renders from the DB row) can't erase the stamp.
-    await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal, maintenance);
+    if (!maintenance) await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal);
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = maintenance ? await verifyMaintenanceOutputs(engine, maintenance, writtenRefs)
+    const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0)
       : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
 
     // Summary index page (deterministic; orchestrator-written via direct
@@ -2911,7 +2912,6 @@ async function stampDreamProvenance(
   refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
   cycleDate: string,
   signal?: AbortSignal,
-  maintenance?: MaintenanceAuthority | null,
 ): Promise<void> {
   if (refs.length === 0) return;
   const { executeRawJsonb } = await import('../sql-query.ts');
@@ -2919,11 +2919,6 @@ async function stampDreamProvenance(
     // #4077: per-row abort check — the per-row try below is only for stamp
     // failures and must not swallow the cancellation unwind.
     throwIfAborted(signal, '[dream] synthesize provenance');
-    if (maintenance) {
-      if (source_id !== maintenance.writer.sourceId) throw new Error('Maintenance output source changed.');
-      await stampMaintenancePage(engine, maintenance, slug, cycleDate, raw_source);
-      continue;
-    }
     try {
       await executeRawJsonb(
         engine,

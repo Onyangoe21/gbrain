@@ -47,7 +47,6 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { importFromContent } from '../import-file.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { throwIfAborted } from '../abort-check.ts';
@@ -107,7 +106,7 @@ export interface QuoteVerifyStats {
   errors: number;
 }
 
-function emptyStats(): QuoteVerifyStats {
+export function emptyQuoteVerifyStats(): QuoteVerifyStats {
   return {
     pages_checked: 0,
     pages_repaired: 0,
@@ -204,7 +203,7 @@ export function normForGrounding(s: string): string {
   return foldForGrounding(s, false) as string;
 }
 
-interface GroundedTranscript {
+export interface GroundedTranscript {
   content: string;
   norm: string;
   map: number[];
@@ -447,6 +446,20 @@ export function repairBody(body: string, t: GroundedTranscript): {
   return { body: out, changed: out !== body, quotes: spans.length, exact, normalized, near, stripped, unbalanced };
 }
 
+export function repairDreamPageMarkdown(md: string, transcript: GroundedTranscript, stats: QuoteVerifyStats): string {
+  const { fm, body } = splitFrontmatter(md);
+  const repaired = repairBody(body, transcript);
+  stats.pages_checked++;
+  stats.quotes_total += repaired.quotes;
+  stats.exact += repaired.exact;
+  stats.normalized_fixed += repaired.normalized;
+  stats.near_fixed += repaired.near;
+  stats.stripped += repaired.stripped;
+  stats.unbalanced += repaired.unbalanced;
+  stats.numeric_claim_warns += countUngroundedNumericClaims(repaired.body, transcript);
+  return fm + repaired.body;
+}
+
 /**
  * Orchestrator entry: verify/repair every newly-created page from this
  * phase's writtenRefs. `transcriptsByPath` maps a transcript filePath →
@@ -459,9 +472,9 @@ export async function verifyAndRepairDreamPages(
   engine: BrainEngine,
   refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
   transcriptsByPath: Map<string, TranscriptForVerify>,
-  opts: { signal?: AbortSignal; maintenance?: MaintenanceAuthority | null } = {},
+  opts: { signal?: AbortSignal } = {},
 ): Promise<QuoteVerifyStats> {
-  const stats = emptyStats();
+  const stats = emptyQuoteVerifyStats();
   // Dedupe defensively by (source, slug) and group by transcript.
   const seen = new Set<string>();
   const byTranscript = new Map<string, Array<{ slug: string; source_id: string }>>();
@@ -489,31 +502,19 @@ export async function verifyAndRepairDreamPages(
 
     for (const ref of group) {
       throwIfAborted(opts.signal, '[dream] quote verify');
-      if (opts.maintenance && ref.source_id !== opts.maintenance.writer.sourceId) throw new Error('Maintenance output source changed.');
       try {
-        const snapshot = opts.maintenance ? await engine.readPageSnapshot(ref.slug, { sourceId: ref.source_id }) : null;
-        const page = opts.maintenance ? snapshot?.page : await engine.getPage(ref.slug, { sourceId: ref.source_id });
+        const page = await engine.getPage(ref.slug, { sourceId: ref.source_id });
         if (!page) { stats.errors++; continue; }
-        stats.pages_checked++;
-        const tags = snapshot?.tags ?? await engine.getTags(ref.slug, { sourceId: ref.source_id });
+        const tags = await engine.getTags(ref.slug, { sourceId: ref.source_id });
         const md = serializePageToMarkdown(page, tags);
-        const { fm, body } = splitFrontmatter(md);
-        const r = repairBody(body, grounded);
-        stats.quotes_total += r.quotes;
-        stats.exact += r.exact;
-        stats.normalized_fixed += r.normalized;
-        stats.near_fixed += r.near;
-        stats.stripped += r.stripped;
-        stats.unbalanced += r.unbalanced;
-        stats.numeric_claim_warns += countUngroundedNumericClaims(r.body, grounded);
-        if (r.changed) {
+        const repaired = repairDreamPageMarkdown(md, grounded, stats);
+        if (repaired !== md) {
           // Canonical write pipeline — same as the children's put_page tool:
           // page + tags + chunks + link extraction, content_hash recomputed.
           // noEmbed: the phase-end embed sweep backfills (oneshot deferEmbeds
           // parity). Provenance fields null → engine COALESCE keeps the
           // first-write record intact.
-          if (opts.maintenance) await publishMaintenancePage(engine, opts.maintenance, ref.slug, fm + r.body, { expectedRevision: snapshot!.revision });
-          else await importFromContent(engine, ref.slug, fm + r.body, {
+          await importFromContent(engine, ref.slug, repaired, {
             noEmbed: true,
             remote: false,
             sourceId: ref.source_id,
@@ -521,7 +522,6 @@ export async function verifyAndRepairDreamPages(
           stats.pages_repaired++;
         }
       } catch (e) {
-        if (opts.maintenance) throw e;
         // Fail-open: a verify bug never kills the phase (pacer precedent) —
         // but a cooperative abort must still unwind.
         throwIfAborted(opts.signal, '[dream] quote verify');
