@@ -6,7 +6,9 @@ export const WRITER_INSPECTION_HINT = 'Inspect gbrain sources writer status --js
 
 export async function writerAdminState(engine: SqlEngine): Promise<string> {
   const [row] = await engine.executeRaw<{ state: string }>(`SELECT jsonb_build_object(
-    'brain', (SELECT jsonb_build_object('id',brain_id,'enabled',enabled) FROM persistence_brain WHERE singleton=1),
+    'brain', (SELECT jsonb_build_object('id',brain_id,'enabled',enabled,
+      'skill_bundles_enabled',to_jsonb(persistence_brain)->'skill_bundles_enabled',
+      'writer_protocol_floor',to_jsonb(persistence_brain)->'writer_protocol_floor') FROM persistence_brain WHERE singleton=1),
     'sources', (SELECT jsonb_agg(jsonb_build_array(id,incarnation,archived,local_path) ORDER BY id) FROM sources),
     'fallback', (SELECT value FROM config WHERE key='sync.repo_path'),
     'worktrees', (SELECT jsonb_agg(jsonb_build_array(id,owner_host_id,owner_epoch::text,topology_generation::text,state,manifest) ORDER BY id) FROM persistence_worktrees),

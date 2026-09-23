@@ -17,12 +17,17 @@ export const PERSISTENCE_IPC_OPERATIONS = [
   'put_page', 'capture', 'delete_page', 'restore_page', 'revert_version',
   'remember', 'forget', 'get_write_request', 'list_write_requests', 'cancel_write_request',
   'get_page', 'fetch',
+  'list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack',
+  'put_skill', 'delete_skill', 'join_brain', 'sync_brain_skills', 'leave_brain',
+  'get_skill_policy', 'set_skill_policy', 'get_skill_retention', 'prune_skill_revisions',
+  'retain_skill_revision', 'import_skill_proposal',
   'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
 ] as const;
 export type PersistenceIpcOperation = typeof PERSISTENCE_IPC_OPERATIONS[number];
 const OPERATIONS = new Set<string>(PERSISTENCE_IPC_OPERATIONS);
 const MUTATIONS = new Set<string>([
   'put_page', 'capture', 'delete_page', 'restore_page', 'revert_version', 'remember', 'forget',
+  'put_skill', 'delete_skill', 'import_skill_proposal',
   'add_tag', 'remove_tag', 'add_timeline_entry', 'takes_add', 'takes_update', 'takes_supersede', 'takes_resolve',
 ]);
 

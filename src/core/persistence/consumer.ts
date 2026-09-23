@@ -10,6 +10,7 @@ import { publicationConcurrency } from './pool-capacity.ts';
 import { runPersistenceEffects } from './effects.ts';
 import { runPendingMemoryCueJob } from '../memory-cues/inline.ts';
 import type { MemoryCueProviders } from '../memory-cues/types.ts';
+import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 
 export type PrepareMutation = (engine: BrainEngine, row: WriteRequest, config: GBrainConfig) => Promise<PreparedMutation>;
 export class PersistenceConsumer {
@@ -97,10 +98,11 @@ export class PersistenceConsumer {
     }
     await this.engine.executeRaw(`UPDATE persistence_requests r SET state='queued',execution_token=NULL,claim_expires_at=NULL
       WHERE r.state='running' AND r.recovery IS NULL AND r.claim_expires_at<now()
+      AND ${PERSISTENCE_PROTOCOL_PREDICATE}
       AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))`, [this.hostId]);
     if (publicationConcurrency(this.engine) === 0) {
       await this.engine.executeRaw(`UPDATE persistence_requests SET blocked_reason='writer_pool_capacity'
-        WHERE state='queued' AND blocked_reason IS DISTINCT FROM 'writer_pool_capacity'`);
+        WHERE state='queued' AND blocked_reason IS DISTINCT FROM 'writer_pool_capacity' AND ${PERSISTENCE_PROTOCOL_PREDICATE}`);
       return;
     }
     const concurrency = this.opts.concurrency ?? 2;

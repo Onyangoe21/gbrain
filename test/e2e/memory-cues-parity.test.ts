@@ -294,13 +294,19 @@ for (const kind of ['pglite', 'postgres'] as const) {
     });
 
     test('upgrade and repeated migration recreate cue schema without touching canonical evidence', async () => {
-      await engine.executeRaw('DROP TABLE memory_cues,memory_cue_indexes,memory_cue_attempts,memory_cue_windows,memory_cue_pages,memory_cue_builds');
-      await engine.setConfig('version', '163');
-      expect((await runMigrations(engine)).current).toBeGreaterThanOrEqual(164);
-      expect((await runMigrations(engine)).applied).toBe(0);
-      expect((await engine.getPage('cue-example', { sourceId: 'default' }))!.compiled_truth).toBe(cueEvidence);
-      await build();
-      expect((await recall()).candidates).toHaveLength(1);
+      for (const version of [163, 164]) {
+        await engine.executeRaw('DROP TABLE memory_cues,memory_cue_indexes,memory_cue_attempts,memory_cue_windows,memory_cue_pages,memory_cue_builds');
+        await engine.setConfig('version', String(version));
+        const migration = await runMigrations(engine);
+        expect(migration.current).toBeGreaterThanOrEqual(165);
+        expect(migration.applied).toBe(165 - version);
+        expect(await engine.executeRaw("SELECT to_regclass('shared_skill_heads')::text AS heads, to_regclass('shared_skill_members')::text AS members"))
+          .toEqual([{ heads: 'shared_skill_heads', members: 'shared_skill_members' }]);
+        expect((await runMigrations(engine)).applied).toBe(0);
+        expect((await engine.getPage('cue-example', { sourceId: 'default' }))!.compiled_truth).toBe(cueEvidence);
+        await build();
+        expect((await recall()).candidates).toHaveLength(1);
+      }
     });
   });
 }

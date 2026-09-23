@@ -4002,6 +4002,8 @@ export async function buildChecks(
     // default (false) — that's the trust-boundary preservation Codex
     // P0-1 flagged.
     checks.push(await checkSyncFreshness(engine, { localOnly: true }));
+    const contentWrites = await (await import('./doctor/checks/canonical-content.ts')).checkCanonicalContentWrites(engine);
+    if (contentWrites) checks.push(contentWrites);
     // Monthly backup-coverage check (same D4 trust stance as sync_freshness:
     // localOnly:true probes git; the remote path stays a cache-only reader).
     progress.heartbeat('backup_coverage');
