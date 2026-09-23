@@ -18,13 +18,15 @@ import { localHostId } from '../persistence/identity.ts';
 import { withCoordinatedWrite } from '../persistence/context.ts';
 import { normalizeSkillFiles, skillMetadata, skillName, skillPath } from './manifest.ts';
 import { assertSkillCapability, assertStoredSkillCapability, publicationEnabled, readSharedSkillPolicy, setSharedSkillPolicy } from './policy.ts';
-import { SHARED_SKILL_LIMITS, type SharedSkillPolicy, type SharedSkillPutInput, type SkillMetadata, type StoredSkillFile, type StoredSkillRevision } from './model.ts';
-import { assertSharedSkillRetentionCapacity, pruneSharedSkillRevisionsInTransaction, sharedSkillRetentionStatus, type SkillRetentionStatus } from './retention.ts';
+import { SHARED_SKILL_LIMITS, type SharedSkillFile, type SharedSkillPolicy, type SharedSkillPutInput, type SkillMetadata, type StoredSkillFile, type StoredSkillRevision } from './model.ts';
+import { assertSharedSkillRetentionCapacity, pruneSharedSkillRevisionsInTransaction, sharedSkillRetentionCapacity, sharedSkillRetentionStatus } from './retention.ts';
 
 interface PackRow { pack_id: string; revision: string; manifest: Record<string, unknown>; manifest_hash: string; }
+type HeadKey = Pick<StoredSkillRevision, 'name' | 'revision' | 'deleted'>;
+interface PackSkill { name: string; revision: string; files: SharedSkillFile[]; }
 interface PublicationIntent {
   pack_id: string; name: string; expected_revision: string | null; policy_epoch: string;
-  files: StoredSkillFile[]; metadata: SkillMetadata; affected: Array<{ name: string; revision: string | null }>;
+  affected: Array<{ name: string; revision: string | null }>;
   expected_pack_revision: string | null; manifest_before_hash: string | null; original_manifest: Record<string, unknown>;
   before_hashes: Record<string, string | null>;
   proposals: Array<{ name: string; files: StoredSkillFile[]; metadata: SkillMetadata; expected_revision: string | null }>;
@@ -69,10 +71,54 @@ async function sourceRoot(engine: BrainEngine, sourceId: string, incarnation: st
   if (realpathSync(root) !== root) throw new OperationError('local_conflict', 'Canonical source root contains a symlink.');
   return { binding, root };
 }
-async function heads(engine: BrainEngine, sourceId: string, incarnation: string, packId: string): Promise<StoredSkillRevision[]> {
+async function headKeys(engine: BrainEngine, sourceId: string, incarnation: string, packId: string): Promise<HeadKey[]> {
+  return engine.executeRaw<HeadKey>(`SELECT name,revision,deleted FROM shared_skill_heads
+    WHERE source_id=$1 AND source_incarnation=$2::uuid AND pack_id=$3 ORDER BY name LIMIT $4`,
+  [sourceId, incarnation, packId, SHARED_SKILL_LIMITS.catalogSkills + 1]);
+}
+function packInventory(pack: PackRow | undefined, keys: HeadKey[]): PackSkill[] {
+  if (!pack) {
+    if (keys.length) throw new OperationError('catalog_unavailable', 'Skill heads have no sealed pack inventory.');
+    return [];
+  }
+  const projection = pack.manifest.shared_skills as { schema_version?: unknown; skills?: unknown } | undefined;
+  if (projection?.schema_version !== 2 || !Array.isArray(projection.skills) || keys.length > SHARED_SKILL_LIMITS.catalogSkills) {
+    throw new OperationError('catalog_unavailable', 'The sealed pack inventory is missing or exceeds its bound.');
+  }
+  const active = new Map(keys.filter(key => !key.deleted).map(key => [key.name, key.revision]));
+  const names = new Set<string>();
+  const inventory: PackSkill[] = [];
+  for (const entry of projection.skills as PackSkill[]) {
+    if (!entry || typeof entry.name !== 'string' || names.has(entry.name) || active.get(entry.name) !== entry.revision) {
+      throw new OperationError('revision_conflict', 'The sealed pack inventory does not match its current skill heads.');
+    }
+    names.add(entry.name);
+    if (!Array.isArray(entry.files) || entry.files.length < 1 || entry.files.length > SHARED_SKILL_LIMITS.files ||
+      !entry.files.some(file => file?.path === `skills/${entry.name}/SKILL.md`)) {
+      throw new OperationError('catalog_unavailable', 'The sealed pack file inventory is incomplete.');
+    }
+    const paths = new Set<string>();
+    const files = entry.files.map(file => {
+      if (!file || typeof file.path !== 'string' || paths.has(file.path) || typeof file.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(file.sha256) ||
+        !Number.isSafeInteger(file.size) || file.size < 0 || !['prose', 'reference', 'asset', 'script'].includes(file.file_class) || typeof file.media_type !== 'string' ||
+        !Array.isArray(file.audience) || file.audience.some(value => typeof value !== 'string') ||
+        !Array.isArray(file.depends_on) || file.depends_on.some(value => typeof value !== 'string')) {
+        throw new OperationError('catalog_unavailable', 'The sealed pack file inventory is malformed.');
+      }
+      paths.add(file.path);
+      return { path: file.path, file_class: file.file_class, audience: file.audience, media_type: file.media_type,
+        size: file.size, sha256: file.sha256, depends_on: file.depends_on };
+    });
+    inventory.push({ name: entry.name, revision: entry.revision, files });
+  }
+  if (names.size !== active.size) throw new OperationError('revision_conflict', 'The sealed pack inventory omits current skill heads.');
+  return inventory;
+}
+async function heads(engine: BrainEngine, sourceId: string, incarnation: string, packId: string, names: string[]): Promise<StoredSkillRevision[]> {
+  if (!names.length) return [];
   return engine.executeRaw<StoredSkillRevision>(`SELECT r.* FROM shared_skill_heads h JOIN shared_skill_revisions r
     ON r.source_id=h.source_id AND r.source_incarnation=h.source_incarnation AND r.pack_id=h.pack_id AND r.name=h.name AND r.revision=h.revision
-    WHERE h.source_id=$1 AND h.source_incarnation=$2::uuid AND h.pack_id=$3 ORDER BY h.name`, [sourceId, incarnation, packId]);
+    WHERE h.source_id=$1 AND h.source_incarnation=$2::uuid AND h.pack_id=$3 AND h.name=ANY($4::text[]) ORDER BY h.name`, [sourceId, incarnation, packId, names]);
 }
 function validateDisclosure(files: StoredSkillFile[], metadata: SkillMetadata, policy: SharedSkillPolicy, legacy: boolean) {
   if (files.some(f => !policy.classes.includes(f.file_class) || f.audience.some(a => !policy.audiences.includes(a)))) {
@@ -82,9 +128,9 @@ function validateDisclosure(files: StoredSkillFile[], metadata: SkillMetadata, p
     throw new OperationError('requirements_changed', 'The runtime requirements exceed the owner-approved publication policy.');
   }
 }
-function affectedSkills(current: StoredSkillRevision[], name: string, files: StoredSkillFile[]): StoredSkillRevision[] {
-  const changedShared = new Map(files.filter(f => f.path.startsWith('skills/conventions/')).map(f => [f.path, f]));
-  return current.filter(row => row.name === name || !row.deleted && row.files.some(f => changedShared.has(f.path) && stableJson(changedShared.get(f.path)) !== stableJson(f)));
+function affectedSkills(current: PackSkill[], name: string, files: StoredSkillFile[]): PackSkill[] {
+  const changedShared = new Map(files.filter(f => f.path.startsWith('skills/conventions/')).map(({ content: _content, ...file }) => [file.path, stableJson(file)]));
+  return current.filter(row => row.name === name || row.files.some(file => changedShared.has(file.path) && changedShared.get(file.path) !== stableJson(file)));
 }
 function rebuildDependentClosure(name: string, previous: StoredSkillFile[], replacements: Map<string, StoredSkillFile>): StoredSkillFile[] {
   const available = new Map(previous.map(file => [file.path, file]));
@@ -141,7 +187,10 @@ export async function submitSharedSkillMutation(ctx: OperationContext, operation
   await assertStoredSkillCapability(ctx.engine, authority, 'skill_editor');
   const [pack] = await ctx.engine.executeRaw<PackRow>('SELECT * FROM shared_skill_packs WHERE source_id=$1 AND source_incarnation=$2::uuid', [sourceId, source.incarnation]);
   if (pack && pack.pack_id !== packId) throw new OperationError('invalid_params', 'The source has a different canonical pack identity.');
-  const current = await heads(ctx.engine, sourceId, source.incarnation, packId);
+  const keys = await headKeys(ctx.engine, sourceId, source.incarnation, packId);
+  const inventory = packInventory(pack, keys);
+  const proposedNames = [...new Set([name, ...(adoption?.skills ?? []).map(input => skillName(input.name))])];
+  const current = await heads(ctx.engine, sourceId, source.incarnation, packId, proposedNames);
   const old = current.find(r => r.name === name);
   if ((old?.revision ?? null) !== expected) throw new OperationError('revision_conflict', 'The skill changed since the supplied revision.');
   if (operation === 'delete_skill' && (!old || old.deleted)) throw new OperationError('skill_not_found', 'There is no active skill to delete.');
@@ -169,12 +218,20 @@ export async function submitSharedSkillMutation(ctx: OperationContext, operation
     if ((current.find(r => r.name === proposal.name)?.revision ?? null) !== proposal.expected_revision) throw new OperationError('revision_conflict', 'An adopted skill changed after inventory.');
     validateDisclosure(proposal.files, proposal.metadata, policy.policy, policy.epoch === 'legacy-prose' || policy.epoch === 'consent-required');
   }
-  const affected = [...new Map(proposals.flatMap(proposal => affectedSkills(current, proposal.name, proposal.files)).map(r => [r.name, r])).values()];
-  for (const proposal of proposals) if (!affected.some(r => r.name === proposal.name)) affected.push({ name: proposal.name, revision: null } as unknown as StoredSkillRevision);
+  const affected: PublicationIntent['affected'] = [...new Map(proposals.flatMap(proposal => affectedSkills(inventory, proposal.name, proposal.files))
+    .map(entry => [entry.name, { name: entry.name, revision: entry.revision }])).values()];
+  for (const proposal of proposals) if (!affected.some(entry => entry.name === proposal.name)) {
+    affected.push({ name: proposal.name, revision: keys.find(key => key.name === proposal.name)?.revision ?? null });
+  }
   authority.skillSlugsUsed = affected.map(r => `skills/${r.name}/SKILL.md`).sort();
   if (adoption) authority.skillAdoptionPreconditions = Object.fromEntries(proposals.map(p => [p.name, p.expected_revision]));
   if (adoption?.expected_hashes) authority.skillAdoptionInventory = { ...adoption.expected_hashes };
   for (const target of authority.skillSlugsUsed) await authorizeWrite(ctx.engine, authority, operation, target);
+  const dependents = affected.filter(target => !proposedNames.includes(target.name)).map(target => target.name);
+  current.push(...await heads(ctx.engine, sourceId, source.incarnation, packId, dependents));
+  if (affected.some(target => (current.find(head => head.name === target.name)?.revision ?? null) !== target.revision)) {
+    throw new OperationError('revision_conflict', 'An affected skill changed while preparing admission.');
+  }
   const manifestBytes = canonicalRead(root, 'skillpack.json');
   if (!pack && manifestBytes && (!adoption || adoption.mode === 'proposal')) {
     throw new OperationError('approval_required', 'An unadopted skillpack already exists on disk. A trusted host must adopt its complete reviewed inventory before individual skill publication.');
@@ -220,18 +277,21 @@ export async function submitSharedSkillMutation(ctx: OperationContext, operation
   if (adoption?.mode === 'proposal' && [...touched, 'skillpack.json'].some(path => !Object.hasOwn(adoption.expected_hashes ?? {}, path))) {
     throw new OperationError('invalid_params', 'A reviewed proposal must supply current hashes for every affected file and skillpack.json.');
   }
+  const sealedFiles = new Map(inventory.flatMap(entry => entry.files).map(file => [file.path, file]));
+  for (const entry of current) if (!entry.deleted) for (const file of entry.files) sealedFiles.set(file.path, file);
   for (const path of touched) {
     const disk = canonicalRead(root, path);
     beforeHashes[path] = disk === null ? null : sha256(disk);
-    const sealed = current.filter(r => !r.deleted).flatMap(r => r.files).find(f => f.path === path);
+    const sealed = sealedFiles.get(path);
     const reviewed = adoption?.expected_hashes !== undefined && Object.hasOwn(adoption.expected_hashes, path) && adoption.expected_hashes[path] === beforeHashes[path];
     if (sealed && beforeHashes[path] !== sealed.sha256 && !reviewed) throw new OperationError('local_conflict', 'A canonical file has unpublished edits; use import_skill_proposal with the reviewed current file hashes.');
     const proposedHash = allProposedFiles.find(f => f.path === path)?.sha256 ?? (extraFiles[path] === undefined ? undefined : sha256(extraFiles[path]));
     if (!sealed && disk !== null && (!adoption || proposedHash !== beforeHashes[path] && !reviewed)) throw new OperationError('local_conflict', 'Publication would overwrite an unadopted file.');
   }
-  const intent: PublicationIntent = { pack_id: packId, name, expected_revision: expected, files, metadata, policy_epoch: policy.epoch,
+  const { skills: _skills, shared_skills: _sharedSkills, ...manifestMetadata } = manifest;
+  const intent: PublicationIntent = { pack_id: packId, name, expected_revision: expected, policy_epoch: policy.epoch,
     affected: affected.map(r => ({ name: r.name, revision: r.revision ?? null })), expected_pack_revision: pack?.revision ?? null,
-    manifest_before_hash: manifestBytes ? sha256(manifestBytes) : null, original_manifest: manifest, before_hashes: beforeHashes, proposals, extra_files: extraFiles };
+    manifest_before_hash: manifestBytes ? sha256(manifestBytes) : null, original_manifest: manifestMetadata, before_hashes: beforeHashes, proposals, extra_files: extraFiles };
   const row = await admitWrite(ctx.engine, { principal, operation, sourceId, sourceIncarnation: source.incarnation, slug, requestId,
     targetKind: 'skill_bundle', protocolVersion: 2, callerIntent, intent: intent as unknown as Record<string, unknown>, authority,
     worktreeId: binding.worktree_id, topologyGeneration: binding.topology_generation });
@@ -248,8 +308,10 @@ export async function prepareSharedSkillMutation(engine: BrainEngine, row: Write
   await authorizeStoredRequest(engine, row);
   await assertStoredSkillCapability(engine, row.authority, 'skill_editor');
   const { root } = await sourceRoot(engine, row.source_id, row.source_incarnation);
-  const current = await heads(engine, row.source_id, row.source_incarnation, intent.pack_id);
   const [currentPack] = await engine.executeRaw<PackRow>('SELECT * FROM shared_skill_packs WHERE source_id=$1 AND source_incarnation=$2::uuid', [row.source_id, row.source_incarnation]);
+  const keys = await headKeys(engine, row.source_id, row.source_incarnation, intent.pack_id);
+  const inventory = packInventory(currentPack, keys);
+  const current = await heads(engine, row.source_id, row.source_incarnation, intent.pack_id, intent.affected.map(target => target.name));
   if ((currentPack?.revision ?? null) !== intent.expected_pack_revision || intent.affected.some(target => (current.find(head => head.name === target.name)?.revision ?? null) !== target.revision)) {
     throw new OperationError('revision_conflict', 'The pack or a skill in its closure changed after admission.');
   }
@@ -265,17 +327,21 @@ export async function prepareSharedSkillMutation(engine: BrainEngine, row: Write
       files };
   });
   const revisionByName = new Map(revisions.map(r => [r.name, r]));
-  const next = [...current.filter(r => !revisionByName.has(r.name)), ...revisions].filter(r => !r.deleted);
-  const allFiles = new Map(next.flatMap(r => r.files).map(f => [f.path, f]));
+  const next = [...inventory.filter(entry => !revisionByName.has(entry.name)), ...revisions.filter(entry => !entry.deleted).map(entry => ({
+    name: entry.name, revision: entry.revision, files: entry.files.map(({ content: _content, ...file }) => file),
+  }))];
+  const allFiles = new Set(next.flatMap(entry => entry.files.map(file => file.path)));
   const changedFiles = new Map<string, StoredSkillFile | null>();
   for (const file of proposals.flatMap(p => p.files)) changedFiles.set(file.path, file);
   for (const file of current.filter(r => revisions.some(p => p.name === r.name)).flatMap(r => r.files)) if (!allFiles.has(file.path)) changedFiles.set(file.path, null);
   const manifest = { ...intent.original_manifest, name: intent.pack_id, brain_resident: true,
-    skills: next.map(r => `skills/${r.name}`).sort(), shared_skills: { schema_version: 2, skills: next.map(r => ({ name: r.name, revision: r.revision,
-      files: r.files.map(({ content: _content, ...file }) => file) })).sort((a, b) => a.name.localeCompare(b.name)) } };
-  const manifestContent = `${JSON.stringify(manifest, null, 2)}\n`;
+    skills: next.map(entry => `skills/${entry.name}`).sort(), shared_skills: { schema_version: 2, skills: next.sort((a, b) => a.name.localeCompare(b.name)) } };
+  const manifestContent = `{\n${Object.entries(manifest).map(([key, value]) =>
+    key === 'shared_skills'
+      ? `  "shared_skills": {"schema_version":2,"skills":[\n${manifest.shared_skills.skills.map(skill => `    ${JSON.stringify(skill)}`).join(',\n')}\n  ]}`
+      : `  ${JSON.stringify(key)}: ${JSON.stringify(value)}`).join(',\n')}\n}\n`;
   const packRevision = randomUUID();
-  let retention: SkillRetentionStatus | undefined;
+  let prunedRevisions = 0;
   const totalBytes = Buffer.byteLength(manifestContent) + [...changedFiles.values()].reduce((sum, file) => sum + (file?.size ?? 0), 0) + Object.values(intent.extra_files).reduce((sum, content) => sum + Buffer.byteLength(content), 0);
   if (totalBytes > SHARED_SKILL_LIMITS.bundleBytes || changedFiles.size + Object.keys(intent.extra_files).length + 1 > SHARED_SKILL_LIMITS.files) throw new OperationError('invalid_params', 'The complete canonical publication exceeds the file-set bound.');
   return {
@@ -291,17 +357,18 @@ export async function prepareSharedSkillMutation(engine: BrainEngine, row: Write
       const policy = await readSharedSkillPolicy(tx, row.source_id, row.source_incarnation, await publicationEnabled(ctx), true);
       if (policy.epoch !== intent.policy_epoch) throw new OperationError('approval_required', 'Publication policy changed after this request was accepted.');
       for (const revision of revisions) validateDisclosure(revision.files, revision.metadata, policy.policy, policy.epoch === 'legacy-prose' || policy.epoch === 'consent-required');
-      const [pack] = await tx.executeRaw<PackRow>('SELECT * FROM shared_skill_packs WHERE source_id=$1 AND source_incarnation=$2::uuid FOR UPDATE', [row.source_id, row.source_incarnation]);
+      const [pack] = await tx.executeRaw<Pick<PackRow, 'revision'>>('SELECT revision FROM shared_skill_packs WHERE source_id=$1 AND source_incarnation=$2::uuid FOR UPDATE', [row.source_id, row.source_incarnation]);
       if ((pack?.revision ?? null) !== intent.expected_pack_revision) throw new OperationError('revision_conflict', 'The pack changed after this request was accepted.');
       for (const target of [...intent.affected].sort((a, b) => a.name.localeCompare(b.name))) {
         const [head] = await tx.executeRaw<{ revision: string }>(`SELECT revision FROM shared_skill_heads
           WHERE source_id=$1 AND source_incarnation=$2::uuid AND pack_id=$3 AND name=$4 FOR UPDATE`, [row.source_id, row.source_incarnation, intent.pack_id, target.name]);
         if ((head?.revision ?? null) !== target.revision) throw new OperationError('revision_conflict', 'A skill in the dependency closure changed.');
       }
-      retention = await withCoordinatedWrite(tx, [row.source_id], () => pruneSharedSkillRevisionsInTransaction(tx, row.source_id, row.source_incarnation));
+      prunedRevisions = await withCoordinatedWrite(tx, [row.source_id], () => pruneSharedSkillRevisionsInTransaction(tx, row.source_id, row.source_incarnation));
+      const capacity = await sharedSkillRetentionCapacity(tx, row.source_id, row.source_incarnation);
       const [incoming] = await tx.executeRaw<{ bytes: number | string }>(`SELECT COALESCE(SUM(octet_length(r.metadata::text)+octet_length(r.files::text)),0) AS bytes
         FROM jsonb_to_recordset($1::text::jsonb) AS r(metadata jsonb,files jsonb)`, [JSON.stringify(revisions)]);
-      assertSharedSkillRetentionCapacity(retention, revisions.length, Number(incoming.bytes), !row.authority.remote);
+      assertSharedSkillRetentionCapacity(capacity, revisions.length, Number(incoming.bytes), !row.authority.remote);
     },
     async apply(tx) {
       for (const revision of revisions) {
@@ -318,11 +385,11 @@ export async function prepareSharedSkillMutation(engine: BrainEngine, row: Write
         DO UPDATE SET revision=excluded.revision,manifest=excluded.manifest,manifest_hash=excluded.manifest_hash`,
       [row.source_id, row.source_incarnation, intent.pack_id, packRevision, JSON.stringify(manifest), sha256(manifestContent)]);
       const primary = revisions.find(r => r.name === intent.name)!;
-      const retained = await sharedSkillRetentionStatus(tx, row.source_id, row.source_incarnation);
+      const retained = !row.authority.remote ? await sharedSkillRetentionStatus(tx, row.source_id, row.source_incarnation) : undefined;
       return { status: primary.deleted ? 'deleted' : 'published', source_id: row.source_id, source_incarnation: row.source_incarnation,
         pack_id: intent.pack_id, name: intent.name, revision: primary.revision,
         affected_skills: revisions.map(r => ({ name: r.name, revision: r.revision })), delivery: 'canonical_committed',
-        ...(!row.authority.remote ? { retention: { ...retained, pruned_revisions: retention?.pruned_revisions ?? 0 } } : {}) };
+        ...(retained ? { retention: { ...retained, pruned_revisions: prunedRevisions } } : {}) };
     },
   };
 }
@@ -358,7 +425,7 @@ export async function adoptSharedSkillpack(ctx: OperationContext, sourceId: stri
     if (manifest.brain_resident !== true) throw new OperationError('approval_required', 'The existing manifest is not approved as a brain-resident pack.');
   }
   const packId = skillName(options.pack_id ?? manifest.name, 'pack_id');
-  const existing = await heads(ctx.engine, sourceId, source.incarnation, packId);
+  const existing = await headKeys(ctx.engine, sourceId, source.incarnation, packId);
   const exclusions = manifest.excluded_from_install;
   if (exclusions !== undefined && (!Array.isArray(exclusions) || exclusions.some(name => typeof name !== 'string'))) throw new OperationError('approval_required', 'Unknown pack exclusion intent requires review.');
   const inputs: SharedSkillPutInput[] = options.skills ?? (Array.isArray(manifest.skills) ? manifest.skills : []).map((path: unknown) => {

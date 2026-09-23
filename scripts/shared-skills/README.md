@@ -53,6 +53,13 @@ times are also recorded. Read/write errors, missing admission observations,
 zero commits during reads, or incomplete samples cannot pass. This does not
 replace the existing `scripts/persistence/performance.ts` gate.
 
+This additional body/asset-RPC comparison is experimental and separate from the
+existing memory-retrieval gate. Report its result per engine, including a failure
+when correctness passes but relative latency does not. PGLite shares one backing
+connection between catalog reads and bundle publication; a passing PostgreSQL
+measurement does not establish the same latency behavior for PGLite. Neither a
+smoke nor `--informational` may be presented as a passing full measurement.
+
 The command writes the aggregate manifest plus uniquely named per-run JSON and
 full stdout/stderr logs beside it. It hashes the benchmark and exercised source
 files before and after each run; edits during measurement invalidate the run.

@@ -2,7 +2,7 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.52.2.0] - 2026-09-22
+## [0.52.2.0] - 2026-09-23
 
 **Keep what your agents know and how they work in the same brain.** New local brains now create a content directory containing both knowledge and useful memory skills. Connected agents can discover the same published instructions instead of maintaining unrelated copies. An explicitly authorized editor can update a skill once, and other connections can fetch the same committed version, including its approved supporting files.
 

@@ -2025,6 +2025,7 @@ CREATE TABLE IF NOT EXISTS shared_skill_revision_leases (
       REFERENCES shared_skill_revisions(source_id,source_incarnation,pack_id,name,revision) ON DELETE RESTRICT
   );
 CREATE INDEX IF NOT EXISTS shared_skill_revision_lease_expiry_idx ON shared_skill_revision_leases(source_id,source_incarnation,expires_at);
+CREATE INDEX IF NOT EXISTS shared_skill_revision_lease_target_idx ON shared_skill_revision_leases(source_id,source_incarnation,pack_id,name,revision,expires_at);
 CREATE TABLE IF NOT EXISTS shared_skill_members (
     installation_id UUID PRIMARY KEY,
     principal_kind TEXT NOT NULL,

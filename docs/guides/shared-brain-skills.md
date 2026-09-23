@@ -504,6 +504,19 @@ the same offline validation, old-service exclusion, and authority reissue
 requirements. A stale backup cannot tell you which newer withdrawals or
 revocations it lacks.
 
+## Concurrent publication and engine choice
+
+PGLite's single backing connection serves both reads and atomic bundle
+publication. Frequent publications can delay shared-skill body and asset reads,
+especially as the generated pack inventory grows. PostgreSQL is the preferred
+engine for write-heavy shared catalogs. This is a latency consideration, not
+permission to return partially published files or stale authorization.
+
+The reproducible [lifecycle workload](../../scripts/shared-skills/README.md)
+reports correctness, read latency and publication costs separately. A successful
+delivery test or memory-search latency gate is not a passing shared-asset latency
+result, and no benchmark proves native harness activation.
+
 ## Acceptance checklist
 
 - **Protocol:** discover only granted sources; fetch an exact revision and its

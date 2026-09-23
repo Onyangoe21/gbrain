@@ -27,9 +27,20 @@ executable with `scripts/build-shared-skills-baseline.sh` and supplies
 An absent old executable is an explicit skip, never old-writer evidence.
 `test/shared-skills-catalog-performance.test.ts` runs the reproducible
 10/100/1,000-skill read benchmark when `GBRAIN_TEST_SHARED_SKILLS_BENCHMARK=1`;
-its timings are diagnostic, while query-count/bound assertions are deterministic.
+its timings and database-call counts are recorded diagnostics, while identity
+and catalog-size assertions are deterministic.
 The shared-skills cases under `evals/harness-instructions/` test interpretation
 separately from executed calls and native sessions.
+
+`scripts/shared-skills/lifecycle.ts` measures real authenticated HTTP enrollment,
+revision/asset reads, publication, missed-notification polling, acknowledgments,
+queue/recovery bytes, and concurrent read latency at 10/100/1,000 skills. Run it on
+a quiet machine with the protocol and fixture boundaries in its
+[README](../scripts/shared-skills/README.md). Its additional body/asset latency
+comparison is experimental; report each engine's measured result without
+substituting it for the existing `scripts/persistence/performance.ts` memory-read
+gate. The five pure accounting tests run normally; the small runtime smoke is
+explicitly opt-in and never counts as a full performance pass.
 
 `test/docs-navigation.test.ts` checks local links and fragments in the primary
 install/memory guides and all `docs/architecture/key-files/` references, requires

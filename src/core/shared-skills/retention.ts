@@ -12,13 +12,16 @@ export const SHARED_SKILL_RETENTION_LIMITS = Object.freeze({ recentPerSkill: 20,
   brainRevisions: 100_000, brainBytes: 1024 * 1024 * 1024,
   pinHours: 24, principalPins: 64, sourcePins: 256, brainPins: 4096 });
 
-export interface SkillRetentionStatus {
-  source_id: string;
-  source_incarnation: string;
+export interface SkillRetentionCapacity {
   retained_revisions: number;
   retained_bytes: number;
   brain_retained_revisions: number;
   brain_retained_bytes: number;
+}
+
+export interface SkillRetentionStatus extends SkillRetentionCapacity {
+  source_id: string;
+  source_incarnation: string;
   protected_heads: number;
   protected_tombstones: number;
   protected_leases: number;
@@ -29,8 +32,16 @@ export interface SkillRetentionStatus {
   limits: typeof SHARED_SKILL_RETENTION_LIMITS;
 }
 
-const RETENTION_ROWS = `WITH ranked AS (
-  SELECT r.*,row_number() OVER(PARTITION BY r.pack_id,r.name ORDER BY r.created_at DESC,r.revision DESC) AS position
+const RETENTION_ROWS = `WITH pending AS MATERIALIZED (
+  SELECT q.intent->>'expected_revision' AS revision,COALESCE(q.intent->'affected','[]'::jsonb) AS affected
+  FROM persistence_requests q WHERE q.source_id=$1 AND q.source_incarnation=$2::uuid
+    AND q.target_kind='skill_bundle' AND (q.state IN ('queued','running','recovering') OR q.recovery IS NOT NULL)
+), publication_revisions AS MATERIALIZED (
+  SELECT revision FROM pending WHERE revision IS NOT NULL
+  UNION SELECT a->>'revision' FROM pending CROSS JOIN LATERAL jsonb_array_elements(affected) a WHERE a->>'revision' IS NOT NULL
+), ranked AS (
+  SELECT r.source_id,r.source_incarnation,r.pack_id,r.name,r.revision,r.created_at,r.deleted,r.stored_bytes,
+    row_number() OVER(PARTITION BY r.pack_id,r.name ORDER BY r.created_at DESC,r.revision DESC) AS position
   FROM shared_skill_revisions r WHERE r.source_id=$1 AND r.source_incarnation=$2::uuid
 ), protected AS (
   SELECT r.*,r.stored_bytes AS bytes,
@@ -38,10 +49,7 @@ const RETENTION_ROWS = `WITH ranked AS (
       AND h.pack_id=r.pack_id AND h.name=r.name AND h.revision=r.revision) AS head,
     EXISTS(SELECT 1 FROM shared_skill_revision_leases l WHERE l.source_id=r.source_id AND l.source_incarnation=r.source_incarnation
       AND l.pack_id=r.pack_id AND l.name=r.name AND l.revision=r.revision AND l.expires_at>now()) AS leased,
-    EXISTS(SELECT 1 FROM persistence_requests q WHERE q.source_id=r.source_id AND q.source_incarnation=r.source_incarnation
-      AND q.target_kind='skill_bundle' AND (q.state IN ('queued','running','recovering') OR q.recovery IS NOT NULL)
-      AND (q.intent->>'expected_revision'=r.revision::text OR EXISTS
-        (SELECT 1 FROM jsonb_array_elements(COALESCE(q.intent->'affected','[]'::jsonb)) a WHERE a->>'revision'=r.revision::text))) AS publishing
+    EXISTS(SELECT 1 FROM publication_revisions p WHERE p.revision=r.revision::text) AS publishing
   FROM ranked r
 ), candidates AS (
   SELECT *, NOT(head OR deleted OR leased OR publishing) AND position>$3 AND created_at<now()-($4::double precision*interval '1 hour') AS eligible FROM protected
@@ -67,7 +75,16 @@ export async function sharedSkillRetentionStatus(engine: BrainEngine, sourceId: 
     limits: SHARED_SKILL_RETENTION_LIMITS };
 }
 
-export async function pruneSharedSkillRevisionsInTransaction(tx: BrainEngine, sourceId: string, incarnation: string): Promise<SkillRetentionStatus> {
+export async function sharedSkillRetentionCapacity(engine: BrainEngine, sourceId: string, incarnation: string): Promise<SkillRetentionCapacity> {
+  const [row] = await engine.executeRaw<Record<keyof SkillRetentionCapacity, number | string>>(`SELECT
+    COUNT(*) FILTER(WHERE source_id=$1 AND source_incarnation=$2::uuid) AS retained_revisions,
+    COALESCE(SUM(stored_bytes) FILTER(WHERE source_id=$1 AND source_incarnation=$2::uuid),0) AS retained_bytes,
+    COUNT(*) AS brain_retained_revisions,COALESCE(SUM(stored_bytes),0) AS brain_retained_bytes FROM shared_skill_revisions`, [sourceId, incarnation]);
+  return { retained_revisions: Number(row.retained_revisions), retained_bytes: Number(row.retained_bytes),
+    brain_retained_revisions: Number(row.brain_retained_revisions), brain_retained_bytes: Number(row.brain_retained_bytes) };
+}
+
+export async function pruneSharedSkillRevisionsInTransaction(tx: BrainEngine, sourceId: string, incarnation: string): Promise<number> {
   await tx.executeRaw(`DELETE FROM shared_skill_revision_leases WHERE source_id=$1 AND source_incarnation=$2::uuid AND expires_at<=now()`, [sourceId, incarnation]);
   const candidates = await tx.executeRaw<{ pack_id: string; name: string; revision: string }>(`${RETENTION_ROWS}
     SELECT r.pack_id,r.name,r.revision FROM shared_skill_revisions r JOIN candidates c
@@ -85,20 +102,17 @@ export async function pruneSharedSkillRevisionsInTransaction(tx: BrainEngine, so
     [sourceId, incarnation, SHARED_SKILL_RETENTION_LIMITS.recentPerSkill, SHARED_SKILL_RETENTION_LIMITS.graceHours, candidates.map(row => row.revision)]);
     count = deleted.length;
   }
-  return { ...await sharedSkillRetentionStatus(tx, sourceId, incarnation), pruned_revisions: count };
+  return count;
 }
 
-export function assertSharedSkillRetentionCapacity(status: SkillRetentionStatus, incomingRevisions: number, incomingBytes: number, exposeCounts = false): void {
+export function assertSharedSkillRetentionCapacity(status: SkillRetentionCapacity, incomingRevisions: number, incomingBytes: number, exposeCounts = false): void {
   if (status.retained_revisions + incomingRevisions <= SHARED_SKILL_RETENTION_LIMITS.sourceRevisions &&
     status.retained_bytes + incomingBytes <= SHARED_SKILL_RETENTION_LIMITS.sourceBytes &&
     status.brain_retained_revisions + incomingRevisions <= SHARED_SKILL_RETENTION_LIMITS.brainRevisions &&
     status.brain_retained_bytes + incomingBytes <= SHARED_SKILL_RETENTION_LIMITS.brainBytes) return;
   const error = new OperationError('skill_retention_capacity', 'Retained skill revisions exceed this source storage budget.',
     'Inspect get_skill_retention and run bounded prune_skill_revisions after delivery/pin leases or the 24-hour grace period expire. Active revisions and receipts are not deleted.');
-  if (exposeCounts) error.detail = JSON.stringify({ retained_revisions: status.retained_revisions, retained_bytes: status.retained_bytes,
-    brain_retained_revisions: status.brain_retained_revisions, brain_retained_bytes: status.brain_retained_bytes,
-    protected_leases: status.protected_leases, protected_publications: status.protected_publications,
-    eligible_revisions: status.eligible_revisions, incoming_revisions: incomingRevisions, incoming_bytes: incomingBytes });
+  if (exposeCounts) error.detail = JSON.stringify({ ...status, incoming_revisions: incomingRevisions, incoming_bytes: incomingBytes });
   throw error;
 }
 
@@ -118,7 +132,10 @@ export async function pruneSharedSkillRevisions(ctx: OperationContext, sourceId 
     await declarePersistenceProtocol(tx);
     const [source] = await tx.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1 FOR UPDATE', [sourceId]);
     if (source?.incarnation !== incarnation) throw new OperationError('source_changed', 'The retention source changed.');
-    return withCoordinatedWrite(tx, [sourceId], () => pruneSharedSkillRevisionsInTransaction(tx, sourceId, incarnation));
+    return withCoordinatedWrite(tx, [sourceId], async () => {
+      const count = await pruneSharedSkillRevisionsInTransaction(tx, sourceId, incarnation);
+      return { ...await sharedSkillRetentionStatus(tx, sourceId, incarnation), pruned_revisions: count };
+    });
   });
 }
 export async function retainSharedSkillRevision(ctx: OperationContext, params: { source_id?: string; source_incarnation: string; pack_id: string; name: string; revision: string; hours?: number }) {

@@ -50,6 +50,7 @@ export const SHARED_SKILLS_SCHEMA_STATEMENTS: readonly string[] = [
       REFERENCES shared_skill_revisions(source_id,source_incarnation,pack_id,name,revision) ON DELETE RESTRICT
   )`,
   `CREATE INDEX IF NOT EXISTS shared_skill_revision_lease_expiry_idx ON shared_skill_revision_leases(source_id,source_incarnation,expires_at)`,
+  `CREATE INDEX IF NOT EXISTS shared_skill_revision_lease_target_idx ON shared_skill_revision_leases(source_id,source_incarnation,pack_id,name,revision,expires_at)`,
 ];
 
 export const SHARED_SKILLS_DELIVERY_LEASE_SCHEMA_STATEMENTS: readonly string[] = [

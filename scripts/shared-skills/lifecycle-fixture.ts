@@ -94,6 +94,7 @@ export async function createLifecycleFixture(options: { root: string; size: numb
     await claimWorktree(engine, 'default', contentRoot);
     await activateSharedSkillPersistence(engine, { confirmQuiesced: true });
     await engine.setConfig('mcp.publish_skills', 'true');
+    await engine.setConfig('mcp.strict_params', 'reject');
     const local: OperationContext = { engine, config: { engine: options.databaseUrl ? 'postgres' : 'pglite', embedding_disabled: true },
       sourceId: 'default', remote: false, dryRun: false, logger: { info() {}, warn() {}, error() {} } };
     const policy = await setSharedSkillPolicy(local, 'default', { version: 1, enabled: true, classes: ['prose', 'asset'],
@@ -160,14 +161,14 @@ export async function createLifecycleFixture(options: { root: string; size: numb
       } catch (error) { counters.errors++; throw error; }
     }
     async function verifyAndFetch(peer: BenchmarkPeer, skill: SharedSkillIdentity, latest = false): Promise<SharedSkillDetail> {
-      const { revision, ...key } = identity(skill);
-      const detail = await call<SharedSkillDetail>(peer, 'get_skill', { ...key, ...(!latest ? { revision } : {}), schema_version: 2 });
+      const { revision, brain_id, ...key } = identity(skill);
+      const detail = await call<SharedSkillDetail>(peer, 'get_skill', { ...key, expected_brain_id: brain_id, ...(!latest ? { revision } : {}), schema_version: 2 });
       if (!latest) assert.equal(detail.revision, skill.revision, 'Body fetch must return the exact issued revision');
       assert.equal(detail.delivery, 'complete', 'Benchmark files must have complete approved closure');
       const main = detail.files.find(file => file.path === `skills/${detail.name}/SKILL.md`);
       assert(main); assert.equal(sha256(detail.body), main.sha256, 'Body must match its declared manifest hash');
       for (const file of detail.files.filter(file => file.path !== main.path)) {
-        const asset = await call<{ revision: string; content: string; sha256: string; size: number }>(peer, 'get_skill_asset', { ...identity(detail), path: file.path });
+        const asset = await call<{ revision: string; content: string; sha256: string; size: number }>(peer, 'get_skill_asset', { ...key, expected_brain_id: brain_id, revision: detail.revision, path: file.path });
         const bytes = Buffer.from(asset.content, 'base64');
         meter.counters().decoded_asset_bytes += bytes.length;
         assert.equal(asset.revision, detail.revision); assert.equal(sha256(bytes), file.sha256); assert.equal(asset.sha256, file.sha256); assert.equal(bytes.length, file.size);
