@@ -619,11 +619,11 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`Migration v${m.version} threw: ${msg}`);
+      if (e instanceof PgliteBusyError) throw e;
       // Same partial-on-throw treatment so the cap counts runaway failures.
       try {
         if (recordCheckpoint) appendCompletedMigration({ version: m.version, status: 'partial' });
       } catch { /* swallow ledger-write failure on throw path */ }
-      if (e instanceof PgliteBusyError) throw e;
       failed = true;
       break;
     }

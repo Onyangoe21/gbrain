@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runCli } from './helpers/cli-spawn.ts';
 import type { CompletedMigrationEntry } from '../src/core/preferences.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { acquireLock, releaseLock } from '../src/core/pglite-lock.ts';
 
 const root = resolve(import.meta.dir, '..');
 
@@ -24,6 +26,34 @@ function entries(ledger: string): CompletedMigrationEntry[] {
 }
 
 describe('migration runner completion safety', () => {
+  test('live-owner retries do not wedge a pending content migration after the owner exits', async () => {
+    await fixture(async (home, ledger) => {
+      const database = join(home, '.gbrain', 'brain');
+      const engine = new PGLiteEngine();
+      try {
+        await engine.connect({ database_path: database });
+        await engine.initSchema();
+      } finally { await engine.disconnect(); }
+      const lock = await acquireLock(database);
+      const lockPath = join(lock.lockDir!, 'lock');
+      writeFileSync(lockPath, JSON.stringify({ ...JSON.parse(readFileSync(lockPath, 'utf8')), subcommand: 'serve' }));
+      const args = ['apply-migrations', '--yes', '--migration', '0.53.0', '--no-autopilot-install', '--json'];
+      try {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const busy = await runCli(args, { home, cwd: home });
+          expect(busy.exitCode).toBe(1);
+          expect(JSON.parse(busy.stdout.trim().split('\n').at(-1)!)).toMatchObject({
+            error: 'pglite_busy', retryable: true, reason: 'live_serve',
+          });
+          expect(JSON.parse(readFileSync(lockPath, 'utf8')).pid).toBe(process.pid);
+        }
+      } finally { await releaseLock(lock); }
+      const resumed = await runCli(args, { home, cwd: home });
+      expect(resumed.exitCode).toBe(0);
+      expect(entries(ledger).filter(row => row.version === '0.53.0').map(row => row.status)).toEqual(['complete']);
+    });
+  }, 60_000);
+
   test('forced previews do not copy a legacy ledger or open a nonexistent database', async () => {
     await fixture(async (home, ledger) => {
       const relocated = join(home, 'relocated');
