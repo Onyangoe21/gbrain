@@ -102,6 +102,7 @@ export function factsAbsorbShouldRetry(
 // handler registered via bare worker.register() runs with a stale gateway
 // (the #3387 chronicle_extract silent-no_events class).
 const GATEWAY_REFRESH_JOB_NAMES = new Set([
+  'memory-cues-build',
   'embed',
   'extract-conversation-facts',
   'enrich',
@@ -2121,6 +2122,10 @@ export async function registerBuiltinHandlers(
   // terminal with "shell handler registered…" lines. The real `jobs work` path
   // omits opts and prints as before.
   const quiet = opts?.quiet === true;
+  registerBuiltinJob(worker, engine, 'memory-cues-build', async job => {
+    const { createMemoryCueBuildHandler } = await import('../core/minions/handlers/memory-cues-build.ts');
+    return createMemoryCueBuildHandler(engine)(job);
+  });
   worker.register('sync', async (job) => {
     const { performSync } = await import('./sync.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;

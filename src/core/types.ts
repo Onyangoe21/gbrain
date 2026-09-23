@@ -790,6 +790,8 @@ export interface ChunkInput {
 
 // Search
 export interface SearchResult {
+  memory_cue?: { id: string; family: 'scene' | 'horizon' | 'bridge'; similarity: number; role?: 'anchor' | 'support'; evidence_chunks?: number };
+  rerank_uses_memory_cue?: true;
   slug: string;
   page_id: number;
   title: string;
@@ -1975,6 +1977,13 @@ export function affectsRecall(d: { stage?: string; reason?: string } | undefined
  * "keyword-only fallback" from "full hybrid with expansion."
  */
 export interface HybridSearchMeta {
+  memory_cues?: {
+    mode: 'off' | 'shadow' | 'on';
+    status: 'ready' | 'empty' | 'skipped' | 'degraded';
+    reason?: string;
+    candidates: number;
+    admitted: number;
+  };
   /** True iff vector search actually ran. False when OPENAI_API_KEY missing or embed failed. */
   vector_enabled: boolean;
   /** Post-auto-detect detail level. */

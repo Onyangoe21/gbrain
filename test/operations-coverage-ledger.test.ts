@@ -64,6 +64,7 @@ const LEDGER: Record<string, string> = {
   get_stats: 'test/cli-bigint-normalize.test.ts',
   get_health: 'test/doctor-timeline-metric-labels-2298.test.ts',
   run_doctor: 'test/truthful-catalog.e2e-lite.test.ts',
+  memory_cues: 'test/memory-cues-admin.test.ts',
   get_versions: 'test/get-page-federated-scope.test.ts',
   revert_version: 'test/e2e/mechanical.test.ts',
   get_brain_identity: 'test/get-brain-identity.test.ts',

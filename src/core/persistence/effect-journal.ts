@@ -8,6 +8,7 @@ import type { EffectKind, PersistenceEffect, EffectRequest } from './effect-mode
 import type { SqlEngine } from './model.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
+import { cueSchedulingEnabled } from '../memory-cues/scheduling.ts';
 
 export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest, revision: string | undefined,
   outcome: Record<string, unknown>, prepared?: PreparedMutation): Promise<void> {
@@ -27,6 +28,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     if (outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });
   }
   if (snapshot && !snapshot.page.deleted_at) {
+    if (await cueSchedulingEnabled(tx, row.source_id)) await queue('memory-cues');
     if (!prepared?.deferEmbedding) await queue('embedding');
     outcome.embedding_state = prepared?.deferEmbedding ? 'deferred' : 'queued';
     if ((outcome.facts_backstop as { queued?: boolean } | undefined)?.queued) {

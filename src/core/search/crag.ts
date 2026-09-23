@@ -86,7 +86,7 @@ export function gradeRetrievalConfidence(
   }
 
   // Calibrated cross-encoder signal when the reranker ran.
-  if (typeof top.rerank_score === 'number' && Number.isFinite(top.rerank_score)) {
+  if (!top.rerank_uses_memory_cue && typeof top.rerank_score === 'number' && Number.isFinite(top.rerank_score)) {
     return top.rerank_score >= floor
       ? { level: 'strong', reason: 'rerank_top', top_evidence: top.evidence, top_rerank_score: top.rerank_score }
       : { level: 'weak', reason: 'rerank_top_below_floor', top_evidence: top.evidence, top_rerank_score: top.rerank_score };

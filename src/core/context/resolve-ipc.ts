@@ -64,6 +64,7 @@ import type { EntityCandidate } from './entity-salience.ts';
 import type { WindowTurn } from './entity-salience.ts';
 import type { PointerBlock } from './retrieval-reflex.ts';
 import type { TurnContextResult } from './turn-context.ts';
+import type { VolunteeredPage } from './volunteer.ts';
 import type {
   SyncAbortRequest,
   SyncAbortResponse,
@@ -175,6 +176,24 @@ export interface TurnContextRequest {
   channel?: string;
 }
 
+export interface SituationRecallRequest {
+  kind: 'situation_recall';
+  protocol: 2;
+  secret: string;
+  sourceId?: string;
+  window: WindowTurn[];
+  priorContextText?: string;
+  excludeSlugs?: string[];
+}
+
+export interface SituationRecallResponse {
+  ok: boolean;
+  protocol: 2;
+  page?: VolunteeredPage | null;
+  error?: string;
+  degradedReason?: string;
+}
+
 /**
  * v0.45.7 ambient recall — boundary context pack over IPC. Two modes:
  *   - assembly (default): the server resolves standing entities (request
@@ -224,6 +243,7 @@ export interface ContextPackRequest {
 export type IpcRequest =
   | ResolveRequest
   | TurnContextRequest
+  | SituationRecallRequest
   | ContextPackRequest
   | SyncStartRequest
   | SyncStatusRequest
@@ -269,6 +289,7 @@ export type SweepStatusIpcHandler = (req: SweepStatusRequest) => SweepStatusResp
 export interface IpcHandlers {
   resolve: ResolveHandler;
   turn_context?: TurnContextHandler;
+  situation_recall?: (req: SituationRecallRequest) => Promise<VolunteeredPage | null>;
   context_pack?: ContextPackHandler;
   sync_start?: SyncStartIpcHandler;
   sync_status?: SyncStatusIpcHandler;
@@ -538,6 +559,15 @@ export async function requestTurnContext(
   // as a resolve request; its block is meaningless for turn_context.
   if ((resp as { protocol?: unknown }).protocol !== 2) return { degraded: 'stale_serve' };
   return resp as TurnContextResponse;
+}
+
+export async function requestSituationRecall(
+  socketPath: string,
+  req: Omit<SituationRecallRequest, 'kind' | 'protocol'>,
+  opts: { timeoutMs?: number } = {},
+): Promise<SituationRecallResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE> {
+  const line = JSON.stringify({ ...req, kind: 'situation_recall', protocol: 2 } satisfies SituationRecallRequest);
+  return syncRoundTrip<SituationRecallResponse>(socketPath, line, opts.timeoutMs ?? TURN_CONTEXT_CLIENT_TIMEOUT_MS);
 }
 
 /** Client-facing context_pack request shape (kind/protocol filled in by the helper). */
@@ -819,6 +849,8 @@ export async function startResolveIpcServer(
               resp = JSON.stringify(out);
               if (block) delivered = { block, req };
             }
+          } else if (kind === 'situation_recall') {
+            resp = JSON.stringify(await handleSituationRecall(parsed as SituationRecallRequest, handlers, opts));
           } else if (kind === 'turn_context') {
             const req = parsed as TurnContextRequest;
             const tcResp = await handleTurnContext(req, handlers, opts);
@@ -892,6 +924,41 @@ export async function startResolveIpcServer(
       resolve(server);
     }); } catch { if (!listened) void binding.release(); resolve(null); }
   });
+}
+
+async function handleSituationRecall(
+  req: SituationRecallRequest,
+  handlers: IpcHandlers,
+  opts: IpcServerOpts,
+): Promise<SituationRecallResponse> {
+  if (!handlers.situation_recall) return { ok: false, protocol: 2, error: 'unsupported_kind' };
+  if (req.protocol !== 2) return { ok: false, protocol: 2, error: 'unsupported_protocol' };
+  if (!opts.secret || !secretMatches(req.secret, opts.secret)) return { ok: false, protocol: 2, error: 'unauthorized' };
+  if (!opts.boundSourceId || (req.sourceId !== undefined && req.sourceId !== opts.boundSourceId)) {
+    return { ok: false, protocol: 2, error: 'source_mismatch' };
+  }
+  if (!Array.isArray(req.window) || req.window.length > 40 || req.window.some(turn =>
+    !turn || !['user', 'assistant'].includes(turn.role) || typeof turn.text !== 'string')
+    || (req.priorContextText !== undefined && typeof req.priorContextText !== 'string')
+    || (req.excludeSlugs !== undefined && (!Array.isArray(req.excludeSlugs) || req.excludeSlugs.length > 100
+      || req.excludeSlugs.some(slug => typeof slug !== 'string')))) {
+    return { ok: false, protocol: 2, error: 'invalid_request' };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      handlers.situation_recall(req),
+      new Promise<'deadline'>(resolve => {
+        timer = setTimeout(() => resolve('deadline'), TURN_CONTEXT_SERVER_BUDGET_MS);
+      }),
+    ]);
+    if (result === 'deadline') return { ok: true, protocol: 2, page: null, degradedReason: 'server_budget' };
+    return { ok: true, protocol: 2, page: result };
+  } catch {
+    return { ok: false, protocol: 2, error: 'situation_recall_failed' };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** turn_context server path: auth [S3#6] → source binding [CX2-10] → budgeted assembly [G11]. */

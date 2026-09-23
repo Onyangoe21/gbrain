@@ -1,6 +1,6 @@
 import type { WriteRequest } from './model.ts';
 
-export type EffectKind = 'git' | 'embedding' | 'withdrawal-mirror' | 'facts-backstop';
+export type EffectKind = 'git' | 'embedding' | 'withdrawal-mirror' | 'facts-backstop' | 'memory-cues';
 export interface EffectRecovery {
   version: 1;
   kind: 'withdrawal-mirror';

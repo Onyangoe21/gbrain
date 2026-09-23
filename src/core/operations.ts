@@ -76,6 +76,7 @@ export { MANAGED_LINK_SOURCES } from './ops/links.ts';
 // contractual — docs/TOOL_CATALOG.md is generated from it).
 
 import { adminOperations } from './ops/admin.ts';
+import { memoryCueOperations } from './ops/memory-cues.ts';
 import { skillsCatalogOperations } from './ops/skills-catalog.ts';
 import { syncStatusOperations } from './ops/sync-status.ts';
 import { rawDataOperations } from './ops/raw-data.ts';
@@ -146,6 +147,7 @@ export const operations: Operation[] = [
   // Admin (get_stats, get_health, run_doctor, get_versions, revert_version
   // + the v0.31.1 banner packet get_brain_identity) — ops/admin.ts
   ...adminOperations,
+  ...memoryCueOperations,
   // PR1: skill catalog over MCP (list_skills, get_skill, list_brain_skillpack,
   // advisor) + v0.41.19.0 get_status_snapshot — ops/skills-catalog.ts
   ...skillsCatalogOperations,

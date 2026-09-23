@@ -22,6 +22,7 @@
 
 import { createGBrainContextEngine, ENGINE_ID } from './core/context-engine.ts';
 import type { ResolveEntitiesFn } from './core/context/reflex.ts';
+import type { SituationRecallFn } from './core/context/volunteer.ts';
 
 /**
  * Plugin-entry shape consumed by the OpenClaw host. The host's plugin loader
@@ -58,6 +59,7 @@ interface PluginCtx {
    * provide it) keep working unchanged — no pluginApi floor bump needed.
    */
   resolveEntities?: ResolveEntitiesFn;
+  recallSituation?: SituationRecallFn;
   /** Back-compat alias some hosts may use for the same capability. */
   brainQuery?: ResolveEntitiesFn;
   [key: string]: unknown;
@@ -74,6 +76,7 @@ export function register(api: PluginApi) {
     return createGBrainContextEngine({
       workspaceDir: ctx.workspaceDir,
       resolveEntities: hostResolver,
+      recallSituation: typeof ctx.recallSituation === 'function' ? ctx.recallSituation : undefined,
     });
   });
 }

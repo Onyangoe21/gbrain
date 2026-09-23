@@ -5337,7 +5337,10 @@ anything. Push-based context adds the other direction: the brain volunteers
 relevant pages from the recent conversation, confidence-gated so push noise
 never becomes worse than pull silence.
 
-The push channels share one zero-LLM core (`src/core/context/volunteer.ts`):
+The push channels share one core (`src/core/context/volunteer.ts`). Its default
+entity-resolution path makes no model calls. The optional, separately enrolled
+[situation-aware recall](situation-recall.md) arm can embed the recent turn
+window, but adds no generative LLM call at read time:
 
 | Channel | Surface | When to use |
 |---|---|---|
@@ -5350,6 +5353,14 @@ Push context is READ-side. Its WRITE-side sibling — the opt-in ambient
 memory writeback channel (`gbrain hook stop` banking gated user turns for
 serve-side extraction, `memory.auto_writeback`) — is documented in
 [ambient-writeback.md](./ambient-writeback.md).
+
+Situation pointers are experimental and default off. They require explicit
+source enrollment and push calibration, stay inside the existing page budget,
+and never expose generated cue text. Their rendered score is labeled **cue
+similarity**, not factual confidence. OpenClaw also needs the engine-free
+`GBRAIN_MEMORY_CUES_PUSH=1` attempt gate or an explicit host capability;
+database consent remains authoritative. The authenticated `situation_recall`
+IPC route does not claim a hook delivery channel or extend unsupported hosts.
 
 ## How it decides
 

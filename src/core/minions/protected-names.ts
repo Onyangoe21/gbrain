@@ -13,6 +13,7 @@
  */
 
 export const PROTECTED_JOB_NAMES: ReadonlySet<string> = new Set([
+  'memory-cues-build',
   'shell',
   // v0.15: subagent + aggregator are protected because they call the
   // Anthropic API. MCP callers can't submit them directly; only the

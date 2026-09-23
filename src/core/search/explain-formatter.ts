@@ -53,6 +53,9 @@ export function formatResultExplain(
   if (typeof result.cosine === 'number') {
     lines.push(`   cosine=${fmt(result.cosine)} (raw query↔chunk similarity)`);
   }
+  if (result.memory_cue) {
+    lines.push(`   situation cue: ${result.memory_cue.family} similarity=${fmt(result.memory_cue.similarity)} (retrieval only)`);
+  }
 
   let anyBoost = false;
 
@@ -131,6 +134,11 @@ export function formatDegradedSummary(degraded: HybridSearchMeta['degraded'] | u
   return `degraded: ${degraded.map((d) => (d.reason ? `${d.stage} (${d.reason})` : d.stage)).join(', ')}`;
 }
 
+export function formatMemoryCueSummary(meta: HybridSearchMeta['memory_cues']): string | null {
+  if (!meta || meta.mode === 'off') return null;
+  return `memory cues: ${meta.mode}/${meta.status}${meta.reason ? ` (${meta.reason})` : ''}, candidates=${meta.candidates}, admitted=${meta.admitted}`;
+}
+
 /**
  * Format a full result list. Caller passes the SearchResult[] directly;
  * the formatter handles enumeration. Returns a single string (multi-line
@@ -140,11 +148,14 @@ export function formatResultsExplain(
   results: SearchResult[],
   meta?: HybridSearchMeta,
 ): string {
-  if (results.length === 0) return 'No results.\n';
+  if (results.length === 0) {
+    const cues = formatMemoryCueSummary(meta?.memory_cues);
+    return cues ? `${cues}\n\nNo results.\n` : 'No results.\n';
+  }
   const body = results.map((r, i) => formatResultExplain(r, i + 1)).join('\n\n') + '\n';
   // v0.42.3.0 — prepend the autocut summary when meta carries a decision;
   // v0.48.2 — and the degraded summary when any stage was skipped.
-  const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded)]
+  const head = [formatAutocutSummary(meta?.autocut), formatDegradedSummary(meta?.degraded), formatMemoryCueSummary(meta?.memory_cues)]
     .filter((l): l is string => l !== null);
   return head.length > 0 ? `${head.join('\n')}\n\n${body}` : body;
 }

@@ -49,6 +49,7 @@ import {
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker, type RerankPassThroughReason, type RerankSkipReason } from './rerank.ts';
+import { createMemoryCueSearch } from './memory-cues.ts';
 import {
   classifyQuery,
   classifyQueryWithBrainPatterns,
@@ -1396,6 +1397,7 @@ export async function hybridSearch(
   // return path (empty array = clean run) so cache rows always carry the
   // stamp and a served row can prove its cleanliness (ENG-5/cache_prestamp).
   const degraded: DegradedStageEntry[] = [];
+  const memoryCues = await createMemoryCueSearch(engine, { ...opts, ...searchOpts });
 
   // A throwing user callback must never break the search hot path — onMeta
   // is a public surface (gbrain/search/hybrid) so a third-party closure bug
@@ -1410,6 +1412,7 @@ export async function hybridSearch(
   // lastResultsCount at each return path; undefined when there are no results.
   let lastRank1Score: number | undefined;
   const emitMeta = (meta: HybridSearchMeta): void => {
+    meta.memory_cues = { ...memoryCues.meta };
     try {
       opts?.onMeta?.(meta);
     } catch {
@@ -2007,7 +2010,8 @@ export async function hybridSearch(
     }
   }
 
-  if (vectorArms.length === 0) {
+  await memoryCues.recall(queryEmbedding, resolvedCol, effectiveModality === 'text' && !unifiedDone);
+  if (vectorArms.length === 0 && memoryCues.list.length === 0) {
     // Embed/vector failed silently; record that vector did not run.
     // v0.29.1 codex pass-2 #4: this is the third return path. Apply
     // post-fusion stages here too — without it, salience='on' silently
@@ -2159,6 +2163,7 @@ export async function hybridSearch(
     keywordFusionList,
     titleFusionList,
     relationalList,
+    memoryCueArm: memoryCues,
     includeRelational: effectiveModality !== 'image',
     relationalQuery: parseRelationalQuery(query) !== null,
     onKeywordArmConfidence: (d) => { keywordArmConfidence = d; },
@@ -2180,7 +2185,7 @@ export async function hybridSearch(
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
   // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
+    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name, memoryCues.rrfShare(allLists));
   }
 
   // Phase E3 (Cat 13): metadata boost gate — decided from the SAME lexical
@@ -2302,6 +2307,7 @@ export async function hybridSearch(
   const reranked = rerankerOpts.enabled
     ? await applyReranker(query, deduped, {
         ...(rerankerOpts as any),
+        ...memoryCues.rerankerOptions(),
         onSkip: (reason: RerankSkipReason) => pushDegraded(degraded, 'reranker_skipped', reason),
         onPassThrough: (reason: RerankPassThroughReason) => {
           pushDegraded(degraded, 'rerank_passthrough', reason);
@@ -2430,6 +2436,13 @@ export async function hybridSearch(
     autocutDecision = r.decision;
   }
 
+  returnPool = await memoryCues.expandEvidence(returnPool,
+    async (rows) => {
+      await stampUnverifiedExtractions(engine, rows, opts);
+      return queryEmbedding ? cosineReScore(engine, rows, queryEmbedding, resolvedCol.name) : rows;
+    },
+    { cosineFloor: resolvedMode.evidence_cosine_floor });
+
   // #3995 — guaranteed page-1 relational evidence. A fired arm's answer is
   // often lexically unrecoverable (unverified entity stub, single-arm RRF
   // score), so its fused row can land beyond the limit slice on multi-arm
@@ -2446,18 +2459,19 @@ export async function hybridSearch(
     relationalSlotDecision = r.decision;
   }
 
-  const sliced = returnPool.slice(offset, offset + limit);
   // v0.32.3 search-lite: budget enforcement at the main return path.
   // hybridSearchCached used to be the only place this fired; now bare
   // hybridSearch enforces it too so eval-replay + eval-longmemeval see
   // the same budget behavior as the production query op.
-  const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
-  await stampContentFlags(engine, budgeted, opts);
+  const { results: packed, meta: budgetMeta, sliced } = memoryCues.pack(returnPool, offset, limit, resolvedMode.tokenBudget,
+    { maxPerPage: dedupOpts?.maxPerPage, relationalList });
+  await stampContentFlags(engine, packed, opts);
+  const budgeted = await memoryCues.revalidate(packed);
   lastResultsCount = budgeted.length;
   lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;
   stampBudgetStage(degraded, budgetMeta);
   emitMeta({
-    vector_enabled: true,
+    vector_enabled: vectorArms.length > 0,
     detail_resolved: detailResolved,
     expansion_applied: expansionApplied,
     intent: suggestions.intent,
@@ -3221,6 +3235,7 @@ export async function cosineReScore(
   results: SearchResult[],
   queryEmbedding: Float32Array,
   column: string = 'embedding',
+  cueRrfShare?: (result: SearchResult) => number,
 ): Promise<SearchResult[]> {
   const chunkIds = results
     .map(r => r.chunk_id)
@@ -3259,7 +3274,10 @@ export async function cosineReScore(
     const chunkEmb = r.chunk_id != null ? embeddingMap.get(r.chunk_id) : undefined;
     const cosine = chunkEmb ? cosineSimilarity(queryEmbedding, chunkEmb) : 0;
     const normRrf = maxRrf > 0 ? r.score / maxRrf : 0;
-    const blended = 0.7 * normRrf + 0.3 * cosine;
+    const share = cueRrfShare?.(r) ?? 0;
+    const blended = share > 0
+      ? 0.7 * normRrf + 0.3 * (share * normRrf + (1 - share) * cosine)
+      : 0.7 * normRrf + 0.3 * cosine;
 
     if (DEBUG) {
       console.error(`[search-debug] ${r.slug}:${r.chunk_id} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);

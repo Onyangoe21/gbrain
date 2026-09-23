@@ -48,10 +48,13 @@ import {
 } from './retrieval-reflex.ts';
 import {
   volunteerStage,
+  recallSituationPage,
+  formatVolunteerScore,
   VOLUNTEER_DEFAULT_MAX_PAGES,
   type VolunteeredPage,
+  type SituationRecallFn,
 } from './volunteer.ts';
-import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } from './resolve-ipc.ts';
+import { resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE, readIpcSecretForConfig, requestSituationRecall } from './resolve-ipc.ts';
 
 /** Per-turn resolver options shared by every rung of the ladder. */
 export interface ResolveEntitiesOpts {
@@ -104,6 +107,7 @@ export interface ReflexParams {
   windowTurns?: WindowTurn[];
   /** Host-provided resolver, if the OpenClaw plugin contract supplied one. */
   resolveEntities?: ResolveEntitiesFn;
+  recallSituation?: SituationRecallFn;
 }
 
 /** Default extraction window (turns). 1 = legacy current-turn-only. */
@@ -203,8 +207,10 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
     const windowSlice = windowed ? params.windowTurns!.slice(-windowN) : null;
     const windowCandidates = windowSlice ? extractCandidatesFromWindow(windowSlice) : null;
     const candidates: EntityCandidate[] = windowCandidates ?? extractCandidates(params.currentUserText);
+    const situationEnabled = volunteerEnabled(cfg)
+      && (params.recallSituation !== undefined || process.env.GBRAIN_MEMORY_CUES_PUSH === '1');
     // Zero-candidate fast path: regex passes only, no brain touch.
-    if (!candidates.length) return null;
+    if (!candidates.length && !situationEnabled) return null;
 
     const opts: ResolveEntitiesOpts = {
       priorContextText: params.priorContextText,
@@ -213,7 +219,7 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
       lexicalArms: lexicalArmsEnabled(cfg),
     };
     const startedAt = Date.now();
-    const block = await withTimeout(resolve(params, cfg, candidates, opts), TIMEOUT_MS);
+    const block = candidates.length ? await withTimeout(resolve(params, cfg, candidates, opts), TIMEOUT_MS) : null;
     const pointers = block?.pointers ?? [];
 
     // Arm 2 (2026-08 fix wave): volunteer stage — windowed lanes only (the
@@ -222,7 +228,7 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
     // REMAINING-budget timeout, never a shared wrapper: expiry falls back to
     // the pointer-only block instead of discarding resolved pointers.
     let volunteered: VolunteeredPage[] = [];
-    if (windowCandidates && windowSlice && volunteerEnabled(cfg)) {
+    if (((windowCandidates && windowSlice) || situationEnabled) && volunteerEnabled(cfg)) {
       const remaining = TIMEOUT_MS - (Date.now() - startedAt);
       if (remaining > MIN_VOLUNTEER_BUDGET_MS) {
         // Own try/catch, NOT just the timeout race (codex adversarial,
@@ -235,13 +241,16 @@ export async function buildReflexAddition(params: ReflexParams): Promise<string 
           const v = await withTimeout(
             volunteerStage(
               (cands, ropts) => resolve(params, cfg, cands, ropts),
-              windowCandidates,
-              windowSlice.length,
+              windowCandidates ?? [],
+              windowSlice?.length ?? 1,
               {
                 excludeSlugs: new Set(pointers.map((p) => p.slug)),
                 priorContextText: params.priorContextText,
                 lexicalArms: opts.lexicalArms,
                 maxPages: VOLUNTEER_DEFAULT_MAX_PAGES,
+                turns: windowSlice ?? [{ role: 'user', text: params.currentUserText }],
+                ...(situationEnabled ? { recallSituation: situationResolver(params, cfg) } : {}),
+                deadlineAt: startedAt + TIMEOUT_MS - 25,
               },
             ),
             remaining,
@@ -306,9 +315,42 @@ export function renderReflexAddition(
   lines.push('## Brain pages the brain volunteers');
   for (const v of volunteered) {
     const syn = v.synopsis ? ` — ${v.synopsis}` : '';
-    lines.push(`- **${v.display}** → \`${v.slug}\` (${v.confidence.toFixed(2)}, ${v.rationale})${syn}`);
+    const source = v.arm === 'situation' ? ` (source_id: ${JSON.stringify(v.source_id)})` : '';
+    lines.push(`- **${v.display}** → \`${v.slug}\`${source} (${formatVolunteerScore(v)}, ${v.rationale})${syn}`);
   }
   return lines.join('\n');
+}
+
+function situationResolver(params: ReflexParams, cfg: GBrainConfig | null): SituationRecallFn | undefined {
+  if (params.recallSituation) return params.recallSituation;
+  if (params.resolveEntities) return undefined;
+  if (cfg?.engine === 'pglite' && cfg.database_path) {
+    return async (turns, opts) => {
+      const secret = readIpcSecretForConfig(cfg);
+      if (!secret) return null;
+      const { resolveSourceIdEngineFree } = await import('../source-resolver.ts');
+      const sourceId = resolveSourceIdEngineFree(null, params.workspaceDir);
+      const result = await requestSituationRecall(resolveSocketPath(cfg.database_path!), {
+        secret,
+        sourceId: sourceId ?? undefined,
+        window: turns,
+        priorContextText: opts.priorContextText,
+        excludeSlugs: [...(opts.excludeSlugs ?? [])],
+      }, { timeoutMs: opts.deadlineAt === undefined ? undefined : Math.max(1, opts.deadlineAt - Date.now()) });
+      if (result === IPC_UNAVAILABLE || 'degraded' in result || !result.ok) return null;
+      return result.page ?? null;
+    };
+  }
+  if (isPostgres(cfg)) {
+    return async (turns, opts) => {
+      const engine = await getPostgresEngine(cfg);
+      if (!engine) return null;
+      const { resolveSourceId } = await import('../source-resolver.ts');
+      const sourceId = await resolveSourceId(engine, null, params.workspaceDir);
+      return recallSituationPage(engine, turns, { ...opts, sourceIds: [sourceId] });
+    };
+  }
+  return undefined;
 }
 
 async function resolve(

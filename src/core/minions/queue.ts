@@ -1455,7 +1455,7 @@ export class MinionQueue {
    * The map binds as a RAW object (never JSON.stringify into ::jsonb — the
    * postgres.js double-encode trap; PGLite hides it, real PG does not).
    */
-  async claim(lockToken: string, lockDurationMs: number, queue: string, registeredNames: string[]): Promise<MinionJob | null> {
+  async claim(lockToken: string, lockDurationMs: number, queue: string, registeredNames: string[], jobId?: number): Promise<MinionJob | null> {
     if (registeredNames.length === 0) return null;
     await assertNoUnreviewedJobs(this.engine);
 
@@ -1493,12 +1493,13 @@ export class MinionQueue {
        WHERE id = (
          SELECT id FROM minion_jobs
          WHERE queue = $3 AND status = 'waiting' AND submission_authority IS NOT NULL AND name = ANY($4)
+         ${jobId === undefined ? '' : 'AND id=$7::bigint'}
          ORDER BY priority ASC, created_at ASC
          FOR UPDATE SKIP LOCKED
          LIMIT 1
        )
        RETURNING *`,
-      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS]
+      [lockToken, lockDurationMs, queue, registeredNames, HANDLER_DEFAULT_TIMEOUT_MS, HANDLER_DEFAULT_LOCK_DURATION_MS, ...(jobId === undefined ? [] : [jobId])]
     );
     return rows.length > 0 ? rowToMinionJob(rows[0]) : null;
   }
@@ -2085,7 +2086,7 @@ export class MinionQueue {
   }
 
   /** Detect and handle stalled jobs. Single CTE, no off-by-one. Returns affected jobs. */
-  async handleStalled(graceMsOverride?: number): Promise<{ requeued: MinionJob[]; dead: MinionJob[] }> {
+  async handleStalled(graceMsOverride?: number, registeredNames?: string[]): Promise<{ requeued: MinionJob[]; dead: MinionJob[] }> {
     await assertNoUnreviewedJobs(this.engine);
     // W0 fix-wave (Tier-1 #4): the dead-letter branch previously emitted NO
     // child_done and never unblocked aggregator parents — a child that died
@@ -2103,8 +2104,9 @@ export class MinionQueue {
         `SELECT id, parent_job_id, stalled_counter, max_stalled
            FROM minion_jobs
           WHERE status = 'active'
-            AND lock_until < now() - ($1::double precision * interval '1 millisecond')`,
-        [graceMs]
+            AND lock_until < now() - ($1::double precision * interval '1 millisecond')
+            ${registeredNames === undefined ? '' : 'AND name=ANY($2::text[])'}`,
+        [graceMs, ...(registeredNames === undefined ? [] : [registeredNames])]
       );
       if (candidates.length === 0) return { requeued: [], dead: [] };
       const ids = candidates.map(c => c.id);

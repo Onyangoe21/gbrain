@@ -36,6 +36,8 @@ import { warnOncePerProcess } from '../utils.ts';
 export type RerankPassThroughReason = 'empty_result_set' | 'malformed_shape';
 
 export interface RerankerOpts {
+  documentForResult?: (result: SearchResult) => string;
+  additionalCandidates?: (result: SearchResult) => boolean;
   enabled: boolean;
   /** How many of the top results to send to the reranker (default 30). */
   topNIn: number;
@@ -99,6 +101,7 @@ function classifyRerankFailure(err: unknown): RerankFailureReason {
 // DEFAULT_MAX_CHUNK_TOKENS already makes on the embed side.
 const RERANK_MAX_DOC_TOKENS = 1400;
 const RERANK_MAX_DOC_CHARS = 6000;
+export const RERANK_ADDITIONAL_CANDIDATE_LIMIT = 20;
 
 /**
  * Trim a reranker document to ~RERANK_MAX_DOC_TOKENS (char cap first, then
@@ -106,15 +109,15 @@ const RERANK_MAX_DOC_CHARS = 6000;
  * never orphans a UTF-16 surrogate — serde/nlohmann-based servers reject a lone
  * surrogate in the JSON body, which would trade the 500 for a 400.
  */
-export function capRerankDoc(text: string): string {
+export function capRerankDoc(text: string, maxTokens = RERANK_MAX_DOC_TOKENS, maxChars = RERANK_MAX_DOC_CHARS): string {
   // ASCII is <=1 token/char and Qwen-family ~1 token/char on CJK, so a doc
   // under the token ceiling in chars cannot overflow it: skip the tokenizer.
-  if (text.length <= RERANK_MAX_DOC_TOKENS) return text;
-  let doc = truncateUtf8(text, RERANK_MAX_DOC_CHARS);
+  if (text.length <= maxTokens) return text;
+  let doc = truncateUtf8(text, maxChars);
   for (let i = 0; i < 4; i++) {
     const tokens = estimateTokens(doc);
-    if (tokens <= RERANK_MAX_DOC_TOKENS) break;
-    doc = truncateUtf8(doc, Math.floor(doc.length * (RERANK_MAX_DOC_TOKENS / tokens) * 0.95));
+    if (tokens <= maxTokens) break;
+    doc = truncateUtf8(doc, Math.floor(doc.length * (maxTokens / tokens) * 0.95));
   }
   return doc;
 }
@@ -140,8 +143,16 @@ export async function applyReranker(
   // bundles never set 0 in practice).
   if (opts.topNIn <= 0) return results;
 
-  const head = results.slice(0, opts.topNIn);
-  const tail = results.slice(opts.topNIn);
+  const additional = opts.additionalCandidates ? results.filter(opts.additionalCandidates) : [];
+  const additionalSet = new Set(additional);
+  let head = results.slice(0, opts.topNIn);
+  let tail = results.slice(opts.topNIn);
+  if (additional.length > 0) {
+    const baseline = results.filter((r) => !additionalSet.has(r)).slice(0, opts.topNIn);
+    const selected = new Set([...baseline, ...additional.slice(0, RERANK_ADDITIONAL_CANDIDATE_LIMIT)]);
+    head = results.filter((r) => selected.has(r));
+    tail = results.filter((r) => !selected.has(r));
+  }
 
   // Document text — chunk_text is the matched span. Fall back to title if
   // empty (shouldn't happen in practice; defensive). Empty docs would
@@ -150,7 +161,7 @@ export async function applyReranker(
   // small physical batch never 500s on an oversized code/hex-heavy chunk.
   // Token-aware, not just char-capped, because hex-dense pages tokenize at
   // ~1 char/token. See capRerankDoc for what this costs hosted providers.
-  const documents = head.map(r => capRerankDoc(r.chunk_text || r.title || ''));
+  const documents = head.map(r => capRerankDoc(opts.documentForResult?.(r) ?? (r.chunk_text || r.title || '')));
 
   let reranked: RerankResult[];
   try {
@@ -240,6 +251,7 @@ export async function applyReranker(
       // (telemetry, debug, autocut) can see the new ordering signal. Doesn't
       // replace `score` — that's RRF and other consumers may depend on it.
       item.rerank_score = r.relevanceScore;
+      if (opts.documentForResult && additionalSet.has(item)) item.rerank_uses_memory_cue = true;
       // v0.40.4 attribution stamp (D12=A) — rank delta. Positive means
       // rank improved (moved closer to top). new_index is the next
       // push position in reorderedHead; original index was r.index.

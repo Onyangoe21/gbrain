@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { buildReflexAddition, warmReflex, type ResolveEntitiesFn as ReflexResolveEntitiesFn } from './context/reflex.ts';
+import type { SituationRecallFn } from './context/volunteer.ts';
 import { backupNagReadOnlyConsult, backupNoticeText, loadBackupStatus } from './backup/status-file.ts';
 // Types inlined from openclaw/plugin-sdk to avoid hard dependency during development.
 // At runtime inside OpenClaw, the real SDK is available; these types ensure build compat.
@@ -791,6 +792,7 @@ export function createGBrainContextEngine(ctx: {
    * PGLite. Absent → the engine falls to the serve IPC / Postgres-direct ladder.
    */
   resolveEntities?: ReflexResolveEntitiesFn;
+  recallSituation?: SituationRecallFn;
 }): ContextEngine {
   const workspaceDir = ctx.workspaceDir ?? process.cwd();
   // Warm the Postgres connection ahead of the first salient turn (no-op for
@@ -1212,6 +1214,7 @@ export function createGBrainContextEngine(ctx: {
         // named-antecedent follow-ups from recent turns now resolve too.
         windowTurns: getWindowTurns(effectiveMessages),
         resolveEntities: ctx.resolveEntities,
+        recallSituation: ctx.recallSituation,
       });
 
       // 3. Combine: live context + checkpoint block (parts index 1 — adjacent

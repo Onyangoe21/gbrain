@@ -8,6 +8,8 @@ import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { rebuildPendingPageProjections } from '../page-state/projections.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { runPersistenceEffects } from './effects.ts';
+import { runPendingMemoryCueJob } from '../memory-cues/inline.ts';
+import type { MemoryCueProviders } from '../memory-cues/types.ts';
 
 export type PrepareMutation = (engine: BrainEngine, row: WriteRequest, config: GBrainConfig) => Promise<PreparedMutation>;
 export class PersistenceConsumer {
@@ -21,6 +23,7 @@ export class PersistenceConsumer {
   private rootRetryAfter = new Map<string, number>();
   private projectionWorker: Promise<unknown> | undefined;
   private effectsWorker: Promise<void> | undefined;
+  private cueWorker: Promise<unknown> | undefined;
   private topologyWorker: Promise<unknown> | undefined;
   private maintenanceWorker: Promise<unknown> | undefined;
   private nextMaintenance = 0;
@@ -28,7 +31,7 @@ export class PersistenceConsumer {
   private abort = new AbortController();
   readonly hostId: string;
   constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, readonly prepare: PrepareMutation,
-    private opts: { hostId?: string; concurrency?: number; pollMs?: number; onError?: (error: unknown) => void } = {}) {
+    private opts: { hostId?: string; concurrency?: number; pollMs?: number; onError?: (error: unknown) => void; memoryCueProviders?: MemoryCueProviders } = {}) {
     this.hostId = opts.hostId ?? localHostId();
   }
   start(): void { this.stopping = false; this.abort = new AbortController(); this.schedule(0); }
@@ -57,6 +60,8 @@ export class PersistenceConsumer {
     if (!this.effectsWorker) this.effectsWorker = runPersistenceEffects(this.engine, this.config,
       { hostId: this.hostId, limit: 2, signal: this.abort.signal }).catch(error => this.report(error))
       .finally(() => { this.effectsWorker = undefined; });
+    if (this.engine.kind === 'pglite' && !this.cueWorker) this.cueWorker = runPendingMemoryCueJob(this.engine, { signal: this.abort.signal, providers: this.opts.memoryCueProviders })
+      .catch(error => this.report(error)).finally(() => { this.cueWorker = undefined; });
     if (!this.maintenanceWorker && Date.now() >= this.nextMaintenance) {
       this.nextMaintenance = Date.now() + 60_000;
       this.maintenanceWorker = compactWriteReceipts(this.engine).catch(error => this.report(error))
@@ -161,6 +166,7 @@ export class PersistenceConsumer {
     await Promise.allSettled([...this.active]);
     await this.projectionWorker;
     await this.effectsWorker;
+    await this.cueWorker;
     await this.topologyWorker;
     await this.maintenanceWorker;
   }

@@ -170,6 +170,20 @@ operation-level exception before the retained bundle knobs.
 
 ## Putting it together
 
+### Optional situation-aware cue arm
+
+`memory.cues.read` defaults to `off`. Explicitly enrolled and calibrated brains
+can add a bounded cue recall arm through `src/core/search/memory-cues.ts`.
+Generated descriptions of relevant situations locate original source chunks;
+they are not facts or answer snippets. All cues share one bounded fusion vote,
+one per source-qualified page. Shadow mode observes candidates without changing
+the result set. Reranking receives a separate internal cue view, and final
+revalidation checks authorization/current generation after asynchronous work.
+The source's cosine and evidence/create-safety labels retain their meaning.
+See [situation-aware recall](../guides/situation-recall.md) for consent, budgets,
+calibration, diagnosis and rollback. This is experimental; live quality gains
+and cross-category non-regression require the external evaluation receipts.
+
 The full pipeline for a trusted local `query` op follows. Remote retrieval
 omits the optional code-graph augmentation stage; the policy-filtered typed-edge
 relational recall arm remains available.

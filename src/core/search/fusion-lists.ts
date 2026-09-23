@@ -144,6 +144,7 @@ export interface ComposeFusionListsInput {
   keywordFusionList: SearchResult[];
   titleFusionList: SearchResult[];
   relationalList: SearchResult[];
+  memoryCueArm?: { list: SearchResult[]; weight: number };
   /** False on image-modality queries (the relational arm is text-only). */
   includeRelational: boolean;
   /**
@@ -210,6 +211,10 @@ export function composeFusionLists(input: ComposeFusionListsInput): FusionListEn
   }
   if (includeRelational && relationalList.length > 0) {
     out.push({ list: relationalList, k: ks.baseRrfK });
+  }
+  const cues = input.memoryCueArm;
+  if (cues && cues.list.length > 0 && Number.isFinite(cues.weight) && cues.weight > 0 && cues.weight <= 0.5) {
+    out.push({ list: cues.list, k: ks.baseRrfK, weight: cues.weight });
   }
   return out;
 }

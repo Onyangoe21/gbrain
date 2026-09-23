@@ -19,3 +19,9 @@ gbrain-evals consumes: `gbrain/engine`, `gbrain/types`, `gbrain/operations`,
 `gbrain/backoff`, `gbrain/search/hybrid`, `gbrain/search/expansion`,
 `gbrain/extract`. Removing any of these is a breaking change for the
 gbrain-evals consumer.
+
+Situation-recall experiments additionally consume `gbrain/memory-cues` for
+production construction/readback and `gbrain/contextual-retrieval` for the real
+background synopsis control. The latter exposes the existing
+`reembedPageWithContextualRetrieval` service rather than treating an inline
+title fallback as synopsis generation.

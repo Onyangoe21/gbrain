@@ -25,6 +25,7 @@ import { dispatchFactsBackstopEffect } from './effect-facts.ts';
 import type { EffectRecovery, PersistenceEffect } from './effect-model.ts';
 import { recoveryStagingFile } from './staging.ts';
 import { selectEffectRecoveries } from './effect-recovery-scan.ts';
+import { scheduleMemoryCuePage } from '../memory-cues/scheduling.ts';
 
 export interface EffectWorkerOptions {
   hostId: string;
@@ -183,7 +184,7 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
     let lock: Awaited<ReturnType<typeof acquireWorktree>> = null;
     try {
       const binding = effect.worktree_id ? await getWorktreeBinding(engine, effect.source_id, opts.hostId) : null;
-      if (effect.worktree_id && !['embedding', 'facts-backstop'].includes(effect.kind)) {
+      if (effect.worktree_id && !['embedding', 'facts-backstop', 'memory-cues'].includes(effect.kind)) {
         if (!binding) throw new OperationError('owner_unavailable', 'The canonical effect owner is unavailable.');
         lock = await acquireWorktree(binding);
         if (!lock) throw new OperationError('writer_busy', 'The canonical worktree is busy.');
@@ -198,6 +199,11 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
       if (effect.kind === 'withdrawal-mirror') await mirrorPage(engine, effect, binding, opts);
       else if (effect.kind === 'git') await gitPage(engine, effect, binding, opts);
       else if (effect.kind === 'facts-backstop') await dispatchFactsBackstopEffect(engine, effect, opts.hostId);
+      else if (effect.kind === 'memory-cues') {
+        const page = await selectedPage(engine, effect);
+        const outcome = page ? await scheduleMemoryCuePage(engine, effect.source_id, page.page.id) : { reason: 'page_ineligible' };
+        await completeEffect(engine, effect, outcome);
+      }
       else await embedPage(engine, config, effect, opts);
     } catch (error) { await recordFailure(engine, effect, error); }
     finally { await lock?.release(); }

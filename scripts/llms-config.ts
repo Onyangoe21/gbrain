@@ -169,6 +169,13 @@ export const SECTIONS: DocSection[] = [
         path: "docs/guides/push-context.md",
       },
       {
+        title: "docs/guides/situation-recall.md",
+        description:
+          "Experimental, default-off situation-aware recall: source enrollment, bounded cue builds, separate retrieval/reminder calibration, original evidence, rollback, and unmeasured quality gates.",
+        path: "docs/guides/situation-recall.md",
+        includeInFull: false,
+      },
+      {
         title: "docs/guides/github-source.md",
         description:
           "Mirror GitHub issues, PRs, comments, reviews and CI checks as brain pages. One key + one registration command to a searchable mirror; webhook-driven instant refresh, poll-sweep fallback, daily reconcile, App-credential option.",

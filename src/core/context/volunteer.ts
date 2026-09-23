@@ -25,6 +25,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { loadConfig, loadConfigWithEngine } from '../config.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import {
   extractCandidatesFromWindow,
@@ -34,6 +35,7 @@ import {
 import {
   resolveEntitiesToPointers,
   ARM_CONFIDENCE,
+  safeSynopsis,
   type ResolveArm,
   type PointerBlock,
 } from './retrieval-reflex.ts';
@@ -41,6 +43,7 @@ import {
 export const VOLUNTEER_DEFAULT_MAX_PAGES = 3;
 export const VOLUNTEER_MAX_PAGES_CAP = 5;
 export const VOLUNTEER_DEFAULT_MIN_CONFIDENCE = 0.7;
+export const SITUATION_RECALL_BUDGET_MS = 300;
 /** Deterministic boost for ≥2-turn or newest-turn mentions. */
 export const VOLUNTEER_SALIENCE_BOOST = 0.05;
 
@@ -49,7 +52,7 @@ export interface VolunteeredPage {
   source_id: string;
   display: string;
   confidence: number;
-  arm: ResolveArm;
+  arm: ResolveArm | 'situation';
   /** Deterministic template string — never raw conversation text. */
   rationale: string;
   synopsis: string;
@@ -71,6 +74,7 @@ export interface VolunteerOpts {
   minConfidence?: number;
   /** v0.46.15: lexical-arms kill switch — see ResolvePointersOpts.lexicalArms. */
   lexicalArms?: boolean;
+  deadlineAt?: number;
 }
 
 /** Shared wire protocol for window turns — watch.ts imports this so the two
@@ -156,14 +160,14 @@ export function gateVolunteeredPointers(
   block: PointerBlock,
   byNorm: ReadonlyMap<string, WindowEntityCandidate>,
   opts: GateOpts,
-): VolunteeredPage[] {
+): Array<VolunteeredPage & { arm: ResolveArm }> {
   const maxPages = clampMaxPages(opts.maxPages);
   const minConfidence =
     typeof opts.minConfidence === 'number' && opts.minConfidence >= 0 && opts.minConfidence <= 1
       ? opts.minConfidence
       : VOLUNTEER_DEFAULT_MIN_CONFIDENCE;
 
-  const out: VolunteeredPage[] = [];
+  const out: Array<VolunteeredPage & { arm: ResolveArm }> = [];
   for (const p of block.pointers) {
     if (opts.excludeSlugs?.has(p.slug)) continue; // before gate + cap — see VolunteerOpts
     // matchedNorm is the resolver's provenance join-key (the candidate that
@@ -229,6 +233,98 @@ export interface VolunteerStageOpts {
   lexicalArms?: boolean;
   maxPages?: number;
   minConfidence?: number;
+  turns?: WindowTurn[];
+  recallSituation?: SituationRecallFn;
+  deadlineAt?: number;
+}
+
+export interface SituationRecallOpts {
+  priorContextText?: string;
+  excludeSlugs?: ReadonlySet<string>;
+  deadlineAt?: number;
+}
+
+export type SituationRecallFn = (
+  turns: WindowTurn[],
+  opts: SituationRecallOpts,
+) => Promise<VolunteeredPage | null>;
+
+export async function recallSituationPage(
+  engine: BrainEngine,
+  turns: WindowTurn[],
+  opts: SituationRecallOpts & { sourceIds: string[] },
+): Promise<VolunteeredPage | null> {
+  const expired = () => opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt;
+  if (!turns.some(turn => turn.text.trim()) || !opts.sourceIds.length || expired()) return null;
+  const { loadMemoryCueSettings, memoryCueColumn, unsupportedCueColumn, recallMemoryCues, revalidateMemoryCueCandidates } =
+    await import('../memory-cues/index.ts');
+  const settings = await loadMemoryCueSettings(engine);
+  if (!settings.pushEnabled || settings.pushMinSimilarity === null || expired()) return null;
+  const sourceIds = opts.sourceIds.filter(id => settings.sourceIds.includes(id));
+  if (!sourceIds.length) return null;
+  const column = await memoryCueColumn(engine);
+  if (unsupportedCueColumn(column) || expired()) return null;
+  const queryTurns: string[] = [];
+  let remaining = 8000;
+  for (const turn of turns.slice(-4).reverse()) {
+    const body = turn.text.trim();
+    if (!body) continue;
+    const prefix = `${turn.role}: `;
+    if (remaining <= prefix.length) break;
+    const line = prefix + body.slice(-(remaining - prefix.length));
+    queryTurns.unshift(line);
+    remaining -= line.length + 1;
+  }
+  const text = queryTurns.join('\n');
+  if (!text) return null;
+  const { embedQuery } = await import('../embedding.ts');
+  if ((await loadConfigWithEngine(engine))?.embedding_disabled === true || expired()) return null;
+  let embedding: Float32Array;
+  try {
+    embedding = await embedQuery(text, {
+      embeddingModel: column.embeddingModel,
+      dimensions: column.dimensions,
+      ...(opts.deadlineAt !== undefined
+        ? { abortSignal: AbortSignal.timeout(Math.max(1, opts.deadlineAt - Date.now())) }
+        : {}),
+    });
+  } catch {
+    return null;
+  }
+  if (expired()) return null;
+  if ((await loadConfigWithEngine(engine))?.embedding_disabled === true || expired()) return null;
+  const scope = { sourceIds, excludePrivate: true, requireSafeChunks: true, purpose: 'push' as const };
+  const recalled = await recallMemoryCues(engine, embedding, {
+    ...scope,
+    embeddingColumn: column,
+    minSimilarity: settings.pushMinSimilarity,
+    limit: VOLUNTEER_MAX_PAGES_CAP * 2,
+  });
+  if (expired()) return null;
+  const prior = opts.priorContextText?.toLowerCase() ?? '';
+  const candidates = recalled.candidates.filter(candidate => {
+    const result = candidate.result;
+    return typeof result.source_id === 'string' && sourceIds.includes(result.source_id) && Number.isFinite(candidate.similarity)
+      && candidate.similarity >= settings.pushMinSimilarity!
+      && !opts.excludeSlugs?.has(result.slug) && !prior.includes(result.slug.toLowerCase());
+  });
+  const [candidate] = await revalidateMemoryCueCandidates(engine, candidates, scope);
+  if (expired() || !candidate) return null;
+  if (loadConfig()?.embedding_disabled === true) return null;
+  const result = candidate.result;
+  if (typeof result.source_id !== 'string' || !sourceIds.includes(result.source_id)) return null;
+  return {
+    slug: result.slug,
+    source_id: result.source_id,
+    display: result.title.replace(/\s+/g, ' ').trim(),
+    arm: 'situation',
+    confidence: candidate.similarity,
+    rationale: 'related situation',
+    synopsis: (candidate.evidence?.length ?? 0) > 1 ? '' : safeSynopsis({
+      slug: result.slug, source_id: result.source_id, title: result.title,
+      type: result.type, frontmatter: {}, compiled_truth: result.chunk_text,
+    }),
+  };
 }
 
 /**
@@ -246,24 +342,49 @@ export async function volunteerStage(
   windowSize: number,
   opts: VolunteerStageOpts = {},
 ): Promise<VolunteeredPage[]> {
-  if (!candidates.length) return [];
+  if (!candidates.length && !opts.recallSituation) return [];
   // Resolve up to the hard cap so the confidence gate sees the full pool —
   // a gated-out alias hit must not shadow a passing title hit behind it.
-  const block = await resolve(candidates, {
+  const block = candidates.length ? await resolve(candidates, {
     priorContextText: opts.priorContextText,
     suppression: 'slug-only',
     maxPointers: VOLUNTEER_MAX_PAGES_CAP * 2,
     lexicalArms: opts.lexicalArms,
     probe: 'volunteer',
-  });
-  if (!block) return [];
+  }) : null;
 
-  return gateVolunteeredPointers(block, candidatesByNorm(candidates), {
+  const pages: VolunteeredPage[] = block ? gateVolunteeredPointers(block, candidatesByNorm(candidates), {
     maxPages: opts.maxPages,
     minConfidence: opts.minConfidence,
     excludeSlugs: opts.excludeSlugs,
     windowSize,
-  });
+  }) : [];
+  if (pages.length >= clampMaxPages(opts.maxPages) || !opts.recallSituation || !opts.turns?.length) return pages;
+  if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) return pages;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const work = opts.recallSituation(opts.turns, {
+      priorContextText: opts.priorContextText,
+      excludeSlugs: new Set([...(opts.excludeSlugs ?? []), ...pages.map(p => p.slug)]),
+      deadlineAt: opts.deadlineAt,
+    });
+    const suggestion = opts.deadlineAt === undefined ? await work : await Promise.race([
+      work,
+      new Promise<null>(resolve => {
+        timer = setTimeout(() => resolve(null), Math.max(0, opts.deadlineAt! - Date.now()));
+      }),
+    ]);
+    if (suggestion?.arm === 'situation' && !opts.excludeSlugs?.has(suggestion.slug)
+      && !opts.priorContextText?.toLowerCase().includes(suggestion.slug.toLowerCase())
+      && !pages.some(p => p.source_id === suggestion.source_id && p.slug === suggestion.slug)) {
+      pages.push({ ...suggestion, rationale: 'related situation' });
+    }
+  } catch (error) {
+    if (!pages.length) throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return pages;
 }
 
 /**
@@ -296,8 +417,15 @@ export async function volunteerContext(
       lexicalArms: opts.lexicalArms,
       maxPages: opts.maxPages,
       minConfidence: opts.minConfidence,
+      turns,
+      recallSituation: (window, situationOpts) => recallSituationPage(engine, window, { ...situationOpts, sourceIds: opts.sourceIds }),
+      deadlineAt: opts.deadlineAt ?? Date.now() + SITUATION_RECALL_BUDGET_MS,
     },
   );
+}
+
+export function formatVolunteerScore(p: Pick<VolunteeredPage, 'arm' | 'confidence'>): string {
+  return `${p.arm === 'situation' ? 'cue similarity ' : ''}${p.confidence.toFixed(2)}`;
 }
 
 /**
@@ -307,7 +435,7 @@ export async function volunteerContext(
  */
 export function formatVolunteeredPage(p: VolunteeredPage): string {
   return (
-    `${p.display} → ${p.slug} (${p.confidence.toFixed(2)}, ${p.arm}) — ${p.rationale}` +
+    `${p.display} → ${p.slug}${p.arm === 'situation' ? ` (source_id: ${JSON.stringify(p.source_id)})` : ''} (${formatVolunteerScore(p)}, ${p.arm}) — ${p.rationale}` +
     (p.synopsis ? `\n    ${p.synopsis}` : '')
   );
 }

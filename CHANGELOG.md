@@ -2,6 +2,82 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.54.0.0] - 2026-09-23
+
+**Teach stored memories when they might be useful.** A schedule constraint can
+matter when you plan a meeting, even when the new question uses different words.
+You can now experiment with small, generated situation cues that help search
+find the original note. The cue is a signpost, not a fact: answers still receive
+the saved evidence, and a generated association cannot make weak evidence look
+more certain.
+
+This feature is off by default. It does not start recording conversations,
+enable paid enrichment, or change ordinary keyless memory. You choose the
+sources, approve a build budget, and select thresholds for the model you use.
+Reading and proactive reminders have separate switches and calibration. A
+missing or outdated calibration leaves the optional path inactive.
+
+Builds keep their original spending allowance through retries and restarts.
+You can inspect progress, cancel, or resume without silently granting another
+budget. Edits, corrections, withdrawals and source changes prevent an old
+background result from becoming current. If you disable embeddings globally,
+cue generation and situation-query embedding respect that choice.
+
+The rollout remains experimental. Deterministic tests establish the storage,
+authorization and delivery behavior; they do not establish a live retrieval
+gain. The companion gbrain-evals category and per-category regression gate are
+the path to measuring that claim. Missing provider runs, incomplete results and
+unsupported profiles must remain visible rather than count as passing.
+
+**Say to your agent:** *"Show me a situation-recall preview and its cost bounds.
+Do not enable model calls or reminders until I approve the sources, budget and
+evaluation configuration."*
+
+### How to inspect it
+
+```sh
+gbrain memory-cues status --source-ids default
+gbrain memory-cues preview --source-ids default --page-limit 100
+gbrain memory-cues --help
+```
+
+| Situation | What to expect |
+|---|---|
+| You upgrade and do nothing else | Existing memory behavior remains unchanged. |
+| You choose shadow mode | Cue candidates are observed without being added to answers. |
+| A cue helps find a source | The original source text is returned, not the generated cue. |
+| A build stops or reaches its cap | Its receipt explains the state; resume keeps the original allowance. |
+| You want unprompted reminders | Separately opt in, calibrate push, and verify the actual harness delivery. |
+
+Read [situation-aware recall](docs/guides/situation-recall.md) before enabling.
+Configured model providers can receive source text. A similarity score is not
+a probability that a statement is true.
+
+## To take advantage of v0.54.0.0
+
+Schema setup is additive and does not enable the feature. If an upgrade left
+migrations incomplete, run `gbrain apply-migrations --yes --no-autopilot-install`,
+then `gbrain doctor`. There is no automatic paid backfill. Existing installs do
+not need to opt in or change their capture settings.
+
+### Itemized changes
+
+- Add migration v164 and derived cue/window/build/reservation tables, with
+  signature-specific vector indexes and revision-bound publication on both
+  PostgreSQL and PGLite.
+- Add trusted-local `memory_cues` administration, protected bounded jobs,
+  incremental scheduling, independent retrieval/push calibration and read-only
+  diagnostic coverage. PGLite explicit submissions can advance a bounded pass.
+- Add an optional bounded hybrid recall arm, a separate cue-aware ranking view,
+  honest source evidence/confidence, and final policy revalidation.
+- Extend supported volunteer/turn-context/reflex paths with at most one
+  situation pointer inside the existing budget. OpenClaw's engine-free attempt
+  gate remains explicit; no new unsupported harness or telemetry claim is made.
+- Export `gbrain/memory-cues` and the existing `gbrain/contextual-retrieval`
+  service for the evaluation consumer, support frozen-cue family ablations,
+  and add lifecycle,
+  budget, source/privacy, real-engine parity, ranker and delivery regressions.
+
 ## [0.52.2.0] - 2026-09-22
 
 **Repair a memory page without guessing which copy to overwrite.** GBrain keeps

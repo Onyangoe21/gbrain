@@ -230,6 +230,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'file_upload',
       'file_url',
       'get_recent_transcripts',
+      'memory_cues',
       'migrate_embeddings',
       'purge_deleted_pages',
       'sources_inspect',

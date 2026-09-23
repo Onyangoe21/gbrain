@@ -32,7 +32,7 @@ import {
   DEFAULT_MAX_POINTERS,
   type ReflexPointer,
 } from './retrieval-reflex.ts';
-import { volunteerContext, type VolunteeredPage } from './volunteer.ts';
+import { volunteerContext, formatVolunteerScore, SITUATION_RECALL_BUDGET_MS, type VolunteeredPage } from './volunteer.ts';
 import { getBrainHotMemoryMeta } from '../facts/meta-hook.ts';
 import { buildEntityCard, type EntityCard, type EntityOpenThread } from '../verbs/entity-card.ts';
 import { estimateTokens } from '../search/token-budget.ts';
@@ -206,6 +206,7 @@ export async function assembleTurnContext(
       ? Math.floor(opts.maxBytes)
       : TURN_CONTEXT_DEFAULT_MAX_BYTES;
   const window = Array.isArray(opts.window) ? opts.window : [];
+  const deadlineAt = Date.now() + (opts.deadlineMs ?? SITUATION_RECALL_BUDGET_MS);
 
   // Sections 1+2 form a dependent chain (volunteer dedupes against the
   // pointers surfaced THIS turn); section 3 is independent, so the two arms
@@ -247,6 +248,7 @@ export async function assembleTurnContext(
           priorContext: opts.priorContextText,
           excludeSlugs,
           maxPages: MAX_VOLUNTEERED_PAGES,
+          deadlineAt,
           // v0.46.15+ lexical-arms kill switch rides the same threading as the
           // pointer arm above (ResolvePointersOpts.lexicalArms).
           lexicalArms: opts.lexicalArms,
@@ -295,7 +297,9 @@ export async function assembleTurnContext(
       text = render(pointers, volunteered, facts);
     }
     while (byteLen(text) > maxBytes && volunteered.length) {
-      dropLowestConfidence(volunteered);
+      const situation = volunteered.findIndex(page => page.arm === 'situation');
+      if (situation >= 0) volunteered.splice(situation, 1);
+      else dropLowestConfidence(volunteered);
       text = render(pointers, volunteered, facts);
     }
     while (byteLen(text) > maxBytes && pointers.length) {
@@ -350,7 +354,8 @@ function render(
     lines.push('', '## Brain pages the brain volunteers');
     for (const v of volunteered) {
       const syn = v.synopsis ? ` — ${v.synopsis}` : '';
-      lines.push(`- **${v.display}** → \`${v.slug}\` (${v.confidence.toFixed(2)}, ${v.rationale})${syn}`);
+      const source = v.arm === 'situation' ? ` (source_id: ${JSON.stringify(v.source_id)})` : '';
+      lines.push(`- **${v.display}** → \`${v.slug}\`${source} (${formatVolunteerScore(v)}, ${v.rationale})${syn}`);
     }
   }
   if (facts.length) {

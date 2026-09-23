@@ -20,6 +20,7 @@ boundary and add its link here rather than raising the cap.
 
 | Subsystem | Entry range / scope |
 |---|---|
+| [Situation-aware recall](key-files/memory-cues.md) | Derived cue generation, indexed recall, local administration and diagnostics |
 | [Page identity and writer administration](key-files/page-identity-and-administration.md) | Opaque result IDs, current grants, state-bound ownership changes |
 | [Canonical reconciliation](key-files/canonical-reconciliation.md) | Exact-page repair, private retained originals, derived atom state and receipt diagnostics |
 | [Company-brain ingestion](key-files/company-brain.md) | Inspection, admission, receipts, derived relationships and schema; [operator guide](../guides/company-brain-ingestion.md) |

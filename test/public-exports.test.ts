@@ -49,6 +49,8 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   { subpath: 'gbrain/backoff', canary: [] },
   { subpath: 'gbrain/search/hybrid', canary: ['hybridSearch', 'rrfFusion'] },
   { subpath: 'gbrain/search/expansion', canary: ['expandQuery'] },
+  { subpath: 'gbrain/memory-cues', canary: ['loadMemoryCueSettings', 'recallMemoryCues', 'revalidateMemoryCueCandidates', 'previewMemoryCueBuild', 'submitMemoryCueBuild', 'runMemoryCueBuild', 'runPendingMemoryCueJob', 'getMemoryCueStatus', 'cancelMemoryCueBuild', 'resumeMemoryCueBuild'] },
+  { subpath: 'gbrain/contextual-retrieval', canary: ['reembedPageWithContextualRetrieval'] },
   { subpath: 'gbrain/think', canary: ['runThink', 'stripGapsSection'] },
   { subpath: 'gbrain/ai/gateway', canary: ['configureGateway', 'embed'] },
   { subpath: 'gbrain/extract', canary: [] },
@@ -75,7 +77,7 @@ describe('public exports — package.json exports map', () => {
     // Removing exports: see CLAUDE.md "Removing any of these is a
     // breaking change going forward" — bump minor and update this count.
     // 23→24 (2026-08 fix wave): ./core/skillopt (audit skillopt-cats-11).
-    expect(count).toBe(24);
+    expect(count).toBe(26);
   });
 
   test('EXPECTED_EXPORTS list matches the exports map exactly (no drift)', () => {
