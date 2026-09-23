@@ -111,6 +111,7 @@ export async function runPhaseConsolidate(
     const candidates = await engine.listFactsByEntity(b.source_id, b.entity_slug, {
       activeOnly: true,
       unconsolidatedOnly: true,
+      visibility: managed ? ['world'] : undefined,
       limit: 100,
     });
     const unconsolidated = managed ? candidates.filter(f => f.visibility === 'world') : candidates;

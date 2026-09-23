@@ -196,6 +196,24 @@ test('managed dry-run and private facts never publish takes or consolidate evide
   });
 }, 30_000);
 
+test('managed consolidation selects eligible world facts before limiting newer private facts', async () => {
+  await fixture(async (engine, sourceId) => {
+    await seed(engine, sourceId);
+    await engine.executeRaw(`INSERT INTO facts(source_id,entity_slug,fact,kind,source,visibility,confidence,valid_from)
+      SELECT $1,'people/example','Private example '||n,'fact','test','private',0.9,'2026-02-01'::timestamptz
+      FROM generate_series(1,101) n`, [sourceId]);
+    const privateBefore = await engine.executeRaw("SELECT * FROM facts WHERE source_id=$1 AND visibility='private' ORDER BY id", [sourceId]);
+    expect(privateBefore).toHaveLength(101);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    const result = await runPhaseConsolidate(engine, { sourceId, minOldestAgeMs: 0 });
+    expect(result.status).toBe('ok');
+    expect(result.details.facts_consolidated).toBe(3);
+    expect(result.details.takes_written).toBe(1);
+    expect(await engine.executeRaw("SELECT * FROM facts WHERE source_id=$1 AND visibility='private' ORDER BY id", [sourceId])).toEqual(privateBefore);
+    expect(await engine.executeRaw("SELECT id FROM facts WHERE source_id=$1 AND visibility='world' AND consolidated_at IS NOT NULL", [sourceId])).toHaveLength(3);
+  });
+}, 30_000);
+
 for (const retirement of ['inactive', 'resolved'] as const) {
   test(`public managed consolidation preserves evidence when the matching take is ${retirement}`, async () => {
     await fixture(async (engine, sourceId, root) => {
