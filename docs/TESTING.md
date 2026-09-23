@@ -239,6 +239,14 @@ later target edits through explicit retries and honor database-only storage poli
 without relaxing source authority. `test/managed-synthesis-postprocess.test.ts`
 and its E2E wrapper verify that completed quote/provenance work never rewrites a
 later user edit, while unfinished work resumes against its original revision.
+The synthesis suite also preserves the existing same-date summary on replay and
+rebuilds a complete index after partial recovery. `test/managed-atom-compaction.test.ts`
+and its PostgreSQL counterpart age and compact real receipts: permanent completion
+identity still prevents repeated extraction, while expired retry payloads produce
+an explicit refusal without changing terminal outcomes or compaction accounting.
+`test/managed-facts-compaction.test.ts` and its PostgreSQL counterpart cover the
+same lifetime boundary for explicit and derived fact-batch identities, including
+failed or partially committed batches and successful replay without new spend.
 Connector sweep fencing and physical-path normalization have separate parity
 coverage in `test/persistence-connector-fencing.test.ts`. Standalone crash/recovery
 cases live in `test/persistence-connector-recovery.test.ts` and their own E2E
