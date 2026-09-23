@@ -9,7 +9,7 @@ import { runPhaseExtractAtoms } from '../src/core/cycle/extract-atoms.ts';
 import { stopPersistenceConsumer } from '../src/core/persistence/service.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { atomContractCases, exerciseManagedAtoms } from './helpers/managed-atoms-contract.ts';
+import { atomContractCases, exerciseManagedAtoms, atomBatchCases, exerciseManagedAtomBatch, atomAuthorityCases, exerciseManagedAtomAuthority } from './helpers/managed-atoms-contract.ts';
 
 let engine: PGLiteEngine;
 beforeAll(async () => {
@@ -22,6 +22,8 @@ beforeEach(async () => { await stopPersistenceConsumer(engine); await resetPglit
 afterAll(async () => { await engine.disconnect(); resetGateway(); });
 
 for (const scenario of atomContractCases) test(`managed atom ${scenario}`, () => exerciseManagedAtoms(engine, scenario), 60_000);
+for (const scenario of atomBatchCases) test(`managed atom batch ${scenario}`, () => exerciseManagedAtomBatch(engine, scenario), 60_000);
+for (const scenario of atomAuthorityCases) test(`managed atom authority ${scenario} rejects normal and dry runs before providers`, () => exerciseManagedAtomAuthority(engine, scenario), 60_000);
 
 test('managed public atom extraction publishes searchable atoms and replays without another model call', async () => {
   const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-atoms-'));

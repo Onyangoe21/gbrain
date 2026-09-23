@@ -10,7 +10,14 @@ import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.t
 import { inspectLegacyWriterLocks } from './legacy-locks.ts';
 import { deleteLockRowExact } from '../db-lock.ts';
 
-export interface ActivationReport { enabled: boolean; activated: boolean; filesystem_sources: number; native_lock: { target: string; napi: 3 }; legacy_locks?: Awaited<ReturnType<typeof inspectLegacyWriterLocks>>; }
+export interface ActivationReport {
+  enabled: boolean;
+  activated: boolean;
+  filesystem_sources: number;
+  native_lock: { target: string; napi: 3 };
+  drift_audit?: { sources: Array<Record<string, unknown>>; complete: boolean; snapshot_only: true };
+  legacy_locks?: Awaited<ReturnType<typeof inspectLegacyWriterLocks>>;
+}
 interface SourceRoot { id: string; incarnation: string; root: string | null; connector: boolean; }
 const quiescence = () => new OperationError('writer_not_quiesced', 'Managed activation requires all older writers and maintenance jobs to be stopped.',
   WRITER_INSPECTION_HINT);
@@ -66,6 +73,20 @@ export async function activatePersistence(engine: BrainEngine, opts: { confirmQu
   const hostId = opts.dryRun ? existingLocalHostId() : localHostId();
   const sources = await configuredSources(engine);
   const initial = await validatedBindings(engine, sources, hostId);
+  let driftAudit: ActivationReport['drift_audit'];
+  if (opts.dryRun) {
+    const { auditCanonicalSource } = await import('./reconcile-audit.ts');
+    const audited: Array<Record<string, unknown>> = [];
+    for (const binding of initial.slice(0, 4)) {
+      try { audited.push(await auditCanonicalSource(engine, binding.source_id)); }
+      catch (error) {
+        audited.push({ source_id: binding.source_id, complete: false,
+          reason: error instanceof OperationError ? error.code : 'storage_error',
+          suggestion: 'Run sources reconcile --audit on this source’s canonical owner.' });
+      }
+    }
+    driftAudit = { sources: audited, complete: initial.length <= 4 && audited.every(report => report.complete === true), snapshot_only: true };
+  }
   const locks: NativeLockHandle[] = [];
   try {
     // All native acquisition precedes the transaction and any database wait.
@@ -96,7 +117,7 @@ export async function activatePersistence(engine: BrainEngine, opts: { confirmQu
       if (legacyLocks.some(row => !opts.cleanupDeadLocalLocks || row.liveness !== 'dead_eligible')) throw quiescence();
       if ((await tx.executeRaw(`SELECT id FROM persistence_requests WHERE state IN ('queued','running','recovering') OR recovery IS NOT NULL LIMIT 1`)).length
         || (await tx.executeRaw('SELECT id FROM persistence_effects WHERE recovery IS NOT NULL LIMIT 1')).length) throw quiescence();
-      if (opts.dryRun) return { enabled: false, activated: false, filesystem_sources: bindings.length, native_lock: native, legacy_locks: legacyLocks };
+      if (opts.dryRun) return { enabled: false, activated: false, filesystem_sources: bindings.length, native_lock: native, legacy_locks: legacyLocks, drift_audit: driftAudit };
       for (const row of legacyLocks) {
         if (!(await deleteLockRowExact(tx, row.id, row.holder_pid, row.acquisition_token)).deleted) throw quiescence();
       }

@@ -14,6 +14,7 @@ import { assertPersistenceAccepting, waitForWrite, writeResponse } from './servi
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteAuthority, WriteRequest } from './model.ts';
 import type { WriteReceipt } from './types.ts';
+import { writeAtomPageState } from '../cycle/extract-atoms-page-state.ts';
 
 export interface AtomOrigin {
   kind: 'page' | 'transcript';
@@ -50,7 +51,7 @@ export async function managedAtomSession(engine: BrainEngine, sourceId: string, 
   assertPersistenceAccepting(engine);
   const caller = currentSubmissionAuthority();
   if (caller && caller.kind !== 'application' || currentVerifiedLocalWriter()?.remote) {
-    throw new OperationError('permission_denied', 'Atom maintenance requires a trusted local, source-wide writer.');
+    throw new OperationError('permission_denied', 'Atom extraction cannot mutate a managed brain through an untrusted caller; a trusted local, source-wide writer is required.');
   }
   const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null }>(
     'SELECT incarnation,archived,local_path FROM sources WHERE id=$1', [sourceId]);
@@ -212,25 +213,40 @@ export async function prepareManagedAtomMutation(engine: BrainEngine, row: Write
   };
   await validate(engine);
   const additionalPageKeys = p.origin.kind === 'page' ? [{ sourceId: row.source_id, slug: p.origin.locator }] : [];
-  if (p.kind === 'managed_atom_complete') return { observedRevision: null, noop: true, additionalPageKeys, validate, apply: async tx => {
-    const children = p.children ?? [];
-    const committed = await tx.executeRaw<{ id: string }>(`SELECT id FROM persistence_requests WHERE id=ANY($1::uuid[]) AND source_incarnation=$2::uuid
-      AND state='committed' AND COALESCE(intent->>'runKey',outcome->>'atom_run_key')=$3
-      AND COALESCE(intent->>'kind',outcome->>'atom_kind')='managed_atom_page'`, [children, row.source_incarnation, p.runKey]);
-    if (committed.length !== children.length) throw new OperationError('revision_conflict', 'The atom batch is not fully committed.');
-    const checkpoint = JSON.stringify([{ sourceId: row.source_id, incarnation: row.source_incarnation, requestId: row.request_id,
-      kind: p.origin.kind, locator: p.origin.locator, pageId: p.origin.pageId, contentHash: p.origin.contentHash, ...(p.failure ? { failure: p.failure } : {}) }]);
-    await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-atoms',$1,$2::text::jsonb)
-      ON CONFLICT(op,fingerprint) DO NOTHING`, [p.runKey, checkpoint]);
-    if (p.checkpointKey) {
-      const advanced = await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-atoms',$1,$2::text::jsonb)
-        ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()
-        WHERE op_checkpoints.completed_keys=$3::text::jsonb RETURNING fingerprint`,
-      [p.checkpointKey, checkpoint, p.expectedCheckpoint === null ? null : JSON.stringify(p.expectedCheckpoint)]);
-      if (!advanced.length) throw new OperationError('revision_conflict', 'The reviewed atom retry checkpoint changed.');
-    }
-    return { status: p.failure ? 'failed' : 'completed', atoms: children.length, ...(p.failure ? { failure: p.failure } : {}) };
-  } };
+  if (p.kind === 'managed_atom_complete') {
+    const targets = await engine.executeRaw<{ slug: string }>('SELECT slug FROM persistence_requests WHERE id=ANY($1::uuid[]) AND source_incarnation=$2::uuid',
+      [p.children ?? [], row.source_incarnation]);
+    additionalPageKeys.push(...targets.map(target => ({ sourceId: row.source_id, slug: target.slug })));
+    return { observedRevision: null, noop: true, additionalPageKeys, validate, apply: async tx => {
+      const children = p.children ?? [];
+      const committed = await tx.executeRaw<{ id: string }>(`SELECT r.id FROM persistence_requests r
+        JOIN pages atom ON atom.source_id=r.source_id AND atom.slug=r.slug
+          AND atom.knowledge_revision::text=r.outcome->>'revision' AND atom.deleted_at IS NULL AND atom.type='atom'
+        WHERE r.id=ANY($1::uuid[]) AND r.source_incarnation=$2::uuid
+        AND r.state='committed' AND COALESCE(r.intent->>'runKey',r.outcome->>'atom_run_key')=$3
+        AND COALESCE(r.intent->>'kind',r.outcome->>'atom_kind')='managed_atom_page'`, [children, row.source_incarnation, p.runKey]);
+      if (committed.length !== children.length) throw new OperationError('revision_conflict', 'The atom batch is not fully committed.');
+      if (p.origin.kind === 'page') {
+        const snapshot = await tx.readPageSnapshot(p.origin.locator, { sourceId: row.source_id });
+        if (!snapshot) throw new OperationError('revision_conflict', 'The accepted atom source page changed.');
+        await writeAtomPageState(tx, row.source_id, { slug: p.origin.locator, content: snapshot.page.compiled_truth,
+          contentHash: p.origin.contentHash, identity: { pageId: p.origin.pageId!, sourceIncarnation: row.source_incarnation,
+            revision: p.origin.revision! } }, p.failure ? 'failure' : 'complete');
+      }
+      const checkpoint = JSON.stringify([{ sourceId: row.source_id, incarnation: row.source_incarnation, requestId: row.request_id,
+        kind: p.origin.kind, locator: p.origin.locator, pageId: p.origin.pageId, contentHash: p.origin.contentHash, ...(p.failure ? { failure: p.failure } : {}) }]);
+      await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-atoms',$1,$2::text::jsonb)
+        ON CONFLICT(op,fingerprint) DO NOTHING`, [p.runKey, checkpoint]);
+      if (p.checkpointKey) {
+        const advanced = await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-atoms',$1,$2::text::jsonb)
+          ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()
+          WHERE op_checkpoints.completed_keys=$3::text::jsonb RETURNING fingerprint`,
+        [p.checkpointKey, checkpoint, p.expectedCheckpoint === null ? null : JSON.stringify(p.expectedCheckpoint)]);
+        if (!advanced.length) throw new OperationError('revision_conflict', 'The reviewed atom retry checkpoint changed.');
+      }
+      return { status: p.failure ? 'failed' : 'completed', atoms: children.length, ...(p.failure ? { failure: p.failure } : {}) };
+    } };
+  }
   await authorizeWrite(engine, row.authority, 'put_page', row.slug);
   const prepared = await preparePageMutation(engine, { ...row, operation: 'put_page' }, config);
   return { ...prepared, additionalPageKeys, validate: async tx => { await validate(tx); await authorizeWrite(tx, row.authority, 'put_page', row.slug); await prepared.validate?.(tx); }, apply: async tx => {

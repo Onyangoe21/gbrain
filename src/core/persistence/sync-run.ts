@@ -5,7 +5,7 @@ import { loadConfig } from '../config.ts';
 import { OperationError } from '../ops/contract.ts';
 import { currentJobSignal } from '../minions/submission-authority.ts';
 import { digest, sha256 } from './digest.ts';
-import { getWriteRequest, admitWrite } from './journal.ts';
+import { getWriteRequest, admitWrite, receiptFor } from './journal.ts';
 import { assertPersistenceAccepting, foregroundWriteCompletions, startPersistenceConsumer, waitForWrite } from './service.ts';
 import { discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
 import { managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, type SyncAuthority } from './sync-authority.ts';
@@ -14,6 +14,22 @@ import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan }
 import { readCommittedBlob } from '../company-brain/revision.ts';
 import { refreshProjectionStatistics } from '../search/projection-statistics.ts';
 import { recordManagedSyncFailure, clearManagedSyncFailureAfterSuccess, formatManagedSyncFailure, type ManagedSyncFailure } from './sync-failures.ts';
+import { writeFailureDiagnostic } from './verb-errors.ts';
+import { isTerminalWriteState, publicWriteReceipt, type WriteReceipt } from './types.ts';
+import type { WriteRequest } from './model.ts';
+
+export interface ManagedSyncWriteDiagnostic {
+  source_id: string;
+  slug: string;
+  path: string | null;
+  write_error: string;
+  reason: string;
+  message: string;
+  suggestion: string;
+  write_request: WriteReceipt;
+  line_endings?: 'crlf_lf_only';
+  ledger_recorded?: boolean;
+}
 
 interface Pending { requestId: string; slug: string; pageId: number | null; intent: SyncIntent; }
 interface Cursor extends SyncDiscovery { runId: string; index: number; authority: SyncAuthority; pending?: Pending; done?: boolean; companyReceiptId?: string;
@@ -75,6 +91,31 @@ function result(cursor: Cursor, status: SyncResult['status'], reason?: SyncResul
     toCommit: cursor.authority.writer.remote ? '' : cursor.target, added: cursor.counts.added, modified: cursor.counts.modified,
     deleted: cursor.counts.deleted, renamed: 0, chunksCreated: cursor.counts.chunks, embedded: 0, pagesAffected: [],
     filesImported: cursor.index, bankedFiles: cursor.index, ...(cursor.uncommitted ? { uncommitted: cursor.uncommitted } : {}), ...(reason ? { reason } : {}) };
+}
+function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): ManagedSyncWriteDiagnostic {
+  const terminal = isTerminalWriteState(row.state);
+  const code = terminal ? row.error_code ?? (row.state === 'cancelled' ? 'cancelled' : 'storage_error') : 'write_pending';
+  const blockedReason = ['writer_busy', 'writer_pool_capacity', 'owner_unavailable', 'recovery_required', 'writer_lock_unavailable',
+    'database_contention', 'consumer_stopping', 'revision_changed_repreparing'].includes(row.blocked_reason ?? '') ? row.blocked_reason! : 'write_pending';
+  const detail = terminal ? writeFailureDiagnostic(code, row.error_message) : {
+    reason: blockedReason, message: 'The write is accepted but not committed; the sync checkpoint has not advanced.',
+    suggestion: 'Re-run the same sync options to resume this request. Do not submit a replacement request or skip the pending write.',
+  };
+  const diagnostic: ManagedSyncWriteDiagnostic = { source_id: cursor.sourceId, slug: pending.slug,
+    path: pending.intent.path, write_error: code, ...detail, write_request: publicWriteReceipt(receiptFor(row)) };
+  if (terminal) diagnostic.suggestion += ' After repair, run gbrain sync with the same source/options and --retry-failed to start a new request. Without --retry-failed, the frozen terminal request returns the same outcome. Skipping failures cannot bypass a managed write.';
+  if (diagnostic.reason === 'pinned_git_worktree_conflict' && pending.intent.path && pending.intent.content !== null) {
+    try {
+      const bytes = readSyncFile(cursor.root, pending.intent.path);
+      if (bytes && sha256(bytes) === pending.intent.rawHash && sha256(bytes) !== sha256(pending.intent.content)
+        && bytes.equals(Buffer.from(bytes.toString('utf8')))
+        && bytes.toString('utf8').replace(/\r\n/g, '\n') === pending.intent.content.replace(/\r\n/g, '\n')) {
+        diagnostic.line_endings = 'crlf_lf_only';
+        diagnostic.message += ' The frozen working-tree and Git versions differ only by CRLF/LF line endings; exact byte protection still applies.';
+      }
+    } catch {}
+  }
+  return diagnostic;
 }
 async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string): Promise<Pending> {
   const entry = cursor.entries[cursor.index];
@@ -220,15 +261,17 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
         principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: pending.intent, intent: pending.intent });
       await validateSyncAuthority(engine, cursor.authority, pending.slug);
       const done = await waitForWrite(engine, row, config, 5000);
-      if (!['committed','failed','conflict','cancelled'].includes(done.state)) return result(cursor, 'partial', 'writer_pending');
+      if (!isTerminalWriteState(done.state)) return { ...result(cursor, 'partial', 'writer_pending'),
+        ...(authority.writer.remote ? {} : { managedWrite: writeDiagnostic(cursor, pending, done) }) };
       if (done.state !== 'committed') {
-        const failure = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
-          code: done.error_code ?? 'storage_error', message: done.error_message ?? 'The accepted sync request did not commit.',
+        const { failure, ledgerRecorded } = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
+          code: done.error_code ?? (done.state === 'cancelled' ? 'cancelled' : 'storage_error'), message: done.error_message ?? 'The accepted sync request did not commit.',
         request_id: pending.requestId, run_id: cursor.runId, target: cursor.target, cursor_key: key,
         phase: pending.intent.kind === 'managed_sync_checkpoint' ? 'checkpoint' : 'receipt', state: done.state, observation_id: pending.requestId,
         first_seen: new Date(done.completed_at ?? done.updated_at).toISOString() });
         return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1,
-          failureCodes: [{ code: failure.code, count: 1 }], ...(authority.writer.remote ? {} : { failures: [failure] }) };
+          failureCodes: [{ code: failure.code, count: 1 }], ...(authority.writer.remote ? {} : { failures: [failure],
+            managedWrite: { ...writeDiagnostic(cursor, pending, done), ledger_recorded: ledgerRecorded } }) };
       }
       if (pending.intent.kind === 'managed_sync_checkpoint') {
         cursor = (await readCursor(engine, key))!;
@@ -262,7 +305,7 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
       if (code !== 'permission_denied') {
         const [stored] = cursor ? [] : await engine.executeRaw<{ completed_keys: [CursorHeader] }>('SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [OP, key]);
         const failedCursor = cursor ?? stored?.completed_keys?.[0];
-        const failure = await recordManagedSyncFailure(engine, { source_id: context.sourceId, source_incarnation: context.incarnation, path: cursor?.entries[cursor.index]?.path ?? failedCursor?.pending?.intent.path ?? `<${phase}>`, code,
+        const { failure } = await recordManagedSyncFailure(engine, { source_id: context.sourceId, source_incarnation: context.incarnation, path: cursor?.entries[cursor.index]?.path ?? failedCursor?.pending?.intent.path ?? `<${phase}>`, code,
           message: error instanceof Error ? error.message : String(error), request_id: failedCursor?.pending?.requestId ?? null,
           run_id: failedCursor?.runId ?? discoveryRun, target: failedCursor?.target ?? discoveryTarget, cursor_key: key, phase, state: 'failed',
           observation_id: failedCursor ? `${failedCursor.runId}:${failedCursor.index}:${phase}:${code}` : `${key}:discovery:${discoveryTarget}:${code}` });

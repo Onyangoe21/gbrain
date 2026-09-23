@@ -1,5 +1,6 @@
 import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
 import { assertImportBase, sameCanonicalImport } from './page-state/import-guard.ts';
+import { stabilizeSafetyAssessments } from './persistence/reconcile-safety.ts';
 import { readSourceFileSync } from './minions/source-filesystem.ts';
 import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname } from 'path';
@@ -553,11 +554,9 @@ export async function importFromContent(
   // would not change, and tag reconciliation would silently no-op
   // (this function returns early on hash-match).
   //
-  // v0.42 (#1699): the content-sanity gate runs on EVERY import and stamps
-  // GATE-DERIVED markers (quarantine / content_flag / embed_skip) carrying a
-  // fresh `assessed_at` timestamp. Those markers are derived from the body,
-  // not source content, so they must be EXCLUDED from the hash — otherwise
-  // every re-sync of a flagged/quarantined page sees a changed hash and
+  // v0.42 (#1699): gate-derived quarantine/content_flag/embed_skip markers
+  // carry assessed_at timestamps. They describe the assessment, not source
+  // content, so they must be EXCLUDED from the hash — otherwise re-sync
   // re-chunks + re-embeds forever (a markup-heavy page keeps chunks, so this
   // is real, unbounded embedding spend). Same bug class as the captured_at /
   // ingested_at fix above; the gate re-derives the markers deterministically
@@ -571,6 +570,7 @@ export async function importFromContent(
   // unscoped-check/scoped-write bug class).
   const existingSnapshot = opts.prepare ? await engine.readPageSnapshot(slug, { sourceId: sourceId ?? 'default', includeDeleted: true }) : null;
   const existing = opts.prepare ? existingSnapshot?.page ?? null : await engine.getPage(slug, { sourceId: sourceId ?? 'default', includeDeleted: true });
+  if (existing) stabilizeSafetyAssessments(parsed.frontmatter, existing.frontmatter);
 
   // #2044 / #4548: remote get_page/fetch intentionally strip non-'world'
   // facts rows before an untrusted caller ever sees them. A documented

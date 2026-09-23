@@ -34,6 +34,7 @@ src/core/company-brain/runtime.ts	1	projection	Only source policy metadata advan
 src/core/cycle/drift.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/extract-atoms.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/extract-facts.ts	3	early_refusal	Managed legacy fence reconciliation refuses before providers; unmanaged reconciliation preserves valid vectors transactionally and applies source-scoped privacy and withdrawal restrictions before embedding.
+src/core/cycle/extract-atoms-page-state.ts	1	engine_guard	Atom completion updates and cardinality checks share one transaction; managed canonical SQL remains fenced and scan/failure bookkeeping is stored separately.
 src/core/cycle/extract-takes.ts	3	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/grade-takes.ts	1	engine_guard	Canonical table SQL trigger requires coordinator capability; legacy calls fail before canonical DB publication.
 src/core/cycle/patterns.ts	0	coordinator	Managed local patterns use admitted page operations and validate canonical outputs; the legacy reverse-file path runs only unmanaged.

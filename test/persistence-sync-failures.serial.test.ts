@@ -9,7 +9,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { makeGitFixture } from './helpers/git-fixture.ts';
-import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { loadSyncFailures, acknowledgeFailures, autoSkipFailures } from '../src/core/sync-failure-ledger.ts';
@@ -97,6 +97,51 @@ test('CRLF checkout is not newer divergent content, but substantive edits remain
     writeFileSync(join(f.root, 'note.md'), 'Divergent uncommitted observation.\n');
     expect(await performManagedSync(engine, options)).toMatchObject({ status: 'blocked_by_failures', failureCodes: [{ code: 'source_changed', count: 1 }] });
     expect((await engine.getPage('note', { sourceId: f.id }))?.compiled_truth).toContain('Updated');
+  }
+}), 120_000);
+
+test.each(['lone_cr', 'trailing_spaces', 'bom', 'content'] as const)('fresh CRLF equivalence does not accept %s differences', async difference => withEnv(env, async () => {
+  for (const engine of engines) {
+    const original = 'Original canonical observation.\n';
+    const f = await fixture(engine, { 'note.md': original });
+    const options = { sourceId: f.id, noPull: true };
+    await performManagedSync(engine, options);
+    const pinned = 'Updated canonical observation.\n';
+    writeFileSync(join(f.root, 'note.md'), pinned); commit(f.root);
+    const working = difference === 'lone_cr' ? pinned.replace(/\n/g, '\r')
+      : difference === 'trailing_spaces' ? pinned.replace(/\n/g, ' \r\n')
+      : difference === 'bom' ? '\ufeff' + pinned.replace(/\n/g, '\r\n')
+      : pinned.replace('Updated', 'Divergent').replace(/\n/g, '\r\n');
+    writeFileSync(join(f.root, 'note.md'), working);
+    const blocked = await performManagedSync(engine, options);
+    expect(blocked).toMatchObject({ status: 'blocked_by_failures', failureCodes: [{ code: 'source_changed', count: 1 }],
+      managedWrite: { write_error: 'source_changed', reason: 'pinned_git_worktree_conflict' } });
+    expect(blocked.managedWrite?.line_endings).toBeUndefined();
+    expect(readFileSync(join(f.root, 'note.md'), 'utf8')).toBe(working);
+    expect((await engine.getPage('note', { sourceId: f.id }))?.compiled_truth).toBe(original.trim());
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
+  }
+}), 120_000);
+
+test('CRLF checkout of a newer commit does not replace the stale blob pinned by an unfinished run', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'a.md': 'Original first observation.\n', 'z.md': 'Original last observation.\n' });
+    const options = { sourceId: f.id, noPull: true };
+    await performManagedSync(engine, options);
+    writeFileSync(join(f.root, 'a.md'), 'Updated first observation.\n');
+    writeFileSync(join(f.root, 'z.md'), 'Updated last observation.\n');
+    const pinned = commit(f.root);
+    expect(await performManagedSync(engine, options, { maxPages: 1, maxMs: 1000 })).toMatchObject({ status: 'partial', filesImported: 1, toCommit: pinned });
+    const newer = 'Newer last observation.\n';
+    writeFileSync(join(f.root, 'z.md'), newer); commit(f.root);
+    writeFileSync(join(f.root, 'z.md'), newer.replace(/\n/g, '\r\n'));
+    const blocked = await performManagedSync(engine, options);
+    expect(blocked).toMatchObject({ status: 'blocked_by_failures', toCommit: pinned, failureCodes: [{ code: 'source_changed', count: 1 }] });
+    expect(blocked.managedWrite?.line_endings).toBeUndefined();
+    expect((await engine.getPage('z', { sourceId: f.id }))?.compiled_truth).toBe('Original last observation.');
+    expect(readFileSync(join(f.root, 'z.md'), 'utf8')).toBe(newer.replace(/\n/g, '\r\n'));
+    expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
+    expect(await performManagedSync(engine, options)).toEqual(blocked);
   }
 }), 120_000);
 
@@ -268,6 +313,37 @@ test('remote managed failure results expose only aggregates, never private recei
     expect(result.failures).toBeUndefined(); expect(result.runId).toBeUndefined();
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain('private-note'); expect(serialized).not.toContain(f.head); expect(serialized).not.toContain(f.root);
+  }
+}), 120_000);
+
+test('remote pending sync keeps its private receipt off the response while resuming the same request', async () => withEnv(env, async () => {
+  for (const engine of engines) {
+    await disposePersistenceConsumer(engine);
+    const f = await fixture(engine, { 'private-pending.md': 'A private observation awaiting publication.\n' });
+    const clientId = `sync-client-${randomUUID()}`;
+    await engine.executeRaw(`INSERT INTO oauth_clients(client_id,client_name,client_secret_hash,scope,source_id,allowed_operations)
+      VALUES($1,'fixture-client','test-only','admin',$2,ARRAY['submit_job'])`, [clientId, f.id]);
+    const ctx = { engine, remote: true, sourceId: f.id, auth: { clientId, principal: { kind: 'oauth_client', id: clientId }, scopes: ['admin'], sourceId: f.id, allowedOperations: ['submit_job'] } } as OperationContext;
+    const accepted = await prepareRemoteJob(ctx, 'sync', { noPull: true });
+    const lock = await acquireWorktree((await getWorktreeBinding(engine, f.id))!);
+    expect(lock).not.toBeNull();
+    try {
+      const run = () => withSubmissionAuthority(accepted.authority, () => performManagedSync(engine, accepted.data));
+      const pending = await run();
+      expect(pending).toMatchObject({ status: 'partial', reason: 'writer_pending', added: 0, filesImported: 0 });
+      expect(pending.managedWrite).toBeUndefined();
+      expect(pending.failures).toBeUndefined();
+      expect(pending.runId).toBeUndefined();
+      const requests = await engine.executeRaw<{ request_id: string }>('SELECT request_id FROM persistence_requests WHERE source_id=$1', [f.id]);
+      expect(requests).toHaveLength(1);
+      const serialized = JSON.stringify(pending);
+      for (const privateValue of ['private-pending', 'A private observation', f.root, f.head, requests[0].request_id]) expect(serialized).not.toContain(privateValue);
+      expect(await run()).toEqual(pending);
+      expect(await engine.executeRaw('SELECT request_id FROM persistence_requests WHERE source_id=$1', [f.id])).toEqual(requests);
+      expect(await readManagedSyncFailures(engine, [f.id])).toHaveLength(1);
+      await lock!.release();
+      expect(await run()).toMatchObject({ status: 'first_sync', added: 1 });
+    } finally { await lock?.release(); await disposePersistenceConsumer(engine); }
   }
 }), 120_000);
 

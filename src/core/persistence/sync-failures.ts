@@ -19,7 +19,7 @@ export interface ManagedSyncFailure {
   attempts: number;
 }
 
-export async function recordManagedSyncFailure(engine: BrainEngine, value: Omit<ManagedSyncFailure, 'first_seen' | 'attempts'> & { first_seen?: string }): Promise<ManagedSyncFailure> {
+export async function recordManagedSyncFailure(engine: BrainEngine, value: Omit<ManagedSyncFailure, 'first_seen' | 'attempts'> & { first_seen?: string }): Promise<{ failure: ManagedSyncFailure; ledgerRecorded: boolean }> {
   const failure = { ...value, first_seen: value.first_seen ?? new Date().toISOString(), attempts: 1 };
   const recorded = await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
@@ -33,8 +33,12 @@ export async function recordManagedSyncFailure(engine: BrainEngine, value: Omit<
       RETURNING completed_keys`, [value.cursor_key, JSON.stringify([failure])]);
     return row.completed_keys[0];
   });
-  try { mirrorManagedSyncFailure(recorded); } catch { }
-  return recorded;
+  let ledgerRecorded = false;
+  try {
+    mirrorManagedSyncFailure({ ...recorded, message: formatManagedSyncFailure(recorded) });
+    ledgerRecorded = true;
+  } catch { }
+  return { failure: recorded, ledgerRecorded };
 }
 
 export async function clearManagedSyncFailureAfterSuccess(engine: BrainEngine, key: string): Promise<void> {

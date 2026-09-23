@@ -60,6 +60,10 @@ async function registrationGrant(engine: BrainEngine, params: Record<string, unk
 
 export async function runPersistenceAdministration(engine: BrainEngine, operation: PersistenceAdminOperation,
   params: Record<string, unknown>, config?: GBrainConfig): Promise<Record<string, unknown>> {
+  if (operation === 'writer_reconcile_preview') return (await import('./reconcile.ts')).runReconcilePreview(engine, params);
+  if (operation === 'writer_reconcile_apply') return (await import('./reconcile.ts')).runReconcileApply(engine, params);
+  if (operation === 'writer_reconcile_audit') return (await import('./reconcile-audit.ts')).runReconcileAudit(engine, params);
+  if (operation === 'writer_reconcile_backups') return (await import('./reconcile.ts')).runReconcileBackups(engine, params);
   if (operation === 'company_brain_preview' || operation === 'company_brain_connect' || operation === 'company_brain_resume') {
     const writer = currentVerifiedLocalWriter();
     if (!writer || writer.remote || writer.principal.kind !== 'local_cli') throw new OperationError('permission_denied', 'Company source administration requires an authenticated local CLI registration.');

@@ -73,8 +73,12 @@ await runApplyMigrations(['--yes']);
     });
   }
 
-  test('failed real install retries, while a historical complete requires explicit force-retry', async () => {
+  test.each(['file-postgres', 'env-overrides-pglite'])('failed applicable install retries in %s, while a historical complete requires explicit force-retry', async (context) => {
     await fixture(async (home, ledger) => {
+      const databaseUrl = 'postgresql://fixture:fixture@127.0.0.1:1/gbrain_test';
+      if (context === 'file-postgres') {
+        writeFileSync(join(home, '.gbrain/config.json'), JSON.stringify({ engine: 'postgres', database_url: databaseUrl }));
+      }
       const bin = join(home, 'bin');
       mkdirSync(bin);
       const calls = join(home, 'calls.log');
@@ -82,49 +86,105 @@ await runApplyMigrations(['--yes']);
       const writeShim = (installCode: number) => writeFileSync(shim,
         `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nif [ "$1" = autopilot ]; then exit ${installCode}; fi\nexit 0\n`, { mode: 0o755 });
       writeShim(7);
-      const env = { PATH: `${bin}:${process.env.PATH ?? ''}`, GBRAIN_NO_AUTOPILOT_INSTALL: undefined };
-      const args = ['apply-migrations', '--yes', '--migration', '0.11.0'];
+      const env: Record<string, string> = { HOME: home, GBRAIN_HOME: home, PATH: `${bin}:${process.env.PATH ?? ''}` };
+      if (context === 'env-overrides-pglite') env.GBRAIN_DATABASE_URL = databaseUrl;
+      const setup = `
+import { mock } from 'bun:test';
+import { loadConfig } from ${JSON.stringify(join(root, 'src/core/config.ts'))};
+import { LATEST_VERSION } from ${JSON.stringify(join(root, 'src/core/migrate.ts'))};
+if (loadConfig()?.engine !== 'postgres') throw new Error('fixture must resolve to an applicable Postgres install');
+const migrationSetup = await import(${JSON.stringify(join(root, 'src/commands/migrations/in-process.ts'))});
+mock.module(${JSON.stringify(join(root, 'src/commands/migrations/in-process.ts'))}, () => ({
+  ...migrationSetup, runMigrateOnlyCore: async () => ({ engine: 'postgres' }),
+}));
+const factory = await import(${JSON.stringify(join(root, 'src/core/engine-factory.ts'))});
+mock.module(${JSON.stringify(join(root, 'src/core/engine-factory.ts'))}, () => ({
+  ...factory,
+  createEngine: async () => ({
+    connect: async () => {}, disconnect: async () => {},
+    getConfig: async (key) => {
+      if (key !== 'version') throw new Error('unexpected preflight read: ' + key);
+      return String(LATEST_VERSION);
+    },
+  }),
+}));
+`;
+      const runScript = (script: string, args: string[] = []) => {
+        const child = Bun.spawnSync([process.execPath, '--no-env-file', script, ...args], {
+          cwd: home, env, stdout: 'pipe', stderr: 'pipe', timeout: 30_000,
+        });
+        return { exitCode: child.exitCode, stdout: child.stdout.toString(), stderr: child.stderr.toString() };
+      };
+      const args = ['--yes', '--migration', '0.11.0'];
       const directScript = join(home, 'orchestrator.ts');
-      writeFileSync(directScript, `
-import { v0_11_0 } from ${JSON.stringify(join(root, 'src/commands/migrations/v0_11_0.ts'))};
+      writeFileSync(directScript, setup + `
+const { v0_11_0 } = await import(${JSON.stringify(join(root, 'src/commands/migrations/v0_11_0.ts'))});
 const result = await v0_11_0.orchestrator({ yes: true, dryRun: false, noAutopilotInstall: false });
 console.log('RESULT=' + JSON.stringify(result));
 `);
-      const direct = Bun.spawnSync([process.execPath, '--no-env-file', directScript], {
-        cwd: home, env: { HOME: home, GBRAIN_HOME: home, PATH: env.PATH },
-        stdout: 'pipe', stderr: 'pipe', timeout: 30_000,
-      });
+      const runnerScript = join(home, 'apply.ts');
+      writeFileSync(runnerScript, setup + `
+const { runApplyMigrations } = await import(${JSON.stringify(join(root, 'src/commands/apply-migrations.ts'))});
+await runApplyMigrations(process.argv.slice(2));
+`);
+      const direct = runScript(directScript);
       expect(direct.exitCode).toBe(0);
-      const directResult = JSON.parse(direct.stdout.toString().split('\n').find(line => line.startsWith('RESULT='))!.slice(7));
+      const directResult = JSON.parse(direct.stdout.split('\n').find(line => line.startsWith('RESULT='))!.slice(7));
       expect(directResult.status).toBe('partial');
       expect(directResult.phases).toContainEqual(expect.objectContaining({ name: 'install', status: 'failed' }));
-      const failed = await runCli(args, { home, cwd: home, env });
+      const failed = runScript(runnerScript, args);
       expect(entries(ledger).at(-1)!.status).toBe('partial');
       expect(entries(ledger).at(-1)!.phases).toContainEqual(expect.objectContaining({ name: 'install', status: 'failed' }));
       expect(failed.exitCode).toBe(1);
       expect(failed.stderr).toContain('install');
 
       writeShim(0);
-      const retry = await runCli(args, { home, cwd: home, env });
+      const retry = runScript(runnerScript, args);
       expect(retry.exitCode).toBe(0);
       expect(entries(ledger).at(-1)!.status).toBe('complete');
 
       const historical = JSON.stringify({ version: '0.11.0', status: 'complete', phases: [{ name: 'install', status: 'failed' }] }) + '\n';
       writeFileSync(ledger, historical);
       const callsBefore = readFileSync(calls, 'utf8');
-      const noop = await runCli(args, { home, cwd: home, env });
+      const noop = runScript(runnerScript, args);
       expect(noop.exitCode).toBe(0);
       expect(readFileSync(ledger, 'utf8')).toBe(historical);
       expect(readFileSync(calls, 'utf8')).toBe(callsBefore);
-      const reset = await runCli(['apply-migrations', '--force-retry', '0.11.0'], { home, cwd: home, env });
+      const reset = runScript(runnerScript, ['--force-retry', '0.11.0']);
       expect(reset.exitCode).toBe(0);
       expect(entries(ledger).at(-1)!.status).toBe('retry');
-      const recovered = await runCli(args, { home, cwd: home, env });
+      const recovered = runScript(runnerScript, args);
       expect(recovered.exitCode).toBe(0);
       expect(entries(ledger).at(-1)!.status).toBe('complete');
       expect(readFileSync(calls, 'utf8')).not.toBe(callsBefore);
     });
   }, 60_000);
+
+  for (const explicitEngine of [true, false]) {
+    test(`${explicitEngine ? 'explicit' : 'inferred'} PGLite skips inapplicable daemon installation without invoking it`, async () => {
+      await fixture(async (home, ledger) => {
+        if (!explicitEngine) {
+          writeFileSync(join(home, '.gbrain/config.json'), JSON.stringify({ database_path: join(home, '.gbrain/brain') }));
+        }
+        const bin = join(home, 'bin');
+        mkdirSync(bin);
+        const calls = join(home, 'calls.log');
+        writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\nif [ "$1" = autopilot ]; then exit 99; fi\nexit 0\n`, { mode: 0o755 });
+        const result = await runCli(['apply-migrations', '--yes', '--migration', '0.11.0'], {
+          home, cwd: home,
+          env: { PATH: `${bin}:${process.env.PATH ?? ''}`, GBRAIN_NO_AUTOPILOT_INSTALL: undefined },
+        });
+        expect(readFileSync(calls, 'utf8')).not.toContain('autopilot');
+        expect(result.exitCode).toBe(0);
+        const record = entries(ledger).at(-1)!;
+        expect(record.status).toBe('complete');
+        expect(record.autopilot_installed).toBe(false);
+        expect(record.phases).toContainEqual({
+          name: 'install', status: 'skipped', detail: 'PGLite is single-writer; use gbrain serve for background maintenance',
+        });
+      });
+    });
+  }
 
   for (const disable of ['flag', 'env']) {
     test(`explicit no-autopilot ${disable} completes without invoking install`, async () => {
@@ -140,7 +200,7 @@ console.log('RESULT=' + JSON.stringify(result));
         });
         expect(result.exitCode).toBe(0);
         expect(entries(ledger).at(-1)!.status).toBe('complete');
-        expect(entries(ledger).at(-1)!.phases).toContainEqual(expect.objectContaining({ name: 'install', status: 'skipped' }));
+        expect(entries(ledger).at(-1)!.phases).toContainEqual({ name: 'install', status: 'skipped', detail: '--no-autopilot-install' });
         expect(readFileSync(calls, 'utf8')).not.toContain('autopilot');
       });
     });
