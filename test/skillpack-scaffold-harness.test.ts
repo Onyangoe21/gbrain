@@ -356,7 +356,7 @@ describe('review-driven CLI hardening', () => {
     expect(view.skills.length).toBeGreaterThan(0);
     expect(view.skills.every((skill: { source_id: string }) => skill.source_id === 'default')).toBe(true);
     const selected = view.skills[0];
-    const identity = ['--brain-id', selected.brain_id, '--source-id', selected.source_id,
+    const identity = ['--expected-brain-id', selected.brain_id, '--source-id', selected.source_id,
       '--source-incarnation', selected.source_incarnation, '--pack-id', selected.pack_id, '--revision', selected.revision];
     const fetched = invoke(['skill', selected.name, ...identity, '--schema-version', '2', '--json']);
     expect(fetched.status, fetched.stderr).toBe(0);
