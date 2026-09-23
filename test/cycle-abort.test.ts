@@ -233,7 +233,7 @@ describe('#4077 — synthesize/patterns cooperative-abort threading', () => {
     expect(src).toMatch(/runSubagentsInline\([\s\S]{0,240}?opts\.signal/);
     expect(src).toMatch(/waitForCompletionRenewing\(queue, jobId, \{[\s\S]*?signal: opts\.signal,/);
     // Write boundaries downstream of the drain are signal-guarded.
-    expect(src).toContain('stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal)');
+    expect(src).toContain('stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal, maintenance)');
     expect(src).toContain('reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal)');
   });
 

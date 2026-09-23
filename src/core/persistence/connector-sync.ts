@@ -90,7 +90,8 @@ export async function beginConnectorSync(engine: BrainEngine, sourceId: string, 
   const caller = currentSubmissionAuthority();
   if (caller && caller.kind !== 'application') throw new OperationError('permission_denied', 'Connector sync requires a trusted local CLI writer; remote jobs cannot acquire connector credentials.');
   const [source] = await engine.executeRaw<ConnectorSource>('SELECT incarnation,archived,local_path,config FROM sources WHERE id=$1', [sourceId]);
-  if (!source || source.archived || source.config.kind !== connector) throw new OperationError('source_changed', 'The connector source is not active.');
+  if (!source || source.archived) throw new OperationError('source_changed', 'The connector source is not active.');
+  if (source.config.kind !== connector) throw new OperationError('writer_coordinator_required', 'Managed connector sync requires a registered connector source; legacy filesystem calls are unsupported.');
   const config = connector === 'google'
     ? (await import('../google/google-source.ts')).parseGoogleSourceConfig(source.config, source.local_path ?? '')
     : (await import('../github-source.ts')).parseGitHubSourceConfig(source.config, source.local_path ?? '');

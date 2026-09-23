@@ -198,7 +198,7 @@ async function recordFailure(engine: BrainEngine, effect: PersistenceEffect, err
     if (attempt >= MAX_RATE_LIMIT_RETRIES) {
       await failEffect(engine, effect, 'embedding_attempts_exhausted'); return;
     }
-    const reason = signal?.aborted ? 'embedding_aborted' : code === 'effect_unavailable' ? 'embedding_unavailable' : code;
+    const reason = signal?.aborted ? 'embedding_aborted' : code;
     const delay = isEmbedRetriableError(error) ? rateLimitDelayMs(error instanceof Error ? error.message : '', attempt - 1)
       : transientBackoffMs(attempt - 1);
     await retryEffect(engine, effect, reason, delay); return;
