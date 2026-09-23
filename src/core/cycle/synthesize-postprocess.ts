@@ -25,7 +25,8 @@ export async function postprocessManagedSynthesis(
 ) {
   const stats = emptyQuoteVerifyStats();
   const writtenRefs: OutputRef[] = [];
-  if (!refs.length) return { writtenRefs, stats };
+  const finalizedRefs: OutputRef[] = [];
+  if (!refs.length) return { writtenRefs, finalizedRefs, stats };
   const outputs = await engine.executeRaw<RetainedOutput>(
     `SELECT t.job_id,j.idempotency_key AS job_key,row_to_json(p) AS request
        FROM subagent_tool_executions t JOIN minion_jobs j ON j.id=t.job_id
@@ -48,13 +49,14 @@ export async function postprocessManagedSynthesis(
     if (!output || !transcript || typeof revision !== 'string') {
       throw new OperationError('recovery_required', 'The synthesis output has no retained transcript and committed revision.');
     }
+    const finalizedRef = { ...ref, raw_source: path };
     const key = digest({ kind: 'synthesis-postprocess-v1', source: authority.writer.sourceIncarnation,
       slug: ref.slug, job: output.job_key, output: output.request.id, revision, transcript: transcript.contentHash });
     const requestId = `${key.slice(0, 8)}-${key.slice(8, 12)}-4${key.slice(13, 16)}-a${key.slice(17, 20)}-${key.slice(20, 32)}`;
     const prior = await getWriteRequest(engine, authority.writer.principal, requestId);
     if (prior) {
       await authorizeStoredRequest(engine, prior);
-      if (prior.state === 'committed') continue;
+      if (prior.state === 'committed') { finalizedRefs.push(finalizedRef); continue; }
       if (['conflict', 'failed', 'cancelled'].includes(prior.state)) writeResponse(prior);
     }
     await authorizeStoredRequest(engine, output.request);
@@ -88,8 +90,9 @@ export async function postprocessManagedSynthesis(
     }
     throwIfAborted(opts.signal, '[dream] synthesis postprocessing');
     await publishMaintenancePage(engine, authority, ref.slug, content, { requestId, expectedRevision: revision });
-    writtenRefs.push({ ...ref, raw_source: path });
+    writtenRefs.push(finalizedRef);
+    finalizedRefs.push(finalizedRef);
     await new Promise(resolve => setTimeout(resolve, 0));
   }
-  return { writtenRefs, stats };
+  return { writtenRefs, finalizedRefs, stats };
 }

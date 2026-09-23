@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -9,9 +9,10 @@ import { runPhaseSynthesize } from '../src/core/cycle/synthesize.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
-import { configureGateway, resetGateway, __setChatTransportForTests } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway, __setChatTransportForTests, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
+import * as staleEmbedding from '../src/core/embed-stale.ts';
 
 const engines: BrainEngine[] = [];
 let dataDir: string;
@@ -42,7 +43,7 @@ async function fixture(run: (f: {
   engine: BrainEngine; sourceId: string; root: string;
   opts: { brainDir: string; sourceId: string; dryRun: boolean; inputFile: string; date: string };
   calls: () => number; edit: (slug: string) => Promise<void>;
-}) => Promise<void>) {
+}) => Promise<void>, outputCount = 1) {
   for (const engine of engines) {
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-synth-postprocess-'));
     const root = join(dir, 'brain');
@@ -76,8 +77,10 @@ async function fixture(run: (f: {
           const hash = /hash suffix \(USE THIS in slugs\): ([a-z0-9-]+)/i.exec(String(opts.messages?.[0]?.content ?? ''))?.[1] ?? 'missing';
           const text = (opts.system ?? '').startsWith('You triage a conversation transcript')
             ? JSON.stringify({ score: 0.9, content_type: 'reflection', segments: [{ quote, note: 'evidence' }], entities: [], reasons: ['durable insight'] })
-            : JSON.stringify({ pages: [{ slug: `wiki/personal/reflections/session-${hash}`, title: 'Session', type: 'note',
-              body: 'A memory strategy with [[people/example]]. Allegedly: "an entirely invented quotation that should lose its marks".' }], skipped: false });
+            : JSON.stringify({ pages: Array.from({ length: outputCount }, (_, i) => ({
+              slug: `wiki/personal/reflections/session${i ? `-${i}` : ''}-${hash}`, title: `Session ${i}`, type: 'note',
+              body: `A memory strategy with [[people/example]]. Evidence item ${i}. Allegedly: "an entirely invented quotation that should lose its marks".`,
+            })), skipped: false });
           return { text, blocks: [{ type: 'text', text }], stopReason: 'end',
             usage: { input_tokens: 100, output_tokens: 100, cache_read_tokens: 0, cache_creation_tokens: 0 },
             model: opts.model!, providerId: 'anthropic' };
@@ -91,7 +94,9 @@ async function fixture(run: (f: {
           } });
       });
     } finally {
+      configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: {} });
       __setChatTransportForTests(null);
+      __setEmbedTransportForTests(null);
       await disposePersistenceConsumer(engine);
       await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
       rmSync(dir, { recursive: true, force: true });
@@ -229,6 +234,9 @@ test('a committed postprocessing receipt survives interruption before the phase 
     const processed = (await engine.readPageSnapshot(slug, { sourceId }))!;
     expect(processed.page.frontmatter.dream_generated).toBe(true);
     expect(processed.page.compiled_truth).not.toContain('"an entirely invented');
+    const summarySlug = `dream-cycle-summaries/${opts.date}`;
+    expect(await engine.readPageSnapshot(summarySlug, { sourceId })).toBeNull();
+    expect(existsSync(join(root, `${summarySlug}.md`))).toBe(false);
     await edit(slug);
     const edited = (await engine.readPageSnapshot(slug, { sourceId }))!;
     const bytes = readFileSync(join(root, `${slug}.md`), 'utf8');
@@ -239,5 +247,106 @@ test('a committed postprocessing receipt survives interruption before the phase 
     expect(calls()).toBe(spent);
     expect((await engine.readPageSnapshot(slug, { sourceId }))!.revision).toBe(edited.revision);
     expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toBe(bytes);
+    const summary = (await engine.readPageSnapshot(summarySlug, { sourceId }))!;
+    expect(summary.page.compiled_truth).toContain('**Pages written:** 1.');
+    expect(summary.page.compiled_truth).toContain(`[[${slug}]]`);
+    expect(readFileSync(join(root, `${summarySlug}.md`), 'utf8')).toContain(`[[${slug}]]`);
   });
+}, 120_000);
+
+test('same-date synthesis replay preserves the completed summary bytes and revision', async () => {
+  await fixture(async ({ engine, sourceId, root, opts, calls, edit }) => {
+    const first = await runPhaseSynthesize(engine, opts);
+    expect(first.status).toBe('ok');
+    const slug = await outputSlug(engine, sourceId);
+    const summarySlug = String(first.details.summary_slug);
+    const summaryPath = join(root, `${summarySlug}.md`);
+    expect(readFileSync(summaryPath, 'utf8')).toContain(`[[${slug}]]`);
+    const spent = calls();
+    for (const userEdited of [false, true]) {
+      if (userEdited) await edit(summarySlug);
+      const before = (await engine.readPageSnapshot(summarySlug, { sourceId }))!;
+      const bytes = readFileSync(summaryPath, 'utf8');
+      const mtime = statSync(summaryPath).mtimeMs;
+      const receipts = await engine.executeRaw('SELECT id,state,outcome FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId]);
+      await disposePersistenceConsumer(engine);
+      await engine.executeRaw('DELETE FROM dream_verdicts');
+      const replay = await runPhaseSynthesize(engine, opts);
+      expect(replay.status).toBe('ok');
+      expect(replay.details.pages_written).toBe(0);
+      expect(replay.details.reverse_write_count).toBe(0);
+      expect(calls()).toBe(spent);
+      expect((await engine.readPageSnapshot(summarySlug, { sourceId }))!.revision).toBe(before.revision);
+      expect(readFileSync(summaryPath, 'utf8')).toBe(bytes);
+      expect(statSync(summaryPath).mtimeMs).toBe(mtime);
+      expect(await engine.executeRaw('SELECT id,state,outcome FROM persistence_requests WHERE source_id=$1 ORDER BY sequence', [sourceId])).toEqual(receipts);
+    }
+  });
+}, 120_000);
+
+test('partial multi-output recovery indexes every finalized output without republishing or embedding earlier outputs', async () => {
+  await fixture(async ({ engine, sourceId, root, opts, calls }) => {
+    await interruptAfterChild(engine, sourceId, opts);
+    const outputs = await engine.executeRaw<{ slug: string }>(
+      "SELECT slug FROM pages WHERE source_id=$1 AND slug LIKE 'wiki/personal/reflections/session-%' ORDER BY slug", [sourceId]);
+    expect(outputs).toHaveLength(2);
+    const [first, second] = outputs.map(row => row.slug);
+    const read = engine.readPageSnapshot;
+    let interrupted = false;
+    const spy = spyOn(engine, 'readPageSnapshot').mockImplementation(async function (this: BrainEngine, target, options) {
+      if (this === engine && target === second && options?.sourceId === sourceId) {
+        interrupted = true;
+        throw new Error('simulated interruption between output postprocessing commits');
+      }
+      return read.call(this, target, options);
+    });
+    const spent = calls();
+    try {
+      expect((await runPhaseSynthesize(engine, opts)).status).toBe('fail');
+      expect(interrupted).toBe(true);
+    } finally { spy.mockRestore(); }
+    const firstSnapshot = (await engine.readPageSnapshot(first, { sourceId }))!;
+    expect(firstSnapshot.page.frontmatter.dream_generated).toBe(true);
+    expect((await engine.readPageSnapshot(second, { sourceId }))!.page.frontmatter.dream_generated).not.toBe(true);
+    const firstBytes = readFileSync(join(root, `${first}.md`), 'utf8');
+    const firstMtime = statSync(join(root, `${first}.md`)).mtimeMs;
+    const firstReceipts = await engine.executeRaw('SELECT id,state,outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2 ORDER BY sequence', [sourceId, first]);
+    const embedded: string[] = [];
+    configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test-synthesis-embedding' } });
+    __setEmbedTransportForTests((async ({ values }: { values: string[] }) => {
+      embedded.push(...values);
+      return { embeddings: values.map(() => Array(1536).fill(0.01)) };
+    }) as never);
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw('DELETE FROM dream_verdicts');
+    const embedScopes: string[][] = [];
+    const embedPages = staleEmbedding.embedStalePages;
+    const embedSpy = spyOn(staleEmbedding, 'embedStalePages').mockImplementation(async (...args) => {
+      embedScopes.push([...args[1]]);
+      return embedPages(...args);
+    });
+    let recovered: Awaited<ReturnType<typeof runPhaseSynthesize>>;
+    try { recovered = await runPhaseSynthesize(engine, opts); }
+    finally { embedSpy.mockRestore(); }
+    expect(recovered.status).toBe('ok');
+    expect(recovered.details.pages_written).toBe(1);
+    expect(recovered.details.reverse_write_count).toBe(1);
+    expect(recovered.details.written_slugs).toEqual([second]);
+    expect(calls()).toBe(spent);
+    expect((await engine.readPageSnapshot(first, { sourceId }))!.revision).toBe(firstSnapshot.revision);
+    expect(readFileSync(join(root, `${first}.md`), 'utf8')).toBe(firstBytes);
+    expect(statSync(join(root, `${first}.md`)).mtimeMs).toBe(firstMtime);
+    expect(await engine.executeRaw('SELECT id,state,outcome FROM persistence_requests WHERE source_id=$1 AND slug=$2 ORDER BY sequence', [sourceId, first])).toEqual(firstReceipts);
+    expect(embedded.length).toBeGreaterThan(0);
+    expect(embedScopes).toEqual([[second]]);
+    const summarySlug = String(recovered.details.summary_slug);
+    const summary = (await engine.readPageSnapshot(summarySlug, { sourceId }))!;
+    const summaryBytes = readFileSync(join(root, `${summarySlug}.md`), 'utf8');
+    expect(summary.page.compiled_truth).toContain('**Pages written:** 2.');
+    for (const { slug } of outputs) {
+      expect(summary.page.compiled_truth).toContain(`[[${slug}]]`);
+      expect(summaryBytes).toContain(`[[${slug}]]`);
+    }
+  }, 2);
 }, 120_000);

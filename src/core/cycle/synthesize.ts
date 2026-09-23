@@ -1065,6 +1065,7 @@ async function runPhaseSynthesizeInner(
     // distinguishable from a triage miss in the phase telemetry.
     const jobsWithPages = new Set<number>();
     let writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages);
+    let finalizedRefs = writtenRefs;
 
     // F1b/F4b: mechanical quote verify/repair on this phase's newly-created
     // pages, BEFORE the provenance stamp / reverse-write / embed sweep so the
@@ -1076,6 +1077,7 @@ async function runPhaseSynthesizeInner(
       const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
         worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, signal: opts.signal });
       writtenRefs = processed.writtenRefs;
+      finalizedRefs = processed.finalizedRefs;
       quoteVerifyStats = config.quoteVerify ? processed.stats : null;
     } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(
@@ -1095,13 +1097,11 @@ async function runPhaseSynthesizeInner(
     const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0)
       : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
 
-    // Summary index page (deterministic; orchestrator-written via direct
-    // engine.putPage so no allow-list path needed).
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
-    // Back-compat: writeSummaryPage takes string[] for display; map refs back to slugs.
     const writtenSlugs = writtenRefs.map(r => r.slug);
     if (SUMMARY_SLUG_RE.test(summarySlug)) {
-      await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes, cycleSourceId, opts.signal, maintenance);
+      const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
+      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance);
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
