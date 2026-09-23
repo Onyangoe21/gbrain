@@ -17,7 +17,7 @@ export const WRITER_HELP = `Usage:
   gbrain sources writer status [<source>] [--probe] [--json]
   gbrain sources writer retry-effects <source> --request-id <uuid> [--dry-run] [--json]
   gbrain sources writer claim <source> --path <directory> [administration options] [--dry-run] [--json]
-  gbrain sources writer activate --confirm-quiesced [--cleanup-dead-local-locks] [administration options] [--dry-run] [--json]
+  gbrain sources writer activate --confirm-quiesced [--cleanup-dead-local-locks] [--shared-skills] [administration options] [--dry-run] [--json]
   gbrain sources writer transfer prepare <source> [--self-transfer] [administration options] [--dry-run] [--json]
   gbrain sources writer transfer accept <source> --path <worktree-root> --expected-epoch <n> --manifest <sha256> [--self-transfer] [administration options] [--dry-run] [--json]
 
@@ -37,6 +37,7 @@ Self-transfer is opt-in on both phases and only repairs this host's recorded
 canonical root; it never relocates a checkout. Inspect status again after prepare.
 Activation may explicitly remove exact dead local legacy holders with
 --cleanup-dead-local-locks; expiry alone is never evidence of death.
+--shared-skills activates recoverable skill bundles and blocks older writers.
 No command takes over an owner based on a stale heartbeat.
 retry-effects handles embedding effects only: it reconciles existing complete
 vectors or explicitly authorizes one additional bounded retry cycle per request.
@@ -78,7 +79,7 @@ export function parsePersistenceAdminArgs(group: Group, args: string[]): {
     const flag = equal < 0 ? token : token.slice(0, equal);
     if (seen.has(flag)) throw new OperationError('invalid_params', `Duplicate option ${flag}.`);
     seen.add(flag);
-    if (['--json', '--dry-run', '--replace', '--probe', '--confirm-quiesced', '--self-transfer', '--cleanup-dead-local-locks'].includes(flag)) {
+    if (['--json', '--dry-run', '--replace', '--probe', '--confirm-quiesced', '--self-transfer', '--cleanup-dead-local-locks', '--shared-skills'].includes(flag)) {
       if (equal >= 0) throw new OperationError('invalid_params', `${flag} does not accept a value.`);
       if (flag === '--json') json = true;
       else params[flag.slice(2).replaceAll('-', '_')] = true;

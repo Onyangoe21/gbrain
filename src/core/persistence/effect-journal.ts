@@ -8,10 +8,12 @@ import type { EffectKind, PersistenceEffect, EffectRequest } from './effect-mode
 import type { SqlEngine } from './model.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
+import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 
 export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest, revision: string | undefined,
   outcome: Record<string, unknown>, prepared?: PreparedMutation): Promise<void> {
-  if (prepared?.noop) return;
+  if (prepared?.noop || prepared?.target === 'skill_bundle') return;
+  await declarePersistenceProtocol(tx);
   const snapshot = await tx.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
   const data = { slug: row.slug, page_id: snapshot?.page.id };
   const queue = async (kind: EffectKind, extra: Record<string, unknown> = {}) => tx.executeRaw(`INSERT INTO persistence_effects
@@ -39,6 +41,7 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
 /** Claims release their database connection before waiting for a filesystem lock/provider. */
 export async function claimPersistenceEffect(engine: BrainEngine, hostId: string): Promise<PersistenceEffect | null> {
   return engine.transactionDirect(async tx => {
+    await declarePersistenceProtocol(tx);
     const [candidate] = await tx.executeRaw<PersistenceEffect>(`SELECT e.* FROM persistence_effects e
       LEFT JOIN persistence_worktrees w ON w.id=e.worktree_id
       WHERE (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
@@ -59,7 +62,7 @@ export async function claimPersistenceEffect(engine: BrainEngine, hostId: string
 
 export async function renewPersistenceEffectClaim(engine: SqlEngine, effect: PersistenceEffect): Promise<boolean> {
   const rows = await engine.executeRaw(`UPDATE persistence_effects SET claim_expires_at=now()+interval '2 minutes',updated_at=now()
-    WHERE id=$1 AND execution_token=$2::uuid AND state='running' AND recovery IS NULL RETURNING id`, [effect.id, effect.execution_token]);
+    WHERE id=$1 AND execution_token=$2::uuid AND state='running' AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [effect.id, effect.execution_token]);
   return rows.length === 1;
 }
 
@@ -68,22 +71,22 @@ export async function advanceEffectCursor(engine: SqlEngine, effect: Persistence
     CASE WHEN kind='embedding' THEN jsonb_set(data,'{embedding_attempt_base}',to_jsonb(attempts)) ELSE data END,'{after_slug}',to_jsonb($3::text)),
     execution_token=NULL,claim_expires_at=NULL,next_attempt_at=now(),error_code=NULL,
     updated_at=now()
-    WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL`, [effect.id, effect.execution_token, slug]);
+    WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, [effect.id, effect.execution_token, slug]);
 }
 
 export async function completeEffect(engine: SqlEngine, effect: PersistenceEffect, outcome: Record<string, unknown> = {}): Promise<void> {
   await engine.executeRaw(`UPDATE persistence_effects SET state='committed',execution_token=NULL,claim_expires_at=NULL,error_code=NULL,
-    outcome=$3::text::jsonb,updated_at=now() WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL`,
+    outcome=$3::text::jsonb,updated_at=now() WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE}`,
   [effect.id, effect.execution_token, JSON.stringify(outcome)]);
 }
 export async function retryEffect(engine: SqlEngine, effect: PersistenceEffect, reason: string, delayMs = 1000): Promise<void> {
   await engine.executeRaw(`UPDATE persistence_effects SET state='queued',execution_token=NULL,claim_expires_at=NULL,error_code=$3,
     next_attempt_at=now()+($4::double precision*interval '1 millisecond'),updated_at=now()
-    WHERE id=$1 AND execution_token=$2::uuid`, [effect.id, effect.execution_token, reason, delayMs]);
+    WHERE id=$1 AND execution_token=$2::uuid AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, [effect.id, effect.execution_token, reason, delayMs]);
 }
 export async function failEffect(engine: SqlEngine, effect: PersistenceEffect, reason: string): Promise<void> {
   await engine.executeRaw(`UPDATE persistence_effects SET state='failed',execution_token=NULL,claim_expires_at=NULL,error_code=$3,updated_at=now()
-    WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL`, [effect.id, effect.execution_token, reason]);
+    WHERE id=$1 AND execution_token=$2::uuid AND recovery IS NULL AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, [effect.id, effect.execution_token, reason]);
 }
 
 /** Only public kind/state/reason, aggregated so withdrawal page counts cannot leak. */

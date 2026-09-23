@@ -11,6 +11,7 @@ import { writerDiagnostics } from './control.ts';
 import { acceptWriterTransfer, claimWorktree, getWorktreeBinding, prepareWriterTransfer, worktreeManifest } from './ownership.ts';
 import { existingLocalHostId, currentVerifiedLocalWriter, persistenceHome, readLocalWriter, registerLocalWriter, revokeLocalWriter, type LocalGrant } from './identity.ts';
 import type { PersistenceAdminOperation } from './admin-contract.ts';
+import { operationScopesAllowed } from '../scope.ts';
 import { assertWriterAdminState, requireWriterAdminIntent, writerAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { writerOnboardingPreflight } from './onboarding.ts';
 
@@ -45,11 +46,14 @@ async function registrationGrant(engine: BrainEngine, params: Record<string, unk
     if (rows.length !== sourceIds.length) throw invalid('Every source_ids entry must name an active source.');
   }
   const scopes = params.scopes === undefined ? ['read', 'write'] : strings(params.scopes, 'scopes');
-  if (!scopes.length || scopes.some(scope => !['read', 'write'].includes(scope))) throw invalid('Local writer scopes may contain read and write only.');
+  if (!scopes.length || scopes.some(scope => !['read', 'write', 'skill_editor', 'skills_member_self'].includes(scope))) throw invalid('Local writer scopes may contain read, write, skill_editor and skills_member_self only.');
   const operations = params.allowed_operations === undefined ? null : strings(params.allowed_operations, 'allowed_operations');
+  if (scopes.some(scope => scope === 'skill_editor' || scope === 'skills_member_self') && !operations?.length) {
+    throw invalid('Shared-skill capabilities require an explicit nonempty allowed_operations snapshot.');
+  }
   if (operations) {
     const { operations: registry } = await import('../operations.ts');
-    if (operations.some(name => !registry.some(op => op.name === name && !op.localOnly && (op.scope === undefined || scopes.includes(op.scope))))) {
+    if (operations.some(name => !registry.some(op => op.name === name && !op.localOnly && operationScopesAllowed(scopes, op)))) {
       throw invalid('allowed_operations must name public operations within the requested read/write scope.');
     }
   }
@@ -134,8 +138,10 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       native = { ...capability, acquired: true, released: lock.released };
     }
     const onboarding = await writerOnboardingPreflight(engine, params.source_id as string | undefined);
+    const [sharedSkills] = await engine.executeRaw<{ writer_protocol_floor: number; skill_bundles_enabled: boolean }>(
+      'SELECT writer_protocol_floor,skill_bundles_enabled FROM persistence_brain WHERE singleton=1');
     await assertWriterAdminState(engine, adminState, false);
-    return { ...diagnostics, host_id: existingLocalHostId(), bindings, admin_state: adminState, onboarding, ...(native ? { native_lock: native } : {}) };
+    return { ...diagnostics, host_id: existingLocalHostId(), bindings, admin_state: adminState, onboarding, shared_skills: sharedSkills, ...(native ? { native_lock: native } : {}) };
   }
   if (operation === 'writer_claim') {
     keys(params, ['source_id', 'path', 'dry_run', 'admin_intent', 'expected_state']);
@@ -145,10 +151,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
     return { claimed: true, binding: await claimWorktree(engine, sourceId, root, undefined, expectedState) };
   }
   if (operation === 'writer_activate') {
-    keys(params, ['confirm_quiesced', 'dry_run', 'admin_intent', 'expected_state', 'cleanup_dead_local_locks']);
+    keys(params, ['confirm_quiesced', 'dry_run', 'shared_skills', 'admin_intent', 'expected_state', 'cleanup_dead_local_locks']);
     if (params.cleanup_dead_local_locks !== undefined && typeof params.cleanup_dead_local_locks !== 'boolean') throw invalid('cleanup_dead_local_locks must be a boolean.');
     if (params.confirm_quiesced !== true) throw invalid('Activation requires --confirm-quiesced after upgrading and stopping older writers on every host.');
+    if (params.shared_skills !== undefined && typeof params.shared_skills !== 'boolean') throw invalid('shared_skills must be a boolean.');
     const expectedState = await requireWriterAdminIntent(engine, operation, params);
+    if (params.shared_skills === true) {
+      const { activateSharedSkillPersistence } = await import('./skill-activation.ts');
+      return { ...await activateSharedSkillPersistence(engine, { confirmQuiesced: true, dryRun: params.dry_run === true, expectedState }),
+        ...(params.dry_run ? { dry_run: true, action: operation } : {}) };
+    }
     const { activatePersistence } = await import('./activation.ts');
     return { ...await activatePersistence(engine, { confirmQuiesced: true, dryRun: params.dry_run === true, expectedState, cleanupDeadLocalLocks: params.cleanup_dead_local_locks === true }),
       unsupported_maintenance: [...UNSUPPORTED_MANAGED_BULK_WRITERS],

@@ -375,6 +375,8 @@ export async function doctorReportRemote(
 
   // 6. Sync freshness check
   checks.push(await checkSyncFreshness(engine));
+  const contentWrites = await (await import('./checks/canonical-content.ts')).checkCanonicalContentWrites(engine, opts.sourceIds);
+  if (contentWrites) checks.push(contentWrites);
 
   // v0.41.19.0 (Issue 5): sync --all consolidation nudge for multi-source brains.
   checks.push(await checkSyncConsolidation(engine));

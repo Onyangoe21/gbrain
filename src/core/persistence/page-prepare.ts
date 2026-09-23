@@ -26,6 +26,7 @@ import { preserveProtectedTakes } from './protected-takes.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { preparePageAdvisories, remoteLinkHint, pageNoopAdvisories } from './page-advisories.ts';
+import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 
 const PURGE_RESIDUALS = 'Brain-repo git history, synced working-tree copies, exports, compiled context files and slug-keyed derived rows (takes, open loops, file records) may still hold the content — rotate the credential and rewrite or regenerate those copies.';
 
@@ -96,6 +97,7 @@ export async function prepareFileTarget(engine: BrainEngine, row: Pick<WriteRequ
 export async function preparePageMutation(engine: BrainEngine, row: WriteRequest, _config: GBrainConfig,
   preparedIntent?: { content: string; expectedRevision: string; tags?: string[] }): Promise<PreparedMutation> {
   if (!row.intent) throw new OperationError('storage_error', 'A pending write lost its normalized intent.');
+  await assertKnowledgePublicationAllowed(engine, row);
   const p = row.intent;
   const source = { sourceId: row.source_id };
   const snapshot = await engine.readPageSnapshot(row.slug, { ...source, includeDeleted: true });

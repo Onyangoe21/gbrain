@@ -13,7 +13,10 @@ import { recoverCredentialDelivery, retainCredentialDelivery } from '../core/har
 export interface ProvisionGrantInput {
   name: string; harness: string; profile?: GrantProfileId; sourceId?: string; url: string;
   clientId?: string; expectedRevision?: number; dryRun?: boolean; resume?: boolean; patch?: GrantPatch;
+  sharedSkills?: 'follow' | 'memory-only';
 }
+
+const FOLLOW_OPERATIONS = ['list_skills', 'get_skill', 'list_brain_skillpack', 'get_skill_asset', 'join_brain', 'sync_brain_skills', 'leave_brain'];
 
 /** Called by trusted local CLI or cookie-authenticated admin routes only. */
 export async function provisionHarnessGrant(engine: BrainEngine, input: ProvisionGrantInput, actor: string) {
@@ -23,13 +26,14 @@ export async function provisionHarnessGrant(engine: BrainEngine, input: Provisio
   if (!normalized.ok) throw new Error('Pass a valid MCP endpoint URL');
   assertSecureEndpoint(normalized.url);
   if (input.profile !== undefined && !GRANT_PROFILES.includes(input.profile)) throw new Error('Unknown grant profile');
+  if (input.sharedSkills !== undefined && !['follow', 'memory-only'].includes(input.sharedSkills)) throw new Error('Shared skills must be follow or memory-only');
   return engine.transaction(async tx => {
     const sql = sqlQueryForEngine(tx);
     await sql`SELECT pg_advisory_xact_lock(hashtext(${registerClientNameLockKey(input.name)})::bigint)`;
     const existing = input.clientId ? await readClientGrant(tx, input.clientId) : undefined;
     if (input.resume) {
       if (!existing || existing.revoked) throw new Error('--resume requires an active --client');
-      if (input.profile || input.sourceId || Object.keys(input.patch ?? {}).length || input.dryRun) throw new Error('--resume only recovers delivery; run a separate grant update to change permissions');
+      if (input.profile || input.sourceId || input.sharedSkills !== undefined || Object.keys(input.patch ?? {}).length || input.dryRun) throw new Error('--resume only recovers delivery; run a separate grant update to change permissions');
       const credentials = recoverCredentialDelivery(existing.clientId, normalized.url);
       // The journal is a delivery record, never authority after secret rotation.
       // Verify the renewable credential against the current confidential client.
@@ -43,6 +47,7 @@ export async function provisionHarnessGrant(engine: BrainEngine, input: Provisio
       delete credentials.expires_at;
       credentials.profile = existing.profile ?? undefined;
       credentials.source_id = existing.sourceId ?? undefined;
+      credentials.shared_skills = { follow: existing.scopes.includes('skills_member_self'), source_ids: [...existing.federatedRead] };
       return { grant: existing, before: existing, dry_run: false, credentials, credential_action: 'recovered_private_handoff' };
     }
     const sourceId = input.sourceId ?? existing?.sourceId ?? 'default';
@@ -61,6 +66,21 @@ export async function provisionHarnessGrant(engine: BrainEngine, input: Provisio
       delegatedNamespace: patch.delegatedNamespace,
     }) : {};
     Object.assign(resolved, patch, input.sourceId === undefined ? {} : { sourceId });
+    const follow = input.sharedSkills ?? (patch.allowedOperations !== undefined || patch.scopes !== undefined ? undefined
+      : !existing || regrant && existing.scopes.includes('skills_member_self') ? 'follow' : undefined);
+    if (follow === 'follow') {
+      const scopes = resolved.scopes ?? existing?.scopes ?? [];
+      const allowed = resolved.allowedOperations ?? existing?.allowedOperations;
+      if (patch.allowedOperations !== undefined && (!patch.allowedOperations || FOLLOW_OPERATIONS.some(name => !patch.allowedOperations!.includes(name)))) {
+        throw new Error('Shared following requires its catalog and membership operations in the explicit operation snapshot; choose memory-only or approve those operations.');
+      }
+      resolved.scopes = [...new Set([...scopes, 'skills_member_self'])];
+      if (allowed != null) resolved.allowedOperations = [...new Set([...allowed, ...FOLLOW_OPERATIONS])].sort();
+    } else if (follow === 'memory-only') {
+      resolved.scopes = (resolved.scopes ?? existing?.scopes ?? []).filter(scope => scope !== 'skills_member_self');
+      const allowed = resolved.allowedOperations ?? existing?.allowedOperations;
+      if (allowed != null) resolved.allowedOperations = allowed.filter(name => !['join_brain', 'sync_brain_skills', 'leave_brain'].includes(name));
+    }
     if (regrant && adapter.connection === 'thin-cli') resolved.surface = 'full';
     if (existing) {
       const result = await rescopeClientGrantInTransaction(tx, existing.clientId, resolved,
@@ -85,7 +105,8 @@ export async function provisionHarnessGrant(engine: BrainEngine, input: Provisio
     const credentials: HarnessCredentials = { version: 1, mcp_url: normalized.url, issuer_url: normalized.url.replace(/\/mcp$/, ''),
       client_id: registered.clientId, client_secret: registered.clientSecret, access_token: tokens.access_token,
       expires_at: Math.floor(Date.now() / 1000) + (tokens.expires_in ?? prospective.tokenTtlSeconds ?? 3600),
-      profile, harness: adapter.id, source_id: sourceId };
+      profile, harness: adapter.id, source_id: sourceId,
+      shared_skills: { follow: prospective.scopes.includes('skills_member_self'), source_ids: [...prospective.federatedRead] } };
     // Failure here rolls back client + token + audit. A commit failure can leave
     // an orphaned private journal, but resume first requires the live client.
     retainCredentialDelivery(credentials);

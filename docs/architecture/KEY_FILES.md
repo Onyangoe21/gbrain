@@ -51,6 +51,7 @@ boundary and add its link here rather than raising the cap.
 | [Providers](key-files/providers.md) | `src/core/anthropic-pricing.ts` through `src/core/transcription.ts` |
 | [Runtime](key-files/runtime.md) | `src/core/abort-check.ts` through `src/core/zombie-reap.ts` |
 | [Security](key-files/security.md) | `src/core/destructive-guard.ts` through `src/core/ssrf-validate.ts` |
+| [Shared brain skills](key-files/shared-skills.md) | Canonical catalog, enrollment, migration, publication and harness integration |
 | [Skills](key-files/skills.md) | `src/core/audit-skill-brain-first.ts` through `src/core/skills-integrity.ts` |
 | [Tooling And Tests](key-files/tooling-and-tests.md) | `.github/workflows/test.yml` through `test/remote-privacy-sweep.test.ts` |
 | [BrainBench — in a sibling repo](key-files/brainbench.md) | Cross-file subsystem contract |

@@ -43,6 +43,12 @@ const HELP =
   '                        Pause file writers. Archive contains sensitive full DB state.\n' +
   '  restore ARCHIVE --into ABS\n' +
   '                        Restore into a NEW absent root; preserve the old brain.\n' +
+  '                        Default --mode new-brain resets shared identity and authority.\n' +
+  '                        --mode recovery preserves brain identity only with\n' +
+  '                        --confirm-quiesced --confirm-backup-compatible\n' +
+  '                        --confirm-authority-reviewed. Old service exclusion is\n' +
+  '                        operator-enforced, not verified by these attestations.\n' +
+  '                        Both modes revoke archived authority and disable publication.\n' +
   '                        Quarantine unfinished jobs; never start automation.\n\n' +
   '  --json   Structured verdict (includes the recovery field).\n\n' +
   'Exit codes: 0 ok / 1 warn / 2 usage error. Off switches: GBRAIN_BACKUP_CHECK=0 or\n' +
@@ -98,27 +104,32 @@ export async function runBackupCli(
       const { resolveBrainId } = await import('../core/brain-resolver.ts');
       if (resolveBrainId(getCliOptions().brain) !== 'host') throw new Error('Full local backup currently supports the selected host installation only; use --brain host with its explicit GBRAIN_HOME.');
       const values: Record<string, string> = {};
+      const confirmations = new Set<string>();
       const positional: string[] = [];
       for (let i = 1; i < args.length; i++) {
         const arg = args[i];
         if (arg === '--json') continue;
-        if (arg === '--output' || arg === '--into') {
+        if (arg === '--output' || arg === '--into' || arg === '--mode') {
           if (!args[i + 1] || args[i + 1].startsWith('--')) throw new Error(`Missing value for ${arg}`);
           values[arg] = args[++i];
-        } else if (arg.startsWith('-')) throw new Error(`Unknown backup option: ${arg}`);
+        } else if (['--confirm-quiesced', '--confirm-backup-compatible', '--confirm-authority-reviewed'].includes(arg)) confirmations.add(arg);
+        else if (arg.startsWith('-')) throw new Error(`Unknown backup option: ${arg}`);
         else positional.push(arg);
       }
       const { createPgliteBackup, restorePgliteBackup } = await import('../core/backup/snapshot.ts');
       if (sub === 'create') {
-        if (!values['--output'] || values['--into'] || positional.length) throw new Error('Usage: gbrain backup create --output /absolute/private/path/archive.gbrain-backup');
+        if (!values['--output'] || values['--into'] || values['--mode'] || confirmations.size || positional.length) throw new Error('Usage: gbrain backup create --output /absolute/private/path/archive.gbrain-backup');
         const result = await createPgliteBackup({ output: values['--output'] });
         if (json) console.log(JSON.stringify({ ok: true, ...result }));
         else console.log(`Backup created: ${result.archive}\nSensitive full database state; protect any off-VM copy.\nExcluded assets: ${(result.manifest.omitted as string[]).join('; ')}`);
       } else {
         if (!values['--into'] || values['--output'] || positional.length !== 1) throw new Error('Usage: gbrain backup restore ARCHIVE --into /absolute/new-root');
-        const result = await restorePgliteBackup({ archive: positional[0], into: values['--into'] });
+        if (values['--mode'] !== undefined && !['new-brain', 'recovery'].includes(values['--mode'])) throw new Error('Restore --mode must be new-brain or recovery.');
+        const result = await restorePgliteBackup({ archive: positional[0], into: values['--into'], mode: values['--mode'] === 'recovery' ? 'recovery' : 'new_brain',
+          confirmQuiesced: confirmations.has('--confirm-quiesced'), confirmBackupCompatible: confirmations.has('--confirm-backup-compatible'),
+          confirmAuthorityReviewed: confirmations.has('--confirm-authority-reviewed') });
         if (json) console.log(JSON.stringify({ ok: true, ...result }));
-        else console.log(`Restored memory: ${result.root}\n${result.quarantined_jobs} unfinished jobs quarantined; no automation started.\nRun setup-in-agent.sh for this root to restore its runtime, then reconnect excluded credentials/services and verify memory.`);
+        else console.log(`Restored memory: ${result.root}\n${result.quarantined_jobs} unfinished jobs quarantined; no automation started.\n${result.reconnect_required.join('\n')}\nRun setup-in-agent.sh for this root to restore its runtime, then reconnect excluded credentials/services and verify memory.`);
       }
       return { exitCode: 0 };
     } catch (error) {

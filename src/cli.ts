@@ -1228,6 +1228,16 @@ export function parseOpArgs(op: Operation, args: string[]): Record<string, unkno
     }
   }
 
+  for (const [key, def] of Object.entries(op.params)) {
+    if ((def.type !== 'object' && def.type !== 'array') || typeof params[key] !== 'string') continue;
+    let value: unknown;
+    try { value = JSON.parse(params[key] as string); }
+    catch { throw new OperationError('invalid_params', `--${key.replace(/_/g, '-')} requires a JSON ${def.type}.`); }
+    if (def.type === 'array' ? !Array.isArray(value) : value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new OperationError('invalid_params', `--${key.replace(/_/g, '-')} requires a JSON ${def.type}.`);
+    }
+    params[key] = value;
+  }
   return params;
 }
 
