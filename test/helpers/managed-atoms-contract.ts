@@ -110,6 +110,7 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         expect(receipt.request_id).toBeTruthy();
         const [original] = await engine.executeRaw<{ state: string; outcome: unknown }>('SELECT state,outcome FROM persistence_requests WHERE request_id=$1::uuid', [receipt.request_id]);
         if (blockedPath) rmSync(blockedPath);
+        await disposePersistenceConsumer(engine);
         const worker = new MinionWorker(engine, { queue: 'fixture' });
         await registerBuiltinHandlers(worker, engine, { quiet: true });
         __setChatTransportForTests(chat);
@@ -187,6 +188,7 @@ export async function exerciseManagedAtoms(engine: BrainEngine, scenario: Case):
         await engine.executeRaw("UPDATE op_checkpoints SET updated_at=now()-interval '30 days' WHERE op='managed-atoms' AND completed_keys->0->>'sourceId'=$1", [sourceId]);
         await purgeStaleCheckpoints(engine, 7);
       }
+      await disposePersistenceConsumer(engine);
       const replay = await runPhaseExtractAtoms(engine, opts);
       expect(calls).toBe(1);
       expect(replay.status).toBe(scenario === 'malformed' ? 'warn' : 'ok');
